@@ -308,7 +308,7 @@ Promise.resolve(handlers.session_start({}, { isIdle: () => true })).then(async (
         expected_revision=1,
     )
     allowed = scope in ("user", "bridge")
-    assert decision.action.value == ("ALLOW" if allowed else "DENY"), decision.reason
+    assert decision.action.value == ("ALLOW" if allowed else "ASK"), decision.reason
     assert (
         runtime.authorize(
             state.session_id,
@@ -317,7 +317,7 @@ Promise.resolve(handlers.session_start({}, { isIdle: () => true })).then(async (
             arguments_digest=binding.arguments_digest,
             expected_revision=1,
         )
-        == allowed
+        is True
     )
 
 
@@ -546,7 +546,14 @@ def test_write_extension_files_embeds_tools(tmp_path: Path) -> None:
     # serverUrl trailing slash is stripped so the extension can append paths.
     assert payload["serverUrl"] == "http://omnigent.test"
     assert payload["tools"] == tools
-    assert payload["planVisibleTools"] == ["read", "manage_todo_list", "sys_os_read"]
+    assert payload["planVisibleTools"] == [
+        "read",
+        "grep",
+        "find",
+        "ls",
+        "manage_todo_list",
+        "sys_os_read",
+    ]
 
 
 def test_write_extension_files_defaults_tools_to_empty(tmp_path: Path) -> None:
@@ -562,7 +569,7 @@ def test_write_extension_files_defaults_tools_to_empty(tmp_path: Path) -> None:
 
     payload = json.loads(cfg.read_text(encoding="utf-8"))
     assert payload["tools"] == []
-    assert payload["planVisibleTools"] == ["read", "manage_todo_list"]
+    assert payload["planVisibleTools"] == ["read", "grep", "find", "ls", "manage_todo_list"]
 
 
 def test_write_extension_files_replaces_startup_instructions_on_relaunch(tmp_path: Path) -> None:

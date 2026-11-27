@@ -206,7 +206,7 @@ def _runtime(
         ("auto", "run_command", {"CommandLine": "rm -rf /"}, Verdict.DENY),
         ("auto", "run_command", {"CommandLine": "git reset --hard"}, Verdict.ASK),
         ("auto", "sys_os_shell", {"command": "omni --version"}, Verdict.ALLOW),
-        ("auto", "sys_os_shell", {"command": "echo $HOME"}, Verdict.ASK),
+        ("auto", "sys_os_shell", {"command": "echo $HOME"}, Verdict.ALLOW),
         ("auto", "sys_os_shell", {"command": "git reset --hard"}, Verdict.ASK),
         ("auto", "sys_os_shell", {"command": "rm -rf /"}, Verdict.DENY),
         (
@@ -216,7 +216,19 @@ def _runtime(
             Verdict.ASK,
         ),
         ("auto", "sys_os_write", {"path": "note.txt", "content": "fixture"}, Verdict.ALLOW),
-        ("auto", "run_command", {"CommandLine": "cd ."}, Verdict.ASK),
+        ("auto", "run_command", {"CommandLine": "cd ."}, Verdict.ALLOW),
+        (
+            "auto",
+            "run_command",
+            {"CommandLine": "Get-ChildItem | Where-Object { $_.Name -match 'x' }"},
+            Verdict.ALLOW,
+        ),
+        (
+            "auto",
+            "run_command",
+            {"CommandLine": 'pwsh -Command "git branch -D main"'},
+            Verdict.ASK,
+        ),
         ("auto", "unknown", {}, Verdict.ASK),
         ("plan", "unknown", {}, Verdict.DENY),
     ],
@@ -239,27 +251,71 @@ def test_acp_host_permission_uses_shared_deny_rules(tmp_path, tier, name, argume
 
 
 @pytest.mark.parametrize(
-    ("windows", "command", "expected"),
+    ("command", "expected"),
     [
-        (True, "$PSVersionTable.PSVersion.ToString()", Verdict.ALLOW),
-        (False, "$PSVersionTable.PSVersion.ToString()", Verdict.ASK),
-        (True, "$PSVersionTable.PSVersion.ToString(); Remove-Item report.txt", Verdict.ASK),
+        ("$PSVersionTable.PSVersion.ToString()", Verdict.ALLOW),
+        ("Get-ChildItem | Where-Object { $_.Name -match 'x' }", Verdict.ALLOW),
+        ("[Console]::OutputEncoding = [Text.Encoding]::UTF8; Get-Date", Verdict.ALLOW),
+        ("git reset --hard", Verdict.ASK),
+        ("$PSVersionTable.PSVersion.ToString(); Remove-Item report.txt", Verdict.ALLOW),
+        ('pwsh -Command "git branch -D main"', Verdict.ASK),
     ],
 )
-def test_acp_host_floor_exempts_only_the_windows_version_query(
-    tmp_path, monkeypatch, windows, command, expected
-):
-    from omnigent import _platform
-    from omnigent.permission_tiers import TierDecision
-
+def test_acp_host_uses_shared_narrow_auto_floor(tmp_path, command, expected):
     runtime = _runtime(tmp_path, "auto")
     runtime._harnesses["session-a"] = "acp"
-    monkeypatch.setattr(_platform, "IS_WINDOWS", windows)
-    monkeypatch.setattr(
-        runtime, "_evaluate", lambda *_args, **_kwargs: TierDecision(Verdict.ALLOW)
-    )
     call = {"call_id": "tool-1", "name": "run_command", "arguments": {"CommandLine": command}}
     assert runtime.evaluate_acp_call_decision("session-a", call)[0].action == expected
+
+
+def test_ag_native_runner_applies_narrow_auto_floor_and_readable_subtrees(tmp_path):
+    runtime = _runtime(tmp_path, "auto")
+    bridge = tmp_path / "bridge"
+    brain_file = (
+        bridge / "agy-home/.gemini/antigravity-cli/brain/c1/.system_generated/steps/9/output.txt"
+    )
+    brain_file.parent.mkdir(parents=True)
+    brain_file.write_text("output\n")
+    builtin_file = bridge / "agy-home/.gemini/antigravity-cli/builtin/skills/plan/SKILL.md"
+    builtin_file.parent.mkdir(parents=True)
+    builtin_file.write_text("# skill\n")
+    relay_file = bridge / "tool_relay.json"
+    relay_file.write_text('{"token":"live"}')
+    escape = brain_file.parent / "escape.json"
+    escape.symlink_to(relay_file)
+
+    _, destructive = runtime.inspect(
+        "session-a",
+        call_id="agy-hook:reset",
+        name="run_command",
+        arguments={"CommandLine": "git reset --hard"},
+        expected_revision=3,
+    )
+    assert destructive.action == Verdict.ASK
+    for idx, target in enumerate((brain_file, builtin_file)):
+        _, allowed = runtime.inspect(
+            "session-a",
+            call_id=f"agy-hook:read-{idx}",
+            name="read_file",
+            arguments={"Path": str(target)},
+            expected_revision=3,
+        )
+        assert allowed.action == Verdict.ALLOW, target
+    for idx, denied_args in enumerate(
+        (
+            ("read_file", {"Path": str(relay_file)}),
+            ("read_file", {"Path": str(escape)}),
+            ("grep_search", {"SearchPath": str(bridge), "Query": "token"}),
+        )
+    ):
+        _, denied = runtime.inspect(
+            "session-a",
+            call_id=f"agy-hook:deny-{idx}",
+            name=denied_args[0],
+            arguments=denied_args[1],
+            expected_revision=3,
+        )
+        assert (denied.action, denied.rule_id) == (Verdict.DENY, "control-path")
 
 
 def test_acp_host_permission_decision_carries_rule_and_mode_metadata(tmp_path):
@@ -1416,7 +1472,9 @@ async def test_scoped_native_http_policy_runs_through_server_and_runner(tmp_path
     from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig, McpService
     from omnigent.server.routes import sessions
     from omnigent.server.routes._auth_helpers import SessionAccess
+    from omnigent.server.routes._sessions import orchestration
     from omnigent.server.routes.sessions import routes_hooks
+    from omnigent.server.schemas import ElicitationResult
     from omnigent.spec.types import AgentSpec, MCPServerConfig
     from tests.runner.conftest import _build_app_for_spec, _runner_client
     from tests.runner.native_helpers import _harness_spec
@@ -1590,6 +1648,15 @@ async def test_scoped_native_http_policy_runs_through_server_and_runner(tmp_path
                         "session-a", binding.get("pi_origin_receipt")
                     )
                     assert receipt.principal == child.principal
+                    asked_tools: list[str] = []
+
+                    async def decline_card(*_args, **kwargs):
+                        asked_tools.append(str(kwargs.get("title", "")))
+                        return ElicitationResult(action="decline")
+
+                    monkeypatch.setattr(
+                        orchestration, "_publish_and_wait_for_harness_elicitation", decline_card
+                    )
                     for name, expected in (
                         ("notes__search", "POLICY_ACTION_UNSPECIFIED"),
                         ("notes___search", "POLICY_ACTION_UNSPECIFIED"),
@@ -1617,6 +1684,7 @@ async def test_scoped_native_http_policy_runs_through_server_and_runner(tmp_path
                         headers={"Authorization": "Bearer " + parent.credential},
                     )
                     assert parent_response.json()["result"] == "POLICY_ACTION_DENY"
+                    assert len(asked_tools) == 3
                     bypass = await client.post(
                         "/permission-tiers/control",
                         headers=child_headers,
@@ -1814,10 +1882,32 @@ async def test_pi_subagent_denial_cannot_open_card_or_acquire_launch_lease(
 
     async def approve(*args, **kwargs):
         cards.append(kwargs)
-        return ElicitationResult(action="accept")
+        return ElicitationResult(action="decline")
 
     monkeypatch.setattr(orchestration, "_publish_and_wait_for_harness_elicitation", approve)
-    for _ in range(2):
+    if tier == "plan":
+        for _ in range(2):
+            authorized = await gate.authorize_permission_call(
+                gate.InspectedPermissionCall(binding, decision),
+                request=None,
+                harness="pi-native",
+                arguments=arguments,
+                conversation_store=None,
+                runner_router=None,
+            )
+            assert authorized.action.value == "DENY"
+        assert cards == []
+        assert decision.action.value == "DENY"
+        assert not runtime.authorize(
+            "session-a",
+            call_id=binding.call_id,
+            name=binding.name,
+            arguments_digest=binding.arguments_digest,
+            expected_revision=3,
+        )
+    else:
+        assert decision.action.value == "ASK"
+        assert decision.rule_id == "native-proof"
         authorized = await gate.authorize_permission_call(
             gate.InspectedPermissionCall(binding, decision),
             request=None,
@@ -1827,17 +1917,7 @@ async def test_pi_subagent_denial_cannot_open_card_or_acquire_launch_lease(
             runner_router=None,
         )
         assert authorized.action.value == "DENY"
-    assert cards == []
-    assert decision.action.value == "DENY"
-    assert decision.rule_id == "native-proof"
-    # Even a direct attempted approval cannot mint an execution lease.
-    assert not runtime.authorize(
-        "session-a",
-        call_id=binding.call_id,
-        name=binding.name,
-        arguments_digest=binding.arguments_digest,
-        expected_revision=3,
-    )
+        assert len(cards) == 1
     assert not runtime.verify_execute(
         "session-a",
         call_id=binding.call_id,
@@ -1860,16 +1940,16 @@ def test_extension_scope_cannot_claim_builtin_read_permissions(tmp_path, scope):
         arguments={"path": "notes.txt"},
         expected_revision=3,
     )
-    assert decision.action.value == "DENY"
+    assert decision.action.value == "ASK"
     assert "extension" in decision.reason.lower()
 
 
 @pytest.mark.parametrize(
     ("tier", "expected"),
     [
-        ("auto", "DENY"),
-        ("ask", "DENY"),
-        ("accept-edits", "DENY"),
+        ("auto", "ASK"),
+        ("ask", "ASK"),
+        ("accept-edits", "ASK"),
         ("plan", "DENY"),
         ("full", "ALLOW"),
     ],
@@ -1992,7 +2072,7 @@ def test_tool_arguments_cannot_supply_missing_extension_provenance(tmp_path, sou
         },
         expected_revision=3,
     )
-    assert decision.action.value == "DENY"
+    assert decision.action.value == "ASK"
     assert "extension source" in decision.reason
 
 
@@ -2001,7 +2081,7 @@ def test_tool_arguments_cannot_supply_missing_extension_provenance(tmp_path, sou
     [
         ("ask", "ASK"),
         ("accept-edits", "ASK"),
-        ("auto", "DENY"),
+        ("auto", "ASK"),
         ("plan", "DENY"),
         ("full", "ALLOW"),
     ],
@@ -2035,7 +2115,7 @@ def test_verified_extension_registry_is_not_remote_tool_authority(tmp_path):
         expected_revision=3,
         local_execution=False,
     )
-    assert decision.action.value == "DENY"
+    assert decision.action.value == "ASK"
 
 
 def test_user_extension_symlink_protects_the_resolved_package(tmp_path):
@@ -2116,7 +2196,7 @@ def test_cli_permission_fence_uses_authenticated_runner_binding(tmp_path, monkey
     ("name", "local_execution", "expected"),
     [
         ("sys_read_inbox", True, "ALLOW"),
-        ("sys_read_inbox", False, "DENY"),
+        ("sys_read_inbox", False, "ASK"),
         ("unknown_control", True, "ASK"),
     ],
 )
@@ -2137,7 +2217,7 @@ def test_framework_inbox_requires_local_execution(
 
 def test_remote_tool_name_cannot_impersonate_local_write(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path, "auto")
-    binding, decision = runtime.inspect(
+    _binding, decision = runtime.inspect(
         "session-a",
         call_id="call-a",
         name="sys_os_write",
@@ -2145,14 +2225,7 @@ def test_remote_tool_name_cannot_impersonate_local_write(tmp_path: Path) -> None
         expected_revision=3,
         local_execution=False,
     )
-    assert decision.action.value == "DENY"
-    assert not runtime.authorize(
-        "session-a",
-        call_id=binding.call_id,
-        name=binding.name,
-        arguments_digest=binding.arguments_digest,
-        expected_revision=3,
-    )
+    assert decision.action.value == "ASK"
 
 
 def test_approval_requires_inspection_and_cannot_replay(tmp_path: Path) -> None:
@@ -2953,6 +3026,15 @@ async def test_acp_managed_flag_survives_initialization(monkeypatch, tmp_path, t
         ("bash", {"command": "cd src && ls"}, True, Verdict.ALLOW),
         ("bash", {"command": "git reset --hard"}, True, Verdict.ASK),
         ("bash", {"command": "echo x > ~/.bashrc"}, True, Verdict.ASK),
+        ("powershell", {"command": "Get-Date"}, True, Verdict.ALLOW),
+        ("powershell", {"command": "git reset --hard"}, True, Verdict.ASK),
+        ("powershell", {"command": "Format-Volume -DriveLetter C"}, True, Verdict.DENY),
+        ("grep", {"pattern": "TODO"}, True, Verdict.ALLOW),
+        ("find", {"pattern": "*.py"}, True, Verdict.ALLOW),
+        ("ls", {}, True, Verdict.ALLOW),
+        ("tool_search", {"query": "session"}, True, Verdict.ALLOW),
+        ("write", {"path": "../note.txt", "content": "fixture"}, True, Verdict.ALLOW),
+        ("edit", {"path": "../note.txt", "oldText": "a", "newText": "b"}, True, Verdict.ALLOW),
         ("write", {"path": "../../outside.txt", "content": "fixture"}, True, Verdict.ASK),
         ("sys_os_shell", {"command": "omni --version"}, False, Verdict.ALLOW),
         ("sys_os_shell", {"command": "echo $HOME"}, False, Verdict.ALLOW),
@@ -2960,6 +3042,9 @@ async def test_acp_managed_flag_survives_initialization(monkeypatch, tmp_path, t
         ("sys_os_shell", {"command": "rm -rf /"}, False, Verdict.DENY),
         ("sys_os_write", {"path": "../../outside.txt", "content": "fixture"}, False, Verdict.ASK),
         ("sys_os_write", {"path": "../note.txt", "content": "fixture"}, False, Verdict.ALLOW),
+        # Bridged non-local tools reusing Pi built-in names must not inherit builtin READ.
+        ("tool_search", {"query": "session"}, False, Verdict.ASK),
+        ("grep", {"pattern": "TODO"}, False, Verdict.ASK),
     ],
 )
 def test_scoped_pi_auto_classifies_native_and_bridged_calls(
@@ -2977,8 +3062,9 @@ def test_scoped_pi_auto_classifies_native_and_bridged_calls(
     _publish_scope(runtime, parent, registry["tools"])
     child = runtime.open_pi_child_scope("session-a")
     assert child.principal.canonical_cwd == str(cwd.resolve())
+    builtin_path = "builtin:tool-search" if name == "tool_search" else f"builtin:{name}"
     source = (
-        {"source": "builtin", "path": f"builtin:{name}"}
+        {"source": "builtin", "path": builtin_path}
         if local
         else {"source": "inline", "path": "<inline:omnigent-permission>"}
     )
@@ -3001,6 +3087,39 @@ def test_scoped_pi_auto_classifies_native_and_bridged_calls(
         origin_receipt=receipt.token,
     )
     assert decision.action == expected, decision.reason
+
+
+def test_legacy_pi_inspect_rejects_bridge_collision_with_builtin_name(tmp_path: Path) -> None:
+    runtime, _source, registry = _extension_runtime(tmp_path, "auto")
+    registry["tools"] = [
+        {
+            "name": "grep",
+            "sourceInfo": {"source": "inline", "path": "<inline:omnigent-permission>"},
+        },
+        {
+            "name": "tool_search",
+            "sourceInfo": {"source": "builtin", "path": "builtin:tool-search"},
+        },
+    ]
+    (runtime.path("session-a").parent / "permission_tools.json").write_text(json.dumps(registry))
+    _, spoofed = runtime.inspect(
+        "session-a",
+        call_id="legacy-spoof",
+        name="grep",
+        arguments={"pattern": "TODO"},
+        expected_revision=3,
+        local_execution=True,
+    )
+    assert spoofed.action == Verdict.ASK
+    _, genuine = runtime.inspect(
+        "session-a",
+        call_id="legacy-builtin",
+        name="tool_search",
+        arguments={"query": "session"},
+        expected_revision=3,
+        local_execution=True,
+    )
+    assert genuine.action == Verdict.ALLOW
 
 
 def test_pi_scope_unlisted_bridged_tool_is_denied_in_auto(tmp_path):
@@ -3039,7 +3158,7 @@ def test_pi_scope_unlisted_bridged_tool_is_denied_in_auto(tmp_path):
 
     for call_id, name, arguments, expected_action in (
         ("calc-call", "calculate", {"expression": "19 * 23"}, "ASK"),
-        ("terminal-call", "sys_terminal_launch", {"command": "sh"}, "DENY"),
+        ("terminal-call", "sys_terminal_launch", {"command": "sh"}, "ASK"),
         ("unlisted-call", "unlisted_bridge_tool", {"x": 1}, "ASK"),
     ):
         receipt = runtime.pi_origin_receipt(
@@ -3170,7 +3289,7 @@ def test_agy_remote_registry_tool_uses_shared_tier_classifier(tmp_path, tier, ac
     runtime = _runtime(tmp_path, tier)
     for local_execution, registry_tool, expected in (
         (False, True, action),
-        (False, False, "DENY" if tier == "auto" else action),
+        (False, False, "ASK" if tier == "auto" else action),
         (True, True, "ASK" if tier == "auto" else action),
     ):
         _, decision = runtime.inspect(

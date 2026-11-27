@@ -1887,3 +1887,136 @@ def test_auto_floor_asks_only_for_narrow_destructive_classes(
     command: str, expected_ask: bool
 ) -> None:
     assert approvals.auto_floor_asks(command) is expected_ask
+
+
+@pytest.mark.parametrize(
+    ("bash_command", "ps_command", "expected"),
+    [
+        ("cp a.txt b.txt", "Copy-Item a.txt b.txt", "clear"),
+        ("cp a.txt b.txt", "cpi a.txt b.txt", "clear"),
+        ("mv a.txt b.txt", "Move-Item a.txt b.txt", "clear"),
+        ("mv a.txt b.txt", "move a.txt b.txt", "clear"),
+        ("mv a.txt b.txt", "Rename-Item a.txt b.txt", "clear"),
+        ("mv a.txt b.txt", "ren a.txt b.txt", "clear"),
+        ("touch note.txt", "New-Item note.txt", "clear"),
+        ("touch note.txt", "ni note.txt", "clear"),
+        ("tee note.txt", "Set-Content note.txt hello", "clear"),
+        ("tee note.txt", "Add-Content note.txt hello", "clear"),
+        ("tee note.txt", "Out-File note.txt", "clear"),
+        ("tee note.txt", "Set-Item note.txt hello", "clear"),
+        ("tee note.txt", "Clear-Item note.txt", "clear"),
+        ("echo ok", "Start-Process notepad", "clear"),
+        ("cp a.txt /etc/hosts", "Copy-Item a.txt /etc/hosts", "user_only"),
+        ("cp a.txt ~/.bashrc", "Copy-Item a.txt ~/.bashrc", "user_only"),
+        (
+            "cp a.txt /etc/hosts",
+            "Copy-Item a.txt -Destination 'C:\\Windows\\foo.txt'",
+            "user_only",
+        ),
+        ("mv a.txt /etc/hosts", "Move-Item a.txt /etc/hosts", "user_only"),
+        ("mv /etc/hosts a.txt", "Move-Item /etc/hosts a.txt", "user_only"),
+        ("mv a.txt /etc/hosts", "Rename-Item /etc/hosts hosts.bak", "user_only"),
+        ("tee ~/.bashrc", "Set-Content ~/.bashrc x", "user_only"),
+        (
+            "tee /etc/hosts",
+            "Set-Content -Path 'C:\\Windows\\System32\\x' -Value bad",
+            "user_only",
+        ),
+        (
+            "tee /etc/hosts",
+            "Set-Content C:\\Windows\\System32\\x bad",
+            "user_only",
+        ),
+        ("touch foo.txt", "Set-ItemProperty ./foo.txt -Name IsReadOnly -Value 1", "clear"),
+        ("install -d /etc/newdir", "New-Item -Path /etc -Name newfile", "user_only"),
+        ("rm -rf /", "Remove-Item tmp.txt", "user_only"),
+        ("rm -rf /", "ri tmp.txt", "user_only"),
+        ("rm -rf /", "del tmp.txt", "user_only"),
+        ("rm -rf /", "rmdir tmp", "user_only"),
+        ("truncate -s 0 /etc/hosts", "Clear-Content local.txt", "user_only"),
+        ("truncate -s 0 /etc/hosts", "clc local.txt", "user_only"),
+        ("sudo ls", "Set-ExecutionPolicy Bypass", "user_only"),
+        ("eval ls", "Invoke-Expression ls", "user_only"),
+        ("eval ls", "iex ls", "user_only"),
+        ("ssh example.com ls", "Invoke-Command -ComputerName host", "user_only"),
+        ("ssh example.com ls", "icm -ComputerName host", "user_only"),
+        ("chmod 777 /etc/hosts", "Set-Acl foo.txt acl", "user_only"),
+        ("sudo ls", "Set-ItemProperty HKLM:/Software/x Name Val", "user_only"),
+        ("sudo ls", "Remove-ItemProperty HKLM:/Software/x Name", "user_only"),
+        ("sudo ls", "New-ItemProperty HKLM:/Software/x Name Val", "user_only"),
+        ("sudo ls", "Start-Process pwsh -Verb RunAs", "user_only"),
+        ("sudo ls", "saps pwsh -Verb:RunAs", "user_only"),
+    ],
+)
+def test_floor_aligns_powershell_cmdlets_with_posix_classes(
+    bash_command: str, ps_command: str, expected: str
+) -> None:
+    assert approvals.floor({"tool_name": "bash", "command": bash_command}) == expected
+    assert approvals.floor({"tool_name": "powershell", "command": ps_command}) == expected
+
+
+def test_floor_reads_run_command_command_line_in_permission_tier_cards() -> None:
+    clear_card = {
+        "phase": "permission_tier",
+        "tool_name": "run_command",
+        "content_preview": json.dumps({"CommandLine": "git status"}),
+    }
+    destructive_card = {
+        "phase": "permission_tier",
+        "tool_name": "run_command",
+        "content_preview": json.dumps({"CommandLine": "git reset --hard"}),
+    }
+    missing_field = {
+        "phase": "permission_tier",
+        "tool_name": "run_command",
+        "content_preview": json.dumps({"command": "git status"}),
+    }
+    assert approvals.floor(clear_card) == "clear"
+    assert approvals.floor(destructive_card) == "user_only"
+    assert approvals.floor(missing_field) == "user_only"
+
+
+@pytest.mark.parametrize(
+    ("command", "platform", "opaque", "expected"),
+    [
+        # Scenario 7: hidden scripts
+        ("printf '\\x73\\x74' | bash", "posix", False, True),
+        ("echo 7374 | xxd -r -p | bash", "posix", False, True),
+        ("pwsh -enc $x", "windows", True, True),
+        ("powershell -EncodedCommand SQBlAHgA", "windows", False, True),
+        ("Invoke-Expression $payload", "windows", True, True),
+        ("cat script.ps1 | iex", "windows", False, True),
+        ("echo x | pwsh -Command -", "windows", False, True),
+        ("echo x | pwsh -File -", "windows", False, True),
+        ("echo x | pwsh -InputFormat Text -Command -", "windows", False, True),
+        ('pwsh -WorkingDirectory /tmp -Command "sudo ls"', "windows", False, True),
+        # Scenario 8: nested shells unwrapping destructive commands
+        ('pwsh -Command "git branch -D main"', "windows", False, True),
+        ('bash -c "sudo ls"', "posix", False, True),
+        ('bash -o pipefail -c "sudo ls"', "posix", False, True),
+        ('cmd /c "git reset --hard"', "windows", False, True),
+        ("git clean -fdx", "posix", False, True),
+        ("git clean -- -n", "posix", False, True),
+        ("git clean -e n", "posix", False, True),
+        ("git clean -en", "posix", False, True),
+        ("git clean -n", "posix", False, False),
+        ("git clean -n -- src", "posix", False, False),
+        ("git clean --dry-run", "posix", False, False),
+        ("Start-Process pwsh -Verb RunAs", "windows", False, True),
+        ("Set-ExecutionPolicy Bypass", "windows", False, True),
+        ("Invoke-Command -ComputerName host -ScriptBlock { ls }", "windows", False, True),
+        ("Set-Acl a.txt $acl", "windows", True, True),
+        (r"Set-ItemProperty HKLM:\Software\Test -Name X -Value 1", "windows", False, True),
+        # Delete verb in opaque command asks; bound delete / ordinary commands allow (Scenario 9)
+        ("Remove-Item $target", "windows", True, True),
+        ("rm -rf build", "posix", False, False),
+        ('python -c "print(1)"', "posix", False, False),
+        ("Remove-Item tmp.log", "windows", False, False),
+        # Piping stdin data to a script file is not stdin-as-script
+        ("cat prompt.txt | bash /opt/work/scripts/run.sh", "posix", False, False),
+    ],
+)
+def test_auto_floor_asks_d5_classes_and_nested_unwrap(
+    command: str, platform: str, opaque: bool, expected: bool
+) -> None:
+    assert approvals.auto_floor_asks(command, platform=platform, opaque=opaque) is expected

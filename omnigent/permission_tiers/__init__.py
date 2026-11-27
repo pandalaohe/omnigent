@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
 import hashlib
 import io
 import json
@@ -17,6 +18,7 @@ import os
 import re
 import shlex
 import stat
+import unicodedata
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
@@ -124,6 +126,7 @@ class TrustedHostContext:
     registry_tool_name: str | None = None
     acp_bridge_tool_name: str | None = None
     readable_control_file: tuple[str, str] | None = None  # (owning control, resolved file)
+    readable_control_subtrees: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -139,6 +142,8 @@ class ToolIntent:
     detail: str = ""
     workspace_path: ResolvedPath | None = None
     resolved_control_paths: tuple[str, ...] = ()
+    resolved_control_kinds: tuple[str, ...] = ()
+    resolved_readable_subtrees: tuple[tuple[str, str, str], ...] = ()
     protected_exact_paths: tuple[str, ...] = ()
     protected_prefix_paths: tuple[str, ...] = ()
     command_paths: tuple[str, ...] = ()
@@ -148,6 +153,11 @@ class ToolIntent:
     recursive_read_paths: tuple[str, ...] = ()
     command_read_only: bool = False
     command_uncertain: bool = False
+    command_opaque: bool = False
+    hidden_script: bool = False
+    cwd_confirmed: bool = True
+    ads_write: str = ""
+    gate_fault: str = ""
     unbound_write: bool = False
     native_status: NativeSupportStatus | None = None
     unseen_tool: bool = False
@@ -192,7 +202,40 @@ _READABLE_CONTROL_DIRECTORIES = (".pi", ".agents")
 _AGENT_ROOT_PARTS = ((".pi",), (".pi", "agent"), (".agents",))
 # A file name carrying one of these can hold a key wherever it sits.
 _KEY_NAME_WORDS = ("auth", "credential", "secret", "token", "apikey", "accounts", "models")
-_RECURSIVE_READS = ("grep_search", "find_by_name")
+_RECURSIVE_READS = ("grep_search", "find_by_name", "grep", "find")
+_PI_OPTIONAL_READ_PATH = frozenset(("grep", "find", "ls"))
+_PI_PATH_TOOLS = frozenset(("read", "write", "edit", "grep", "find", "ls"))
+_PI_BUILTIN_TOOLS = frozenset(
+    ("read", "write", "edit", "bash", "powershell", "grep", "find", "ls", "tool_search")
+)
+_PI_UNICODE_SPACES = re.compile(r"[\u00A0\u2000-\u200A\u202F\u205F\u3000]")
+_PI_WINDOWS_SHELL_PATH = re.compile(r"^/(?:mnt/|cygdrive/)?([a-z])(?:/(.*))?$", re.IGNORECASE)
+_PI_AM_PM_SPACE = re.compile(r" (AM|PM)\.", re.IGNORECASE)
+_POWERSHELL_PROVIDER_PATH = re.compile(r"^(?:env|variable|function|alias):[^:]*$", re.IGNORECASE)
+_POWERSHELL_WRITE_CMDLETS = frozenset(
+    (
+        "set-content",
+        "sc",
+        "add-content",
+        "ac",
+        "out-file",
+        "clear-content",
+        "clc",
+        "new-item",
+        "ni",
+        "set-item",
+        "si",
+        "clear-item",
+        "cli",
+        "set-acl",
+        "set-itemproperty",
+        "sp",
+        "clear-itemproperty",
+        "clp",
+        "remove-itemproperty",
+        "rp",
+    )
+)
 # Shell words that read every file under their operand.
 _RECURSIVE_SHELL_READS = ("rg", "ag", "ack", "grep", "egrep", "fgrep", "find")
 _TRUSTED_VARIABLES = ("HOME", "TMPDIR")
@@ -200,7 +243,7 @@ _TRUSTED_VARIABLES = ("HOME", "TMPDIR")
 _MAX_CWDS = 4
 _COMMAND_WORDS = re.compile(r"[^\s'\"|;&()<>]+")
 # A delete stays refused while its target cannot be bound; other writes proceed.
-_DELETE_COMMANDS = ("rm", "rmdir", "unlink", "del", "erase", "rd", "remove-item", "srm")
+_DELETE_COMMANDS = ("rm", "rmdir", "unlink", "del", "erase", "rd", "remove-item", "ri", "srm")
 _FIND_ACTIONS = (
     "-delete",
     "-exec",
@@ -278,7 +321,12 @@ _EDIT_PATH = {
     "replace_file_content": "TargetFile",
     "multi_replace_file_content": "TargetFile",
 }
-_EXEC_COMMAND = {"bash": "command", "sys_os_shell": "command", "run_command": "CommandLine"}
+_EXEC_COMMAND = {
+    "bash": "command",
+    "powershell": "command",
+    "sys_os_shell": "command",
+    "run_command": "CommandLine",
+}
 _READ_NO_PATH = frozenset(
     (
         "sys_session_list",
@@ -364,6 +412,22 @@ _CONTROL_TOOLS = frozenset(
         "wait_5_seconds",
         "report_browser_outcome",
     )
+)
+_NATIVE_GRANT_TOOLS = frozenset(("ask_permission", "ask_custom_permission"))
+_NATIVE_SUBAGENT_TOOLS = frozenset(("subagent", "invoke_subagent"))
+_NATIVE_BOOTSTRAP_ERRORS = frozenset(
+    (
+        "Native bootstrap support is missing, malformed or stale",
+        "Native launch inputs or bootstrap changed; re-prove the call",
+        "Native call has no acknowledged attestation",
+    )
+)
+_POWERSHELL_PROVIDER_PREFIX = re.compile(
+    r"^(?:hklm|hkcu|hkcr|hku|hkcc|registry|env|variable|function|alias|cert|wsman):",
+    re.IGNORECASE,
+)
+_POWERSHELL_STREAM_WRITE_CMDLETS = frozenset(
+    ("set-content", "sc", "add-content", "ac", "out-file", "clear-content", "clc")
 )
 # Native tools whose effects extend beyond a checkable path or command.
 _AGY_UNCHECKABLE = {
@@ -481,6 +545,7 @@ def plan_visible_tool_names(names: Iterable[str]) -> tuple[str, ...]:
     """
     allowed = {
         *_READ_PATH,
+        *_PI_OPTIONAL_READ_PATH,
         *_READ_NO_PATH,
         *_QUESTION_TOOLS,
         *_CONTROL_TOOLS,
@@ -614,25 +679,27 @@ def resolve_local_path(path: str) -> ResolvedPath:
     return ResolvedPath(str(final), kind)
 
 
-def _windows_absolute(path: str, context: TrustedHostContext) -> str:
+def _windows_absolute(path: str, context: TrustedHostContext, *, expand_env: bool = True) -> str:
     if _DEVICE.match(path):
         raise ValueError("Windows device path")
     path = path.replace("/", "\\")
     if path.startswith("~\\") or path == "~":
         path = ntpath.join(context.home, path[2:] if path != "~" else "")
 
-    def expand(match: re.Match[str]) -> str:
-        name = match.group(1).upper()
-        env = {key.upper(): value for key, value in context.environment.items()}
-        if name in ("USERPROFILE", "HOME"):
-            return context.home
-        if name in env:
-            return env[name]
-        raise ValueError(f"Unknown Windows path variable: {name}")
+    if expand_env:
 
-    path = _WINDOWS_ENV.sub(expand, path)
-    if "$" in path or "%" in path:
-        raise ValueError(f"Unresolved Windows path variable: {path}")
+        def expand(match: re.Match[str]) -> str:
+            name = match.group(1).upper()
+            env = {key.upper(): value for key, value in context.environment.items()}
+            if name in ("USERPROFILE", "HOME"):
+                return context.home
+            if name in env:
+                return env[name]
+            raise ValueError(f"Unknown Windows path variable: {name}")
+
+        path = _WINDOWS_ENV.sub(expand, path)
+        if "$" in path or "%" in path:
+            raise ValueError(f"Unresolved Windows path variable: {path}")
     drive, tail = ntpath.splitdrive(path)
     if not drive and path.startswith("\\") and not path.startswith("\\\\"):
         raise ValueError("Root-relative Windows path without drive")
@@ -642,6 +709,8 @@ def _windows_absolute(path: str, context: TrustedHostContext) -> str:
             raise ValueError("Missing drive cwd")
         path = ntpath.join(current, tail)
     elif not drive:
+        if not context.cwd:
+            raise ValueError("Unconfirmed working directory")
         path = ntpath.join(context.cwd, path)
     drive, _ = ntpath.splitdrive(path)
     if not drive or (len(drive) == 2 and not ntpath.isabs(path)):
@@ -674,7 +743,11 @@ def _absolute(path: str, context: TrustedHostContext) -> str:
         path = context.home + path[1:]
     if "$" in path:
         raise ValueError("Unresolved path variable")
-    return path if path.startswith("/") else os.path.join(context.cwd, path)
+    if path.startswith("/"):
+        return path
+    if not context.cwd:
+        raise ValueError("Unconfirmed working directory")
+    return os.path.join(context.cwd, path)
 
 
 def _resolve(path: str, context: TrustedHostContext) -> ResolvedPath:
@@ -703,6 +776,131 @@ def _required_text(arguments: Mapping[str, object], key: str) -> str:
     return value
 
 
+def _map_windows_shell_path(path: str) -> str:
+    """Convert Git Bash / MSYS / Cygwin / WSL drive paths to Windows drive paths."""
+    if not path.startswith("/") or path.startswith("//") or "\\" in path:
+        return path
+    match = _PI_WINDOWS_SHELL_PATH.match(path)
+    if not match:
+        return path
+    drive = match.group(1).upper()
+    suffix = (match.group(2) or "").replace("/", "\\")
+    return f"{drive}:\\{suffix}"
+
+
+def _normalize_pi_path(path: str, *, windows: bool) -> str:
+    """Mirror Pi's resolveToCwd preprocessing before host path binding."""
+    normalized = _PI_UNICODE_SPACES.sub(" ", path).removeprefix("@")
+    if windows:
+        normalized = _map_windows_shell_path(normalized)
+    if normalized.lower().startswith("file://"):
+        raise ValueError("File URI paths are not supported")
+    if not normalized:
+        raise ValueError("Missing path")
+    return normalized
+
+
+def _lexical_pi_path(path: str, context: TrustedHostContext) -> str:
+    """Match Node path.resolve lexical dot-segment collapse before symlink resolution."""
+    windows = context.platform == "windows"
+    normalized = _normalize_pi_path(path, windows=windows)
+    absolute = _absolute(normalized, context)
+    if windows:
+        return ntpath.normpath(absolute)
+    collapsed = os.path.normpath(absolute)
+    return "/" + collapsed.lstrip("/") if collapsed.startswith("//") else collapsed
+
+
+def _pi_read_fallback_variants(path: str) -> tuple[str, ...]:
+    """Mirror Pi's resolveReadPath fallback order when the initial spelling is absent."""
+    nfd = unicodedata.normalize("NFD", path)
+    candidates = (
+        _PI_AM_PM_SPACE.sub("\u202f\\1.", path),
+        nfd,
+        path.replace("'", "\u2019"),
+        nfd.replace("'", "\u2019"),
+    )
+    return tuple(dict.fromkeys(variant for variant in candidates if variant != path))
+
+
+def _resolve_literal_windows_pi_path(normalized: str, context: TrustedHostContext) -> ResolvedPath:
+    """Resolve a Windows Pi path literally (skipping only %VAR% expansion), matching Pi 1.5.0."""
+    literal = ntpath.normpath(_windows_absolute(normalized, context, expand_env=False))
+    result = context.resolver(literal)
+    if not isinstance(result, ResolvedPath) or result.kind not in (
+        "file",
+        "new-file",
+        "directory",
+        "unknown",
+    ):
+        raise ValueError("Invalid host path resolution")
+    if not ntpath.isabs(result.path):
+        raise ValueError("Host resolution returned a relative path")
+    final = _windows_absolute(result.path, context, expand_env=False)
+    return ResolvedPath(ntpath.normpath(final), result.kind)
+
+
+def _resolve_pi_path(
+    path: str, context: TrustedHostContext, *, read_fallbacks: bool = False
+) -> tuple[ResolvedPath, str, ResolvedPath | None]:
+    """Bind OS and Pi lexical/literal/fallback targets independently so no error skips a guard."""
+    windows = context.platform == "windows"
+    normalized = _normalize_pi_path(path, windows=windows)
+    physical: ResolvedPath | None = None
+    with contextlib.suppress(OSError, RuntimeError, ValueError):
+        physical = _resolve(normalized, context)
+    lexical = ""
+    lexical_resolved: ResolvedPath | None = None
+    with contextlib.suppress(OSError, RuntimeError, ValueError):
+        lexical = _lexical_pi_path(path, context)
+        lexical_resolved = _resolve(lexical, context)
+    literal_resolved: ResolvedPath | None = None
+    if windows and "%" in normalized:
+        with contextlib.suppress(OSError, RuntimeError, ValueError):
+            literal_resolved = _resolve_literal_windows_pi_path(normalized, context)
+    primary = physical or literal_resolved or lexical_resolved
+    if primary is None:
+        return ResolvedPath(path, "unknown"), path, None
+    secondary = lexical_resolved
+    bound_text = lexical or primary.path
+    if literal_resolved is not None and literal_resolved != primary:
+        secondary = literal_resolved
+        bound_text = literal_resolved.path
+    if read_fallbacks and (secondary or primary).kind == "new-file" and lexical:
+        for variant in _pi_read_fallback_variants(lexical):
+            with contextlib.suppress(OSError, RuntimeError, ValueError):
+                candidate = _resolve(variant, context)
+                if candidate.kind != "new-file":
+                    secondary = candidate
+                    bound_text = variant
+                    break
+    alternate = secondary if secondary is not None and secondary != primary else None
+    return primary, bound_text, alternate
+
+
+def _validate_optional_number(
+    arguments: Mapping[str, object],
+    key: str,
+    *,
+    allow_zero: bool = False,
+    integer_only: bool = False,
+) -> None:
+    if key not in arguments:
+        return
+    value = arguments[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"Invalid {key}")
+    if (value < 0 if allow_zero else value <= 0) or (
+        integer_only and isinstance(value, float) and not value.is_integer()
+    ):
+        raise ValueError(f"Invalid {key}")
+
+
+def _validate_optional_bool(arguments: Mapping[str, object], key: str) -> None:
+    if key in arguments and not isinstance(arguments[key], bool):
+        raise ValueError(f"Invalid {key}")
+
+
 def _command_text(command: str) -> str:
     chunks = [command]
     current = [command]
@@ -724,6 +922,39 @@ def _command_text(command: str) -> str:
         chunks.extend(following)
         current = following
     raise ValueError("Encoded command nesting too deep")
+
+
+def _is_windows_ads_path(path: str, *, allow_ps_provider: bool = False) -> bool:
+    """True when a Windows path names an NTFS alternate data stream after the drive prefix."""
+    normalized = path.replace("/", "\\")
+    if allow_ps_provider and _POWERSHELL_PROVIDER_PREFIX.match(normalized):
+        return False
+    _, tail = ntpath.splitdrive(normalized)
+    return ":" in tail
+
+
+def _bind_file_target(
+    path: str,
+    context: TrustedHostContext,
+    *,
+    pi_path: bool = False,
+    read_fallbacks: bool = False,
+) -> tuple[ResolvedPath, str, ResolvedPath | None]:
+    """Bind a validated string file path; binding failures degrade to kind='unknown'."""
+    if "\x00" in path:
+        raise ValueError("Missing or malformed path")
+    windows = context.platform == "windows"
+    if pi_path:
+        # Structural Pi path rejections (file:// URI, empty after @) stay invalid.
+        _normalize_pi_path(path, windows=windows)
+        try:
+            return _resolve_pi_path(path, context, read_fallbacks=read_fallbacks)
+        except (OSError, RuntimeError, ValueError):
+            return ResolvedPath(path, "unknown"), path, None
+    try:
+        return _resolve(path, context), path, None
+    except (OSError, RuntimeError, ValueError):
+        return ResolvedPath(path, "unknown"), path, None
 
 
 def _checked_agy_delegation(arguments: Mapping[str, object], context: TrustedHostContext) -> bool:
@@ -853,19 +1084,53 @@ def _adapt_unbound_call(
                 if path.startswith("/")
                 else context.workspace.rstrip("/\\") + "/" + path
             )
-            return ToolIntent(
-                ToolKind.OTHER, name, digest, context, target=_resolve(target, context)
-            )
+            target_resolved, _, _ = _bind_file_target(target, context)
+            return ToolIntent(ToolKind.OTHER, name, digest, context, target=target_resolved)
         if name in _READ_PATH:
             path = _required_text(arguments, _READ_PATH[name])
+            target, bound_text, alternate = _bind_file_target(
+                path, context, pi_path=(name in _PI_PATH_TOOLS), read_fallbacks=(name == "read")
+            )
             return ToolIntent(
                 ToolKind.READ,
                 name,
                 digest,
                 context,
-                target=_resolve(path, context),
-                target_text=path,
+                target=target,
+                source=alternate,
+                target_text=bound_text,
             )
+        if name in _PI_OPTIONAL_READ_PATH:
+            if name in ("grep", "find"):
+                _required_text(arguments, "pattern")
+            if name == "grep":
+                if "glob" in arguments and not isinstance(arguments["glob"], str):
+                    raise ValueError("Invalid glob")
+                _validate_optional_bool(arguments, "ignoreCase")
+                _validate_optional_bool(arguments, "literal")
+                _validate_optional_number(arguments, "context", allow_zero=True)
+            _validate_optional_number(arguments, "limit")
+            if "path" not in arguments or arguments["path"] == "":
+                path = "."
+            elif isinstance(arguments["path"], str):
+                path = arguments["path"]
+            else:
+                raise ValueError("Invalid path")
+            target, bound_text, alternate = _bind_file_target(path, context, pi_path=True)
+            return ToolIntent(
+                ToolKind.READ,
+                name,
+                digest,
+                context,
+                target=target,
+                source=alternate,
+                target_text=bound_text,
+            )
+        if name == "tool_search":
+            if not re.sub(r"[\s\ufeff]+", "", _required_text(arguments, "query")):
+                raise ValueError("Empty tool_search query")
+            _validate_optional_number(arguments, "limit", integer_only=True)
+            return ToolIntent(ToolKind.READ, name, digest, context, detail="tool-search")
         if name in _EDIT_PATH:
             if name in ("write", "sys_os_write") and not isinstance(arguments.get("content"), str):
                 raise ValueError("Missing content")
@@ -883,46 +1148,89 @@ def _adapt_unbound_call(
                     raise ValueError("Missing or malformed edit content")
                 if edits is not None and not batch:
                     raise ValueError("Malformed batch edit content")
+            path = _required_text(arguments, _EDIT_PATH[name])
+            ads_write = (
+                f"Windows alternate data stream: {path}"
+                if context.platform == "windows" and _is_windows_ads_path(path)
+                else ""
+            )
+            target, bound_text, alternate = _bind_file_target(
+                path, context, pi_path=(name in _PI_PATH_TOOLS)
+            )
             return ToolIntent(
                 ToolKind.EDIT,
                 name,
                 digest,
                 context,
-                target=_resolve(_required_text(arguments, _EDIT_PATH[name]), context),
+                target=target,
+                source=alternate,
+                target_text=bound_text,
+                ads_write=ads_write,
             )
         if name in _EXEC_COMMAND:
             target = None
-            if name == "run_command":
+            command_opaque = False
+            opaque_detail = ""
+            if name == "bash" and context.platform == "windows" and not _windows_posix(context):
+                context = replace(context, shell="bash")
+            elif name == "powershell" and context.platform == "windows":
+                context = replace(context, shell="pwsh")
+            elif name == "run_command":
+                command = _required_text(arguments, _EXEC_COMMAND[name])
                 if context.platform == "windows":
                     context = replace(context, shell="pwsh")
+                raw_cwd = _required_text(arguments, "Cwd") if "Cwd" in arguments else None
                 if arguments.get("RunPersistent") or arguments.get("RequestedTerminalID"):
                     return ToolIntent(
-                        ToolKind.UNKNOWN,
+                        ToolKind.EXEC,
                         name,
                         digest,
                         context,
+                        command=command,
                         status="unknown",
+                        command_opaque=True,
+                        cwd_confirmed=False,
                         detail="Persistent terminal working directory cannot be confirmed",
                     )
-                if "Cwd" in arguments:
-                    target = _resolve(_required_text(arguments, "Cwd"), context)
-                    if target.kind != "directory":
-                        raise ValueError("Command Cwd must be a confirmed directory")
-                    context = replace(context, cwd=target.path)
-                    if context.platform == "windows":
-                        drive = ntpath.splitdrive(target.path)[0]
-                        if len(drive) == 2:
-                            context = replace(
-                                context,
-                                drive_cwds={**context.drive_cwds, drive.upper(): target.path},
-                            )
+                cwd_confirmed = True
+                if raw_cwd is not None:
+                    try:
+                        resolved_cwd = _resolve(raw_cwd, context)
+                        if resolved_cwd.kind != "directory":
+                            raise ValueError("Command Cwd must be a confirmed directory")
+                        target = resolved_cwd
+                        context = replace(context, cwd=target.path)
+                        if context.platform == "windows":
+                            drive = ntpath.splitdrive(target.path)[0]
+                            if len(drive) == 2:
+                                context = replace(
+                                    context,
+                                    drive_cwds={**context.drive_cwds, drive.upper(): target.path},
+                                )
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        command_opaque = True
+                        cwd_confirmed = False
+                        opaque_detail = str(exc)
+                return ToolIntent(
+                    ToolKind.EXEC,
+                    name,
+                    digest,
+                    context,
+                    command=command,
+                    target=target,
+                    command_opaque=command_opaque,
+                    cwd_confirmed=cwd_confirmed,
+                    detail=opaque_detail,
+                )
             return ToolIntent(
                 ToolKind.EXEC,
                 name,
                 digest,
                 context,
-                command=_command_text(_required_text(arguments, _EXEC_COMMAND[name])),
+                command=_required_text(arguments, _EXEC_COMMAND[name]),
                 target=target,
+                command_opaque=command_opaque,
+                detail=opaque_detail,
             )
         if name == "invoke_subagent":
             if context.agy_delegation_status == "failed":
@@ -959,7 +1267,7 @@ def _adapt_unbound_call(
             if kind is None:
                 raise ValueError(f"Unknown {name} action")
             target = (
-                _resolve(_required_text(arguments, "NotebookPath"), context)
+                _bind_file_target(_required_text(arguments, "NotebookPath"), context)[0]
                 if name == "notebook_edit"
                 else None
             )
@@ -1025,57 +1333,107 @@ def adapt_tool_call(
         workspace = _resolve(context.workspace, context)
         if workspace.kind != "directory":
             raise ValueError("Workspace cannot be confirmed")
-        controls = tuple(_resolve(path, context).path for path in context.control_paths)
+        resolved_controls = tuple(_resolve(path, context) for path in context.control_paths)
+        controls = tuple(item.path for item in resolved_controls)
+        control_kinds = tuple(item.kind for item in resolved_controls)
+        readable_subtrees = tuple(
+            (_absolute(path, context), resolved.path, resolved.kind)
+            for path in context.readable_control_subtrees
+            for resolved in (_resolve(path, context),)
+        )
         exact, prefixes = _protected_paths(context)
-        agy_powershell = bool(
-            intent.command and intent.name == "run_command" and context.platform == "windows"
-        )
-        version_query = agy_powershell and is_powershell_version_query(intent.command)
-        paths, recursive_paths = (
-            _command_paths(intent.command, intent.context, agy_powershell=agy_powershell)
-            if intent.command and not version_query
-            else ((), ())
-        )
-        bound = replace(
-            intent,
-            workspace_path=workspace,
-            resolved_control_paths=controls,
-            protected_exact_paths=tuple(_resolve(path, context).path for path in exact),
-            protected_prefix_paths=tuple(_resolve(path, context).path for path in prefixes),
-            command_paths=paths,
-            recursive_read_paths=recursive_paths,
-            command_uncertain=agy_powershell
-            and not version_query
-            and bool(re.search(r"[$`]|\[[\w.]+\]::", intent.command)),
-        )
-        if not intent.command:
-            return bound
-        try:
-            writes = _shell_writes(
-                intent.command,
-                intent.context,
-                0,
-                windows_posix_executor=_windows_posix(intent.context),
-            )
-        except _UnboundShellWrite as exc:
-            return replace(
-                bound,
-                status="unknown",
-                detail=str(exc),
-                unbound_write=True,
-                command_read_only=False,
-            )
-        return replace(
-            bound,
-            command_write_paths=writes.paths,
-            command_delete_paths=writes.deletes,
-            command_read_only=writes.read_only,
-            status="unknown" if writes.unbound_delete or writes.opaque_stdin else bound.status,
-            detail=writes.unbound_delete or writes.opaque_stdin or bound.detail,
-            unbound_write=bool(writes.unbound_delete),
-        )
+        protected_exact = tuple(_resolve(path, context).path for path in exact)
+        protected_prefix = tuple(_resolve(path, context).path for path in prefixes)
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
-        return replace(intent, status="invalid", detail=str(exc))
+        return replace(intent, gate_fault=str(exc) or type(exc).__name__)
+    bound = replace(
+        intent,
+        workspace_path=workspace,
+        resolved_control_paths=controls,
+        resolved_control_kinds=control_kinds,
+        resolved_readable_subtrees=readable_subtrees,
+        protected_exact_paths=protected_exact,
+        protected_prefix_paths=protected_prefix,
+    )
+    if not bound.command:
+        return bound
+    command_text = bound.command
+    command_opaque = bound.command_opaque
+    hidden_script = bound.hidden_script
+    opaque_detail = bound.detail if command_opaque else ""
+    try:
+        command_text = _command_text(bound.command)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        command_opaque = True
+        hidden_script = True
+        opaque_detail = opaque_detail or str(exc)
+    powershell_command = bool(
+        command_text
+        and bound.name in ("run_command", "powershell")
+        and context.platform == "windows"
+    )
+    version_query = powershell_command and is_powershell_version_query(command_text)
+    provider_seen: list[bool] = []
+    paths: tuple[str, ...] = ()
+    recursive_paths: tuple[str, ...] = ()
+    command_context = (
+        bound.context if bound.cwd_confirmed else replace(bound.context, cwd="", drive_cwds={})
+    )
+    if not version_query:
+        try:
+            paths, recursive_paths, paths_opaque = _command_paths(
+                command_text,
+                command_context,
+                agy_powershell=powershell_command,
+                provider_seen=provider_seen,
+            )
+            if paths_opaque:
+                command_opaque = True
+                opaque_detail = opaque_detail or paths_opaque
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            command_opaque = True
+            opaque_detail = opaque_detail or str(exc)
+    writes = _ShellWrites()
+    writes_failed_detail = ""
+    try:
+        writes = _shell_writes(
+            command_text,
+            command_context,
+            0,
+            windows_posix_executor=_windows_posix(command_context),
+        )
+    except _UnboundShellWrite as exc:
+        writes = _ShellWrites(unbound_write=str(exc), read_only=False)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        command_opaque = True
+        writes_failed_detail = str(exc)
+        writes = _ShellWrites(read_only=False)
+    if writes.opaque:
+        command_opaque = True
+        opaque_detail = opaque_detail or writes.opaque
+    if writes_failed_detail:
+        opaque_detail = opaque_detail or writes_failed_detail
+    if writes.opaque_stdin:
+        hidden_script = True
+    unbound_reason = writes.unbound_delete or writes.unbound_write
+    return replace(
+        bound,
+        command=command_text,
+        command_paths=paths,
+        recursive_read_paths=recursive_paths,
+        command_write_paths=writes.paths,
+        command_delete_paths=writes.deletes,
+        command_read_only=writes.read_only,
+        command_uncertain=powershell_command
+        and not version_query
+        and (bool(re.search(r"[$`]|\[[\w.]+\]::", command_text)) or bool(provider_seen)),
+        command_opaque=command_opaque,
+        hidden_script=hidden_script,
+        ads_write=writes.ads_write or bound.ads_write,
+        status="unknown" if unbound_reason or writes.opaque_stdin else bound.status,
+        detail=unbound_reason or writes.opaque_stdin or opaque_detail or bound.detail,
+        unbound_write=bool(unbound_reason),
+    )
 
 
 def _protected_paths(context: TrustedHostContext) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -1829,6 +2187,30 @@ def _git_subcommand(
     return None
 
 
+def _posix_raw_has_escape(raw: str) -> bool:
+    """True when a POSIX token uses a backslash that changes shell lexing."""
+    quote = ""
+    index = 0
+    while index < len(raw):
+        char = raw[index]
+        if quote == "'":
+            if char == "'":
+                quote = ""
+        elif quote == '"':
+            if char == "\\":
+                if index + 1 >= len(raw) or raw[index + 1] in ("\\", '"', "$", "`", "\n"):
+                    return True
+                index += 1
+            elif char == '"':
+                quote = ""
+        elif char == "\\":
+            return True
+        elif char in ("'", '"'):
+            quote = char
+        index += 1
+    return False
+
+
 def _windows_path_operands(
     tokens: list[str], raw_tokens: list[str], shell: str, *, posix_executor: bool
 ) -> tuple[list[str], list[str]]:
@@ -1836,8 +2218,9 @@ def _windows_path_operands(
     dialect = _command_name(shell)
     if posix_executor and dialect in _HEREDOC_SHELLS:
         offset = 0
-        while offset < len(raw_tokens) and re.match(
-            r"[A-Za-z_][A-Za-z0-9_]*=", raw_tokens[offset]
+        while offset < len(raw_tokens) and (
+            raw_tokens[offset] in _COMMAND_LEADS
+            or re.match(r"[A-Za-z_][A-Za-z0-9_]*=", raw_tokens[offset])
         ):
             offset += 1
         tokens, raw_tokens = tokens[offset:], raw_tokens[offset:]
@@ -1905,7 +2288,7 @@ def _windows_path_operands(
         or any(
             any(char in raw for char in "$`^!{}\r\n")
             or (dialect == "cmd" and any(char in raw for char in "%'"))
-            or (dialect in _HEREDOC_SHELLS and "\\" in raw)
+            or (dialect in _HEREDOC_SHELLS and _posix_raw_has_escape(raw))
             for raw in raw_tokens
         )
     ):
@@ -2138,6 +2521,10 @@ _WINDOWS_SHELL_TOKENS = (
     r"&>>|&>|>>|>\||>&|<<<|<<-|<<|<&|<>|&&|\|\||\|&|[;&|<>()\n]|"
     r"""(?:"[^"]*"|'[^']*'|[^\s"'|;&<>()])+"""
 )
+_CMD_SHELL_TOKENS = (
+    r"&>>|&>|>>|>\||>&|<<<|<<-|<<|<&|<>|&&|\|\||\|&|[;&|<>()\n]|"
+    r"""(?:"[^"]*"|[^\s"|;&<>()])+"""
+)
 
 
 def _windows_command_paths(
@@ -2148,32 +2535,35 @@ def _windows_command_paths(
     posix_executor: bool,
     assigned: frozenset[str] = frozenset(),
     agy_powershell: bool = False,
-) -> tuple[str, ...]:
+    provider_seen: list[bool] | None = None,
+) -> tuple[tuple[str, ...], str]:
     if depth > 3:
-        raise ValueError("Shell wrapper nesting cannot be checked")
-    paths = []
+        return (), "Shell wrapper nesting cannot be checked"
+    paths: list[str] = []
+    opaque = ""
     windows_posix = posix_executor and _windows_posix(context)
     if windows_posix:
         assigned |= _shell_assignments(command, context)
         end, outer, bodies, heredocs_closed = _shell_scan(command, binding_paths=True)
         if end != len(command) or not heredocs_closed:
-            raise ValueError("Uncheckable POSIX shell expansion")
-        command = outer
+            opaque = opaque or "Uncheckable POSIX shell expansion"
+        else:
+            command = outer
         for body in bodies:
-            paths.extend(
-                _windows_command_paths(
-                    body, context, depth + 1, posix_executor=True, assigned=assigned
-                )
+            sub_paths, sub_opaque = _windows_command_paths(
+                body, context, depth + 1, posix_executor=True, assigned=assigned
             )
+            paths.extend(sub_paths)
+            opaque = opaque or sub_opaque
     raw_tokens = []
     end = 0
     for match in re.finditer(_WINDOWS_SHELL_TOKENS, command):
         if command[end : match.start()].strip():
-            raise ValueError("Uncheckable Windows shell quoting")
+            opaque = opaque or "Uncheckable Windows shell quoting"
         raw_tokens.append(match[0])
         end = match.end()
     if command[end:].strip():
-        raise ValueError("Uncheckable Windows shell quoting")
+        opaque = opaque or "Uncheckable Windows shell quoting"
     tokens = [
         re.sub(
             r""""([^"]*)"|'([^']*)'""",
@@ -2184,10 +2574,11 @@ def _windows_command_paths(
     ]
     if _command_name(context.shell) == "cmd":
         if any(_cmd_raw_token_uncheckable(raw) for raw in raw_tokens):
-            raise ValueError("Uncheckable Windows shell quoting")
+            opaque = opaque or "Uncheckable Windows shell quoting"
     segments: list[list[str]] = [[]]
     raw_segments: list[list[str]] = [[]]
     candidates: list[tuple[str, TrustedHostContext]] = []
+    redirect_candidates: list[tuple[str, TrustedHostContext]] = []
     index = 0
     while index < len(tokens):
         raw = raw_tokens[index]
@@ -2198,8 +2589,12 @@ def _windows_command_paths(
         elif raw in (">", ">>", ">|", "&>", "&>>", ">&", "<", "<<", "<<-", "<<<", "<&", "<>"):
             index += 1
             if index == len(tokens) or re.fullmatch(r"[;&|<>()\n]+", raw_tokens[index]):
-                raise ValueError("Missing shell redirection target")
-            candidates.append((tokens[index], context))
+                opaque = opaque or "Missing shell redirection target"
+                if index < len(tokens):
+                    segments.append([])
+                    raw_segments.append([])
+                continue
+            redirect_candidates.append((tokens[index], context))
         else:
             segments[-1].append(tokens[index])
             raw_segments[-1].append(raw)
@@ -2233,15 +2628,17 @@ def _windows_command_paths(
                 if shell in ("cmd", "powershell", "pwsh") and len(segment) > option_index + 2
                 else segment[option_index + 1]
             )
-            paths.extend(
-                _windows_command_paths(
-                    inner,
-                    replace(context, shell=shell),
-                    depth + 1,
-                    posix_executor=posix_executor,
-                    assigned=assigned,
-                )
+            inner_paths, inner_opaque = _windows_command_paths(
+                inner,
+                replace(context, shell=shell),
+                depth + 1,
+                posix_executor=posix_executor,
+                assigned=assigned,
+                agy_powershell=agy_powershell and shell in ("powershell", "pwsh"),
+                provider_seen=provider_seen,
             )
+            paths.extend(inner_paths)
+            opaque = opaque or inner_opaque
             candidates.extend(
                 (value, context) for value in segment[:option_index] if not value.startswith("-")
             )
@@ -2289,19 +2686,30 @@ def _windows_command_paths(
                     ):
                         continue
                     segment, raw_segment = segment[1:], raw_segment[1:]
-            git_chdirs, segment_candidates = _windows_path_operands(
-                segment, raw_segment, context.shell, posix_executor=posix_executor
-            )
+            try:
+                git_chdirs, segment_candidates = _windows_path_operands(
+                    segment, raw_segment, context.shell, posix_executor=posix_executor
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                opaque = opaque or str(exc)
+                git_chdirs = ()
+                segment_candidates = tuple(
+                    value for value in segment[1:] if value and not value.startswith("-")
+                )
             target_context = context
             for chdir_token in git_chdirs:
                 if not chdir_token:
                     continue
-                expanded_dir = _expand_trusted(chdir_token, target_context, assigned)
-                if expanded_dir is None:
-                    raise _UnresolvedWindowsVariable(
-                        f"Unresolved Windows path variable: {chdir_token}"
-                    )
-                resolved_dir = _resolve(expanded_dir, target_context).path
+                try:
+                    expanded_dir = _expand_trusted(chdir_token, target_context, assigned)
+                    if expanded_dir is None:
+                        raise _UnresolvedWindowsVariable(
+                            f"Unresolved Windows path variable: {chdir_token}"
+                        )
+                    resolved_dir = _resolve(expanded_dir, target_context).path
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    opaque = opaque or str(exc)
+                    break
                 paths.append(resolved_dir)
                 target_context = replace(target_context, cwd=resolved_dir)
                 drive = ntpath.splitdrive(resolved_dir)[0]
@@ -2311,44 +2719,53 @@ def _windows_command_paths(
                         drive_cwds={**target_context.drive_cwds, drive.upper(): resolved_dir},
                     )
             candidates.extend((value, target_context) for value in segment_candidates)
-    for token, token_context in candidates:
-        if token:
+    for is_redirect, group in ((True, redirect_candidates), (False, candidates)):
+        for token, token_context in group:
+            if not token:
+                continue
             try:
-                expanded = _expand_trusted(token, token_context, assigned)
-            except _UnresolvedWindowsVariable:
-                if not agy_powershell or "$" not in token:
-                    raise
-                expanded = None
-            if expanded is None:
-                if agy_powershell and re.search(r"[$`]", token):
-                    if _DEVICE.match(token):
-                        raise ValueError("Windows device path")
-                    without_scope = re.sub(
-                        r"\$(?:env|global|local|private|script|using):", "$", token, flags=re.I
-                    )
-                    if ":" in ntpath.splitdrive(without_scope)[1]:
-                        raise ValueError("Windows alternate data stream")
-                    continue
-                raise _UnresolvedWindowsVariable(f"Unresolved Windows path variable: {token}")
-            token = expanded
-            paths.append(_resolve(token, token_context).path)
-    return tuple(paths)
+                try:
+                    expanded = _expand_trusted(token, token_context, assigned)
+                except _UnresolvedWindowsVariable:
+                    if not agy_powershell or "$" not in token:
+                        raise
+                    expanded = None
+                if expanded is None:
+                    if agy_powershell and re.search(r"[$`]", token):
+                        if _DEVICE.match(token):
+                            raise ValueError("Windows device path")
+                        without_scope = re.sub(
+                            r"\$(?:env|global|local|private|script|using):", "$", token, flags=re.I
+                        )
+                        if ":" in ntpath.splitdrive(without_scope)[1]:
+                            raise ValueError("Windows alternate data stream")
+                        continue
+                    raise _UnresolvedWindowsVariable(f"Unresolved Windows path variable: {token}")
+                token = expanded
+                if not is_redirect:
+                    if agy_powershell and _POWERSHELL_PROVIDER_PATH.match(token):
+                        if provider_seen is not None:
+                            provider_seen.append(True)
+                        continue
+                    if windows_posix:
+                        token = _map_windows_shell_path(token)
+                paths.append(_resolve(token, token_context).path)
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                opaque = opaque or str(exc)
+    return tuple(paths), opaque
 
 
 def _write_tokens(
-    command: str, *, windows: bool, windows_posix: bool = False
+    command: str, *, windows: bool, cmd_shell: bool = False
 ) -> tuple[list[str], list[str]]:
     """Tokens plus their original text, for binding shell write targets."""
     if windows:
-        pattern = (
-            _WINDOWS_SHELL_TOKENS
-            if windows_posix
-            else r"""[;&|<>()]+|(?:"[^"]*"|'[^']*'|[^\s"'|;&<>()])+"""
-        )
+        pattern = _CMD_SHELL_TOKENS if cmd_shell else _WINDOWS_SHELL_TOKENS
+        quote_pattern = r'"([^"]*)"' if cmd_shell else r""""([^"]*)"|'([^']*)'"""
         raw_tokens = re.findall(pattern, command)
         tokens = [
             re.sub(
-                r""""([^"]*)"|'([^']*)'""",
+                quote_pattern,
                 lambda match: next(value for value in match.groups() if value is not None),
                 token,
             )
@@ -2510,28 +2927,36 @@ def _command_paths(
     powershell: bool = False,
     depth: int = 0,
     agy_powershell: bool = False,
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Bind direct path operands; this does not interpret scripts or terminal state."""
+    provider_seen: list[bool] | None = None,
+) -> tuple[tuple[str, ...], tuple[str, ...], str]:
+    """Bind direct path operands per token/segment; retain bindable evidence alongside opacity."""
     if depth > 3:
-        raise ValueError("Shell wrapper nesting cannot be checked")
+        return (), (), "Shell wrapper nesting cannot be checked"
     if context.platform == "windows":
-        return _windows_command_paths(
+        win_paths, win_opaque = _windows_command_paths(
             command,
             context,
             depth,
             posix_executor=_windows_posix(context),
             agy_powershell=agy_powershell,
-        ), ()
+            provider_seen=provider_seen,
+        )
+        return win_paths, (), win_opaque
     command = command.replace("\\\n", "")
-    tokens, _raw = _write_tokens(command, windows=powershell)
-    paths = []
-    recursive_paths = []
+    opaque = ""
+    try:
+        tokens, _raw = _write_tokens(command, windows=powershell)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        opaque = str(exc)
+        tokens = _COMMAND_WORDS.findall(command)
+    paths: list[str] = []
+    recursive_paths: list[str] = []
     for index, _token in enumerate(tokens):
         wrapped = _wrapped_command(tokens, tokens, index, writes_only=False)
         if wrapped is None:
             continue
         shell, inner = wrapped
-        inner_paths, inner_recursive = _command_paths(
+        inner_paths, inner_recursive, inner_opaque = _command_paths(
             inner,
             replace(context, shell=shell),
             powershell=shell in ("powershell", "pwsh"),
@@ -2539,6 +2964,7 @@ def _command_paths(
         )
         paths.extend(inner_paths)
         recursive_paths.extend(inner_recursive)
+        opaque = opaque or inner_opaque
     segments: list[list[str]] = [[]]
     for token in tokens:
         if not token or token in (";", "&&", "||", "|", ">", ">>", "<", "(", ")", "\n"):
@@ -2558,11 +2984,16 @@ def _command_paths(
                 token = context.home + token[7:]
             if "$" in token or "=" in token:
                 continue
-            # Globs stay literal so a read of a globbed directory is still visible.
-            paths.append(_resolve(token, context).path)
+            try:
+                # Globs stay literal so a read of a globbed directory is still visible.
+                resolved_path = _resolve(token, context).path
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                opaque = opaque or str(exc)
+                continue
+            paths.append(resolved_path)
             if reading in _RECURSIVE_SHELL_READS:
-                recursive_paths.append(paths[-1])
-    return tuple(paths), tuple(recursive_paths)
+                recursive_paths.append(resolved_path)
+    return tuple(paths), tuple(recursive_paths), opaque
 
 
 @dataclass(frozen=True)
@@ -2574,6 +3005,9 @@ class _ShellWrites:
     unbound_delete: str = ""
     read_only: bool = True
     opaque_stdin: str = ""
+    unbound_write: str = ""
+    opaque: str = ""
+    ads_write: str = ""
 
     def merged(self, other: _ShellWrites) -> _ShellWrites:
         return _ShellWrites(
@@ -2582,6 +3016,9 @@ class _ShellWrites:
             self.unbound_delete or other.unbound_delete,
             self.read_only and other.read_only,
             self.opaque_stdin or other.opaque_stdin,
+            self.unbound_write or other.unbound_write,
+            self.opaque or other.opaque,
+            self.ads_write or other.ads_write,
         )
 
 
@@ -2753,7 +3190,7 @@ def _shell_segments(
             if op in _WRITE_REDIRECTIONS or (
                 op == ">&" and not destination.isdigit() and destination != "-"
             ):
-                if destination != "/dev/null" or windows:
+                if destination != "/dev/null" or (windows and not posix_stdin):
                     redirects.append(destination)
         else:
             if posix_stdin and not segment:
@@ -3004,7 +3441,7 @@ def _shell_writes(
         if (not windows and not powershell) and scan_end == len(command) and heredocs_closed
         else command,
         windows=windows or powershell,
-        windows_posix=windows_posix,
+        cmd_shell=windows and not powershell and _command_name(context.shell) == "cmd",
     )
     assigned = untrusted | _shell_assignments(command, context)
     nested = _ShellWrites()
@@ -3021,12 +3458,10 @@ def _shell_writes(
                     inherited_stdin=inherited_stdin,
                 )
             )
-        except _UnboundShellWrite:
-            raise
-        except (OSError, RuntimeError, TypeError, ValueError):
-            if windows_posix:
-                raise
-            continue
+        except _UnboundShellWrite as exc:
+            nested = nested.merged(_ShellWrites(unbound_write=str(exc), read_only=False))
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            nested = nested.merged(_ShellWrites(opaque=str(exc), read_only=False))
     cwds: frozenset[str] = frozenset((context.cwd,)) if known else frozenset()
     segments = _shell_segments(
         tokens,
@@ -3038,6 +3473,9 @@ def _shell_writes(
     paths: list[str] = []
     deletes: list[str] = []
     unbound = ""
+    unbound_write = ""
+    opaque = ""
+    ads_write = ""
     opaque_stdin = ""
     read_only = True
     for position, (segment, raws, redirects, _operator, stdin_connected) in enumerate(segments):
@@ -3064,35 +3502,94 @@ def _shell_writes(
                                 inherited_stdin=True,
                             )
                         )
-                    except _UnboundShellWrite:
-                        raise
-                    except (OSError, RuntimeError, TypeError, ValueError):
-                        if windows_posix:
-                            raise
-                        continue
+                    except _UnboundShellWrite as exc:
+                        nested = nested.merged(
+                            _ShellWrites(unbound_write=str(exc), read_only=False)
+                        )
+                    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                        nested = nested.merged(_ShellWrites(opaque=str(exc), read_only=False))
         deleting = _delete_segment(segment)
-        operands = (
-            _write_operands(
-                segment,
-                raws,
-                posix_shell=not windows and not powershell,
-                bsd_sed=context.platform == "darwin",
+        try:
+            operands: Iterable[str] = (
+                _write_operands(
+                    segment,
+                    raws,
+                    posix_shell=not windows and not powershell,
+                    bsd_sed=context.platform == "darwin",
+                )
+                if segment
+                else ()
             )
-            if segment
-            else ()
-        )
+        except _UnboundShellWrite as exc:
+            unbound_write = unbound_write or str(exc)
+            read_only = False
+            operands = ()
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            opaque = opaque or str(exc)
+            read_only = False
+            operands = ()
+        if windows and segment:
+            head_idx = _command_offset(segment)
+            seg_head = _command_name(segment[head_idx]) if head_idx < len(segment) else ""
+            if seg_head in _POWERSHELL_STREAM_WRITE_CMDLETS:
+                skip_next = False
+                for arg, raw_arg in zip(
+                    segment[head_idx + 1 :], raws[head_idx + 1 :], strict=False
+                ):
+                    if skip_next:
+                        skip_next = False
+                        continue
+                    if raw_arg.startswith(("'", '"')):
+                        continue
+                    folded = arg.casefold()
+                    if folded == "-stream" or folded.startswith(("-stream:", "-stream=")):
+                        ads_write = (
+                            ads_write or f"Windows alternate data stream: {seg_head} -Stream"
+                        )
+                        break
+                    if folded in {
+                        "-value",
+                        "-path",
+                        "-literalpath",
+                        "-encoding",
+                        "-delimiter",
+                        "-filter",
+                        "-include",
+                        "-exclude",
+                        "-credential",
+                        "-width",
+                    }:
+                        skip_next = True
         for target in (*redirects, *operands):
+            if windows and _is_windows_ads_path(target, allow_ps_provider=True):
+                ads_write = ads_write or f"Windows alternate data stream: {target}"
+                continue
             if deleting and ("{" in target or ".." in target.replace("\\", "/").split("/")):
                 unbound = unbound or _UNBOUND_DELETE
                 continue
-            bound = _bound_targets(target, cwds, context, assigned, windows_posix=windows_posix)
+            try:
+                bound = _bound_targets(
+                    target, cwds, context, assigned, windows_posix=windows_posix
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                if deleting:
+                    unbound = unbound or _UNBOUND_DELETE
+                else:
+                    unbound_write = unbound_write or str(exc)
+                    read_only = False
+                continue
             if bound is None:
                 if windows_posix and not deleting:
-                    raise _UnboundShellWrite("Shell write target cannot be bound")
+                    unbound_write = unbound_write or "Shell write target cannot be bound"
+                    read_only = False
+                    continue
                 expansion = re.search(r"[$`]", target)
                 literal = target[: expansion.start()] if expansion else ""
                 if literal.strip("/\\"):
-                    paths.extend(_bound_targets(literal, cwds, context, frozenset()) or ())
+                    try:
+                        paths.extend(_bound_targets(literal, cwds, context, frozenset()) or ())
+                    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                        opaque = opaque or str(exc)
                 if deleting and not unbound:
                     unbound = _UNBOUND_DELETE
                 continue
@@ -3105,18 +3602,23 @@ def _shell_writes(
                 continue
             inner_shell, inner = wrapped
             for cwd in sorted(cwds) or (context.cwd,):
-                nested = nested.merged(
-                    _shell_writes(
-                        inner,
-                        replace(context, cwd=cwd, shell=inner_shell),
-                        depth + 1,
-                        powershell=inner_shell in ("powershell", "pwsh"),
-                        untrusted=assigned,
-                        known=bool(cwds),
-                        windows_posix_executor=windows_posix_executor,
-                        inherited_stdin=stdin_connected and index == shell_offset,
+                try:
+                    nested = nested.merged(
+                        _shell_writes(
+                            inner,
+                            replace(context, cwd=cwd, shell=inner_shell),
+                            depth + 1,
+                            powershell=inner_shell in ("powershell", "pwsh"),
+                            untrusted=assigned,
+                            known=bool(cwds),
+                            windows_posix_executor=windows_posix_executor,
+                            inherited_stdin=stdin_connected and index == shell_offset,
+                        )
                     )
-                )
+                except _UnboundShellWrite as exc:
+                    nested = nested.merged(_ShellWrites(unbound_write=str(exc), read_only=False))
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    nested = nested.merged(_ShellWrites(opaque=str(exc), read_only=False))
             break
         chained = (
             _operator in ("", "&&")
@@ -3136,20 +3638,31 @@ def _shell_writes(
             if _command_name(segment[offset]) == "popd" or (arguments and arguments[0] == "-"):
                 cwds = frozenset()
             else:
-                bound = _bound_targets(
-                    arguments[0] if arguments else "~",
-                    cwds,
-                    context,
-                    assigned,
-                    windows_posix=windows_posix,
-                )
+                try:
+                    bound = _bound_targets(
+                        arguments[0] if arguments else "~",
+                        cwds,
+                        context,
+                        assigned,
+                        windows_posix=windows_posix,
+                    )
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    opaque = opaque or str(exc)
+                    bound = None
                 if not bound:
                     cwds = frozenset()
                 else:
                     cwds = frozenset(bound) if chained else cwds | frozenset(bound)
-    return _ShellWrites(tuple(paths), tuple(deletes), unbound, read_only, opaque_stdin).merged(
-        nested
-    )
+    return _ShellWrites(
+        tuple(paths),
+        tuple(deletes),
+        unbound,
+        read_only,
+        opaque_stdin,
+        unbound_write,
+        opaque,
+        ads_write,
+    ).merged(nested)
 
 
 def _write_operands(
@@ -3183,7 +3696,7 @@ def _write_operands(
                     conservative[index] = attached[1]
                     arguments[index - offset - 1] = "-t" + attached[1]
         operands = [value for value in arguments if value and not value.startswith("-")]
-        if command in ("cp", "copy", "copy-item", "install", "ln"):
+        if command in ("cp", "copy", "copy-item", "cpi", "install", "ln"):
             if offset and command not in ("install", "ln"):
                 return conservative
             options = arguments
@@ -3195,13 +3708,13 @@ def _write_operands(
             for index, value in enumerate(options):
                 if (
                     command in ("cp", "install", "ln") and value in ("-t", "--target-directory")
-                ) or (command == "copy-item" and value.lower() == "-destination"):
+                ) or (command in ("copy-item", "cpi") and value.lower() == "-destination"):
                     return options[index + 1 : index + 2] or conservative
                 if command in ("cp", "install", "ln") and value.startswith("--target-directory="):
                     return [value.split("=", 1)[1]]
                 if command in ("cp", "install", "ln") and value.startswith("-t") and value != "-t":
                     return [value[2:]]
-                if command == "copy-item" and value.lower().startswith("-destination:"):
+                if command in ("copy-item", "cpi") and value.lower().startswith("-destination:"):
                     return [value.split(":", 1)[1]]
             if any(
                 value.startswith("-") and value not in ("-T", "--no-target-directory", "--")
@@ -3209,14 +3722,37 @@ def _write_operands(
             ):
                 return conservative
             return operands[-1:]
-        if command in ("set-content", "add-content", "out-file"):
+        if command in _POWERSHELL_WRITE_CMDLETS:
             if offset:
                 return conservative
+            base_target: str | None = None
+            item_name: str | None = None
             for index, value in enumerate(arguments):
-                if value.lower() in ("-path", "-literalpath", "-filepath"):
-                    return arguments[index + 1 : index + 2] or conservative
-                if value.lower().startswith(("-path:", "-literalpath:", "-filepath:")):
-                    return [value.split(":", 1)[1]]
+                lowered = value.lower()
+                if lowered in ("-path", "-literalpath", "-filepath"):
+                    if index + 1 >= len(arguments):
+                        return conservative
+                    base_target = arguments[index + 1]
+                elif lowered.startswith(("-path:", "-literalpath:", "-filepath:")):
+                    base_target = value.split(":", 1)[1]
+                elif command in ("new-item", "ni") and lowered == "-name":
+                    if index + 1 >= len(arguments):
+                        return conservative
+                    item_name = arguments[index + 1]
+                elif command in ("new-item", "ni") and lowered.startswith("-name:"):
+                    item_name = value.split(":", 1)[1]
+            if command in ("new-item", "ni") and item_name is not None:
+                if base_target is None:
+                    base_target = operands[0] if operands else "."
+                sep = "\\" if "\\" in base_target or "\\" in item_name else "/"
+                combined = (
+                    item_name
+                    if ntpath.isabs(item_name) or item_name.startswith("/")
+                    else base_target.rstrip("/\\") + sep + item_name.lstrip("/\\")
+                )
+                return [combined, base_target]
+            if base_target is not None:
+                return [base_target]
             return (
                 conservative if any(value.startswith("-") for value in arguments) else operands[:1]
             )
@@ -3259,7 +3795,13 @@ def _write_operands(
             "rmdir",
             "unlink",
             "remove-item",
+            "ri",
             "move-item",
+            "mi",
+            "move",
+            "rename-item",
+            "rni",
+            "ren",
         ):
             # The program name and options are not operands; after -- everything is.
             operands = conservative[offset + 1 :]
@@ -3418,6 +3960,84 @@ def _names_key_file(command: str) -> str:
     return ""
 
 
+def _allowed_control_subtrees(
+    control: str,
+    original: str,
+    configured: tuple[tuple[str, str, str], ...],
+    context: TrustedHostContext,
+    windows: bool,
+) -> tuple[tuple[str, str], ...]:
+    """Target-scoped readable directory subtrees strictly tied to their owning control root."""
+    joined = ntpath.join if windows else os.path.join
+    norm = (lambda value: ntpath.normcase(ntpath.normpath(value))) if windows else os.path.normpath
+    sep = "\\" if windows else "/"
+    orig_norm = norm(_absolute(original, context))
+    ctrl_norm = norm(control)
+    subtrees: list[tuple[str, str]] = []
+    for lexical_sub, resolved_sub, kind in configured:
+        if kind != "directory":
+            continue
+        lex_norm = norm(lexical_sub)
+        res_norm = norm(resolved_sub)
+        if lex_norm == orig_norm and res_norm == ctrl_norm:
+            subtrees.append((lexical_sub, resolved_sub))
+            continue
+        if _under(lex_norm, orig_norm, windows) and lex_norm != orig_norm:
+            rel = lex_norm[len(orig_norm) :].lstrip("\\/")
+            if not rel or ".." in rel.replace("\\", "/").split("/"):
+                continue
+            expected = norm(joined(ctrl_norm, rel.replace("/", sep) if windows else rel))
+            if res_norm == expected:
+                subtrees.append((lexical_sub, resolved_sub))
+            continue
+        if _under(orig_norm, lex_norm, windows) and orig_norm != lex_norm:
+            rel = orig_norm[len(lex_norm) :].lstrip("\\/")
+            if not rel or ".." in rel.replace("\\", "/").split("/"):
+                continue
+            expected_ctrl = norm(joined(res_norm, rel.replace("/", sep) if windows else rel))
+            if ctrl_norm == expected_ctrl:
+                subtrees.append((lexical_sub, resolved_sub))
+    return tuple(dict.fromkeys(subtrees))
+
+
+def _control_mentions_inside_subtrees(
+    command: str,
+    control: str,
+    original: str,
+    subtrees: tuple[str, ...],
+    roots: tuple[str, ...],
+    context: TrustedHostContext,
+    windows: bool,
+) -> bool:
+    """True when every literal mention of control in command lies strictly inside subtrees."""
+    if not subtrees:
+        return False
+    if any(_under(control, sub, windows) for sub in subtrees):
+        return True
+    haystack = command.casefold().replace("/", "\\") if windows else command
+    forms: list[str] = []
+    for base in (control, _absolute(original, context)):
+        for form in _path_forms(base, context):
+            forms.append(form.casefold().replace("/", "\\") if windows else form)
+    forms = sorted(set(forms), key=len, reverse=True)
+    found = False
+    for form in forms:
+        pattern = re.compile(
+            r"(?<![\w./~\\-])" + re.escape(form) + r"(?![\w.-])([^\s'\"|;&()<>]*)"
+        )
+        for match in pattern.finditer(haystack):
+            found = True
+            suffix = match.group(1)
+            if ".." in suffix.replace("\\", "/").split("/"):
+                return False
+            candidate = control.rstrip("/\\") + suffix
+            if not any(_under(candidate, sub, windows) for sub in subtrees):
+                return False
+            if _key_read(candidate, roots, windows):
+                return False
+    return found
+
+
 def _control_refusal(
     intent: ToolIntent,
     control: str,
@@ -3425,8 +4045,10 @@ def _control_refusal(
     context: TrustedHostContext,
     windows: bool,
     reasons: tuple[str, str],
-) -> str:
-    """Refuse writes and key-bearing reads; allow skills, notes and extensions."""
+    *,
+    control_kind: str = "",
+) -> tuple[Literal["", "deny", "ask"], str]:
+    """Refuse writes and key-bearing reads; allow skills, notes, extensions and D4 subtrees."""
     control_reason, credential_reason = reasons
     joined = ntpath.join if windows else os.path.join
     readable = any(
@@ -3434,6 +4056,11 @@ def _control_refusal(
         for root in (context.home, context.workspace)
         for name in _READABLE_CONTROL_DIRECTORIES
     )
+    subtree_pairs = _allowed_control_subtrees(
+        control, original, intent.resolved_readable_subtrees, context, windows
+    )
+    subtrees = tuple(resolved_sub for _, resolved_sub in subtree_pairs)
+    lexical_subtrees = tuple(lexical_sub for lexical_sub, _ in subtree_pairs)
     roots = tuple(
         joined(root, *parts).rstrip("\\" if windows else "/")
         for root in (context.home, context.workspace)
@@ -3447,24 +4074,74 @@ def _control_refusal(
             and target.kind == "file"
             and context.readable_control_file == (original, target.path)
         ):
-            return ""
+            return "", ""
         try:
             typed = _absolute(intent.target_text, context) if intent.target_text else ""
         except ValueError:
             typed = ""
-        for path in dict.fromkeys((typed or target.path, target.path)):
-            if not (
-                _under(path, control, windows) or (recursive and _under(control, path, windows))
-            ):
+        home_control = any(
+            _under(control, joined(context.home, name), windows)
+            for name in _READABLE_CONTROL_DIRECTORIES
+        )
+        workspace = intent.workspace_path.path if intent.workspace_path is not None else ""
+        resolved_targets = [target.path]
+        if intent.source is not None:
+            resolved_targets.append(intent.source.path)
+        check_paths = [typed or target.path, *resolved_targets]
+        deduped = list(dict.fromkeys(check_paths))
+        resolved_in_subtrees = bool(subtrees) and all(
+            any(_under(path, sub, windows) for sub in subtrees) for path in resolved_targets
+        )
+        typed_in_subtrees = not typed or any(
+            _under(typed, sub, windows) for sub in (*lexical_subtrees, *subtrees)
+        )
+        all_in_subtrees = resolved_in_subtrees and typed_in_subtrees
+        control_inside_subtrees = any(_under(control, sub, windows) for sub in subtrees)
+        try:
+            orig_abs = _absolute(original, context)
+        except ValueError:
+            orig_abs = control
+        for path in deduped:
+            under_control = _under(path, control, windows) or _under(path, orig_abs, windows)
+            covers_control = recursive and (
+                _under(control, path, windows) or _under(orig_abs, path, windows)
+            )
+            if not (under_control or covers_control):
                 continue
             if not readable:
-                return control_reason
+                if not all_in_subtrees or (covers_control and not control_inside_subtrees):
+                    return "deny", control_reason
+                if _key_read(path, roots, windows, covers=recursive):
+                    return "deny", _credential_refusal(credential_reason, path)
+                continue
+            if (
+                intent.name in ("grep", "find")
+                and control_kind == "new-file"
+                and not under_control
+                and not home_control
+                and workspace
+                and _under(control, workspace, windows)
+                and _under(path, workspace, windows)
+            ):
+                continue
             if _key_read(path, roots, windows, covers=recursive):
-                return _credential_refusal(credential_reason, path)
-        return ""
+                return "deny", _credential_refusal(credential_reason, path)
+        return "", ""
     if not intent.command:
+        targets = [
+            p.path for p in (target, intent.source) if p is not None and p.kind != "unknown"
+        ]
+        if intent.target_text:
+            with contextlib.suppress(ValueError):
+                targets.append(_absolute(intent.target_text, context))
+        try:
+            orig_abs = _absolute(original, context)
+        except ValueError:
+            orig_abs = control
         return (
-            control_reason if target is not None and _under(target.path, control, windows) else ""
+            ("deny", control_reason)
+            if any(_under(p, control, windows) or _under(p, orig_abs, windows) for p in targets)
+            else ("", "")
         )
     mentioned = any(
         _mentions_path(intent.command, form, context)
@@ -3472,24 +4149,35 @@ def _control_refusal(
     )
     named = _names_key_file(intent.command)
     if mentioned and named:
-        return _credential_refusal(credential_reason, named)
+        return "deny", _credential_refusal(credential_reason, named)
     for candidate in intent.command_write_paths:
         if _under(candidate, control, windows):
-            return control_reason
-    allowed = readable and intent.command_read_only
+            return "deny", control_reason
     recursive_paths = frozenset(intent.recursive_read_paths)
     for candidate in intent.command_paths:
         if not _under(candidate, control, windows):
             continue
-        if not allowed:
-            return control_reason
+        candidate_allowed = intent.command_read_only and (
+            readable or any(_under(candidate, sub, windows) for sub in subtrees)
+        )
+        if not candidate_allowed:
+            return "deny", control_reason
         if _key_read(candidate, roots, windows) or (
             candidate in recursive_paths and _key_read(candidate, roots, windows, covers=True)
         ):
-            return _credential_refusal(credential_reason, candidate)
-    if mentioned and not allowed:
-        return control_reason
-    return ""
+            return "deny", _credential_refusal(credential_reason, candidate)
+    if mentioned:
+        mention_allowed = intent.command_read_only and (
+            readable
+            or _control_mentions_inside_subtrees(
+                intent.command, control, original, subtrees, roots, context, windows
+            )
+        )
+        if not mention_allowed:
+            if intent.command_opaque:
+                return "ask", control_reason
+            return "deny", control_reason
+    return "", ""
 
 
 def _validated_rules(
@@ -3599,7 +4287,7 @@ def _explanation(
 
 
 def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -> TierDecision:
-    """Return a pure decision; bad rules or path facts deny controlled calls."""
+    """Return a pure decision; bad rules or gate faults deny, uncertainty asks or allows per D3."""
     try:
         if tier not in PERMISSION_TIERS:
             raise ValueError("Unknown permission tier")
@@ -3607,18 +4295,10 @@ def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -
             return TierDecision(
                 Verdict.DENY, f"Malformed or unresolved tool call: {intent.detail}"
             )
+        if intent.gate_fault:
+            return TierDecision(Verdict.DENY, f"Permission check unavailable: {intent.gate_fault}")
         if tier == "full":
             return TierDecision(Verdict.ALLOW)
-        if intent.native_status == NativeSupportStatus.FAILED or (
-            intent.name == "subagent" and intent.native_status is None
-        ):
-            return TierDecision(
-                Verdict.DENY,
-                "Native support proof is missing"
-                if intent.native_status is None
-                else intent.detail or "Native support proof failed",
-                "native-proof",
-            )
         active, _, _, control_reason, protected_reason, credential_reason = _validated_rules(rules)
         context = intent.context
         if context.platform not in ("darwin", "linux", "windows"):
@@ -3645,30 +4325,67 @@ def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -
                 context.environment.get("SystemRoot") or context.environment.get("SYSTEMROOT")
             )
         ):
-            raise ValueError("Missing trusted Windows system root")
-        target = intent.target
-        if target is not None and target.kind == "unknown":
-            return TierDecision(Verdict.DENY, "Target type or final path cannot be confirmed")
+            return TierDecision(
+                Verdict.DENY, "Permission check unavailable: Missing trusted Windows system root"
+            )
         if intent.workspace_path is None or not intent.resolved_control_paths:
             raise ValueError("Missing bound host paths")
-        for original, path in zip(
-            context.control_paths, intent.resolved_control_paths, strict=True
+        # D2 positive matches run before any uncertainty outcome.
+        if intent.name in _NATIVE_GRANT_TOOLS:
+            return TierDecision(
+                Verdict.DENY,
+                intent.detail
+                or "Native permission grants cannot replace the session permission tier",
+            )
+        if intent.native_status == NativeSupportStatus.FAILED and (
+            intent.name not in _NATIVE_SUBAGENT_TOOLS
+            or intent.detail in _NATIVE_BOOTSTRAP_ERRORS
+            or bool(context.native_tools.get(intent.name))
         ):
-            refusal = _control_refusal(
-                intent, path, original, context, windows, (control_reason, credential_reason)
+            return TierDecision(
+                Verdict.DENY,
+                intent.detail or "Native support proof failed",
+                "native-proof",
             )
-            if refusal:
+        if intent.ads_write:
+            return TierDecision(
+                Verdict.DENY, f"Windows alternate data stream write is refused: {intent.ads_write}"
+            )
+        target = intent.target
+        control_kinds = (
+            intent.resolved_control_kinds
+            if len(intent.resolved_control_kinds) == len(intent.resolved_control_paths)
+            else ("",) * len(intent.resolved_control_paths)
+        )
+        opaque_control_mention = ""
+        for original, path, control_kind in zip(
+            context.control_paths, intent.resolved_control_paths, control_kinds, strict=True
+        ):
+            action, refusal = _control_refusal(
+                intent,
+                path,
+                original,
+                context,
+                windows,
+                (control_reason, credential_reason),
+                control_kind=control_kind,
+            )
+            if action == "deny":
                 return TierDecision(Verdict.DENY, refusal, "control-path")
-        if intent.unbound_write:
-            return TierDecision(Verdict.DENY, intent.detail, "unbound-write")
+            if action == "ask" and not opaque_control_mention:
+                opaque_control_mention = refusal
         if intent.kind == ToolKind.EDIT and target is not None:
-            is_protected = target.path in intent.protected_exact_paths or any(
-                _under(target.path, value, windows) for value in intent.protected_prefix_paths
-            )
-            if is_protected and tier == "auto":
-                return TierDecision(
-                    Verdict.DENY, f"{protected_reason}: {target.path}", "protected-path"
+            for bound_target in (
+                p for p in (target, intent.source) if p is not None and p.kind != "unknown"
+            ):
+                is_protected = bound_target.path in intent.protected_exact_paths or any(
+                    _under(bound_target.path, value, windows)
+                    for value in intent.protected_prefix_paths
                 )
+                if is_protected and tier == "auto":
+                    return TierDecision(
+                        Verdict.DENY, f"{protected_reason}: {bound_target.path}", "protected-path"
+                    )
         if intent.kind == ToolKind.EXEC and tier == "auto":
             for candidate in intent.command_write_paths:
                 if any(
@@ -3686,41 +4403,70 @@ def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -
                 if pattern.search(intent.command):
                     explanation = _explanation(intent.command, context.platform, rules.signatures)
                     return TierDecision(Verdict.DENY, f"{name}: {explanation or reason}", rule_id)
+        # D3 step 3: tool_search under plan -> DENY; READ/DELEGATE/framework -> ALLOW.
+        if intent.detail == "tool-search" and tier == "plan":
+            return TierDecision(Verdict.DENY, "Plan tier cannot activate deferred tools")
         if intent.kind in (ToolKind.READ, ToolKind.DELEGATE) or intent.detail in (
             "framework-question",
             "framework-control",
         ):
             return TierDecision(Verdict.ALLOW)
+        # D3 step 4: plan denies everything else.
         if tier == "plan":
             return TierDecision(
                 Verdict.DENY, "Plan tier permits only known reads and user questions"
             )
+        # D3 step 5: uncertainty -> ASK (auto / ask / accept-edits).
+        if opaque_control_mention:
+            return TierDecision(Verdict.ASK, opaque_control_mention, "control-path")
+        if intent.native_status == NativeSupportStatus.FAILED or (
+            intent.name == "subagent" and intent.native_status is None
+        ):
+            return TierDecision(
+                Verdict.ASK,
+                "Native support proof is missing"
+                if intent.native_status is None
+                else intent.detail or "Native support proof failed",
+                "native-proof",
+            )
+        if intent.unbound_write:
+            return TierDecision(
+                Verdict.ASK,
+                intent.detail or "Write or delete target cannot be bound",
+                "unbound-write",
+            )
+        if intent.kind != ToolKind.READ and any(
+            p is not None and p.kind == "unknown" for p in (target, intent.source)
+        ):
+            return TierDecision(Verdict.ASK, "Target type or final path cannot be confirmed")
         if intent.status == "unknown" or intent.kind == ToolKind.UNKNOWN:
-            if tier == "auto" and not intent.unseen_tool:
-                return TierDecision(
-                    Verdict.DENY, intent.detail or "This tool cannot yet be checked"
-                )
             return TierDecision(
                 Verdict.ASK, intent.detail or "Unknown tool needs one-time approval"
             )
-        if intent.command_uncertain:
-            return TierDecision(
-                Verdict.ASK, "PowerShell expansion or script needs one-time approval"
-            )
+        # D3 step 6: opaque or uncertain command -> auto ALLOW (D5 may ASK); ask/accept-edits ASK.
+        if intent.command_opaque or intent.command_uncertain:
+            if tier == "auto":
+                return TierDecision(Verdict.ALLOW)
+            return TierDecision(Verdict.ASK, intent.detail or "Command requires one-time approval")
+        # D3 step 7: ask / accept-edits / auto.
         if tier == "ask":
             return TierDecision(Verdict.ASK, "This tool call needs one-time approval")
         if tier == "accept-edits":
+            bound_targets = tuple(p for p in (target, intent.source) if p is not None)
             if (
                 intent.kind == ToolKind.EDIT
                 and target
-                and target.kind in ("file", "new-file")
-                and _under(target.path, intent.workspace_path.path, windows)
+                and all(
+                    item.kind in ("file", "new-file")
+                    and _under(item.path, intent.workspace_path.path, windows)
+                    for item in bound_targets
+                )
             ):
                 return TierDecision(Verdict.ALLOW)
             return TierDecision(Verdict.ASK, "This tool call needs one-time approval")
         return TierDecision(Verdict.ALLOW)
     except Exception as exc:  # noqa: BLE001 - a gate must deny on any check failure
-        return TierDecision(Verdict.DENY, f"Permission check failed: {type(exc).__name__}")
+        return TierDecision(Verdict.DENY, f"Permission check unavailable: {type(exc).__name__}")
 
 
 def format_denial_reason(

@@ -30,6 +30,7 @@ from omnigent.permission_tiers import (
 from omnigent.permission_tiers.host import (
     HOST_PERMISSION_STATE_FILE,
     HostPermissionState,
+    apply_auto_floor,
     local_host_context,
     read_host_permission_state,
 )
@@ -81,6 +82,7 @@ def decide(
             raise ValueError("Missing tool name")
         intent = adapt_tool_call(name, _object(call["args"]), context)
         decision = decide_tier(canonical, intent, rules)
+        decision = apply_auto_floor(canonical, intent, decision, floor="narrow")
         if decision.action == Verdict.ALLOW:
             return {"decision": "ask"}
         if decision.action == Verdict.DENY:
@@ -383,6 +385,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                     str(Path(permission_tiers.__file__).parent),
                     str(Path(__file__).resolve()),
                     *control_paths(tier_file.parent),
+                ),
+            )
+            package_root = Path(permission_tiers.__file__).resolve().parents[1]
+            context = replace(
+                context,
+                readable_control_subtrees=(
+                    str(package_root),
+                    str(tier_file.parent / "agy-home" / ".gemini" / "antigravity-cli" / "brain"),
+                    str(tier_file.parent / "agy-home" / ".gemini" / "antigravity-cli" / "builtin"),
                 ),
             )
             call = _object(payload.get("toolCall"))

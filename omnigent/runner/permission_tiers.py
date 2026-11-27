@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
-from omnigent import _platform
 from omnigent.permission_tiers import (
     NativeCallBinding,
     NativeInputSnapshot,
@@ -19,7 +18,6 @@ from omnigent.permission_tiers import (
     PermissionTier,
     TierDecision,
     Verdict,
-    is_powershell_version_query,
     load_rules,
 )
 from omnigent.permission_tiers.host import (
@@ -758,19 +756,6 @@ class PermissionTierRuntime:
             local_execution=True,
             acp_bridge_tool_name=name if call.get("bridge_tool") is True else None,
         )
-        if decision.action == Verdict.ALLOW and name == "run_command":
-            from omnigent.server.child_approvals import floor
-
-            command = arguments.get("CommandLine")
-            if (
-                not (
-                    _platform.IS_WINDOWS
-                    and isinstance(command, str)
-                    and is_powershell_version_query(command)
-                )
-                and floor({"phase": "acp_permission", "command": command}) == "user_only"
-            ):
-                return TierDecision(Verdict.ASK, "Command requires user approval"), tier
         return decision, tier
 
     def _evaluate(
@@ -798,7 +783,7 @@ class PermissionTierRuntime:
             and (local_execution or pi_scope is not None)
             and harness in ("pi", "pi-native")
         ):
-            from omnigent.permission_tiers import _READ_PATH
+            from omnigent.permission_tiers import _PI_BUILTIN_TOOLS, _READ_PATH
             from omnigent.permission_tiers.pi_tools import read_pi_tool_registry
 
             bridge = (
@@ -841,14 +826,36 @@ class PermissionTierRuntime:
                 if required:
                     return TierDecision(Verdict.DENY, registry.reason)
             extensions = dict(registry.extensions)
-            if pi_scope is not None and name in registry.bridge_tools and "__" not in name:
+            if (
+                name in _PI_BUILTIN_TOOLS
+                and name not in extensions
+                and (
+                    name in registry.bridge_tools
+                    or (name in registry.tool_names and name not in registry.builtin_tools)
+                )
+            ):
+                eval_local_execution = False
+            elif (
+                pi_scope is not None
+                and name in registry.bridge_tools
+                and "__" not in name
+                and name not in _PI_BUILTIN_TOOLS
+            ):
                 read_path_arg = _READ_PATH.get(name)
                 if read_path_arg is None or isinstance(arguments.get(read_path_arg), str):
                     eval_local_execution = True
         agy_delegation: Literal["proven", "missing", "failed"] = "missing"
         readable_control_file = None
+        package_root = Path(__file__).resolve().parents[1]
+        readable_subtrees: list[str] = [str(package_root)]
         if state.tier != "full" and harness == "antigravity-native":
             bridge_dir = self._paths[session_id].parent
+            readable_subtrees.extend(
+                (
+                    str(bridge_dir / "agy-home" / ".gemini" / "antigravity-cli" / "brain"),
+                    str(bridge_dir / "agy-home" / ".gemini" / "antigravity-cli" / "builtin"),
+                )
+            )
             if name == "invoke_subagent":
                 from omnigent.harnesses.antigravity_native.delegation_proof import (
                     delegation_status,
@@ -872,8 +879,12 @@ class PermissionTierRuntime:
             agy_delegation_status=agy_delegation,
             registry_tool_name=name if registry_tool else None,
             readable_control_file=readable_control_file,
+            readable_control_subtrees=tuple(readable_subtrees),
             auto_approval_floor=(
-                "narrow" if harness in ("pi", "pi-native") else is_acp_permission_harness(harness)
+                "narrow"
+                if harness in ("pi", "pi-native", "antigravity-native")
+                or is_acp_permission_harness(harness)
+                else False
             ),
             acp_bridge_tool_name=acp_bridge_tool_name,
         )

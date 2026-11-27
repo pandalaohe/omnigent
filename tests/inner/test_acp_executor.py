@@ -1426,7 +1426,7 @@ async def test_managed_agy_permission_logs_windows_auto_decision(
         ("command", None, "run_command", "allow"),
         ("command", "other", "run_command", "allow"),
         ("cwd", "execute", "run_command", "allow"),
-        ("script", "execute", "run_command", "ask"),
+        ("script", "execute", "run_command", "allow"),
         ("protected-write", "other", "write_to_file", "deny"),
         ("workspace-write", "edit", "write_to_file", "allow"),
         ("unknown", "other", "unknown", "ask"),
@@ -1851,18 +1851,18 @@ async def test_managed_agy_shell_options_keep_permission_denials(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("path", "expected"),
+    ("path", "expected", "asked"),
     [
-        (r"tmp\note.txt", (True, "once")),
-        (r"\\server\share\note.txt", (True, "once")),
-        ("/c/work/project/tmp/note.txt", (False, None)),
-        (r"C:\work\project\tmp\note.txt:stream", (False, None)),
-        (r"C:\Windows\System32\drivers\etc\hosts", (False, None)),
+        (r"tmp\note.txt", (True, "once"), False),
+        (r"\\server\share\note.txt", (True, "once"), False),
+        ("/c/work/project/tmp/note.txt", (True, "once"), True),
+        (r"C:\work\project\tmp\note.txt:stream", (False, None), False),
+        (r"C:\Windows\System32\drivers\etc\hosts", (False, None), False),
     ],
     ids=["relative", "unc", "msys-root", "ads", "protected-path"],
 )
 async def test_managed_agy_permission_applies_equal_tier_verdicts_to_write_path_aliases(
-    path, expected, windows_acp_permission_executor
+    path, expected, asked, windows_acp_permission_executor
 ) -> None:
     for target_field in ("Path", "TargetFile"):
         ex = windows_acp_permission_executor("auto")
@@ -1874,7 +1874,10 @@ async def test_managed_agy_permission_applies_equal_tier_verdicts_to_write_path_
         assert policy_call is not None
         assert policy_call.args[1]["name"] == "write_to_file"
         assert policy_call.args[1]["arguments"]["TargetFile"] == path
-        ex._elicitation_handler.assert_not_awaited()
+        if asked:
+            ex._elicitation_handler.assert_awaited_once()
+        else:
+            ex._elicitation_handler.assert_not_awaited()
 
 
 @pytest.mark.asyncio
