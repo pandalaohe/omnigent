@@ -3897,7 +3897,37 @@ async def test_project_blocked_agents_enforced_at_funnel_choice_routing_and_suba
     assert r6.status_code == 409, r6.text
     assert r6.json()["error"]["code"] == "agent_blocked_for_project"
 
-    # Scenario 30 (sub-agent): runner sub-agent of a running session is exempt after blocking
+    # Scenario 30 (sub-agent): runner sub-agent of a running session is exempt after blocking;
+    # blank sub_agent_name is rejected (400) and mismatched parent agent is still blocked (409).
+    r30_blank = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent_a,
+            "host_id": HOST,
+            "workspace": "/opt/work/project",
+            "project_id": proj_id,
+            "sub_agent_name": "   ",
+        },
+    )
+    assert r30_blank.status_code == 400, r30_blank.text
+
+    parent_b = env.store.create_conversation(
+        agent_id=agent_b, host_id=HOST, project_id=proj_id, workspace="/opt/work/project"
+    )
+    r30_spoof = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent_a,
+            "host_id": HOST,
+            "workspace": "/opt/work/project",
+            "project_id": proj_id,
+            "parent_session_id": parent_b.id,
+            "sub_agent_name": "helper-worker",
+        },
+    )
+    assert r30_spoof.status_code == 409, r30_spoof.text
+    assert r30_spoof.json()["error"]["code"] == "agent_blocked_for_project"
+
     parent_a = env.store.create_conversation(
         agent_id=agent_a, host_id=HOST, project_id=proj_id, workspace="/opt/work/project"
     )
@@ -4058,6 +4088,15 @@ async def test_j1_independent_opens_use_project_host_default_and_respect_boundar
             "orchestration": {"session_choice": "off"},
         },
     )
+
+    # Scenario 21: omit both project_id and agent_id without choice header → J1 fills default
+    r21_no_choice_hdr = await env.client.post(
+        "/v1/sessions/orchestrated",
+        headers={ORCHESTRATION_SOURCE_HEADER: env.parent.id},
+        json={"host_id": HOST, "workspace": "/opt/work/project"},
+    )
+    assert r21_no_choice_hdr.status_code == 201, r21_no_choice_hdr.text
+    assert r21_no_choice_hdr.json()["agent_id"] == agent_b
 
     r21_default = await env.client.post(
         "/v1/sessions/orchestrated",

@@ -29,7 +29,7 @@ from omnigent.project_agent_blocks import (
     check_default_agents_not_blocked,
     validate_blocked_agents,
 )
-from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runner.routing import RunnerRouter
 from omnigent.server.auth import AuthProvider
 from omnigent.server.project_archive import ProjectArchiveService
@@ -334,29 +334,64 @@ def create_projects_router(
         """
         user_id = require_user(request, auth_provider)
         await _require_private_source(request, user_id)
+        is_agent_caller = (
+            ORCHESTRATION_SOURCE_HEADER in request.headers
+            or RUNNER_TUNNEL_TOKEN_HEADER in request.headers
+            or getattr(request.state, "auth_purpose", None) == "runner"
+        )
         validated_config: dict[str, Any] | None = None
+        project: Project | None = None
         if body.config is not None:
             validated_config = _validate_config(body.config)
-            if ORCHESTRATION_SOURCE_HEADER in request.headers:
+            if is_agent_caller:
                 existing = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
-                if existing is not None and (
-                    _normalized_orchestration(existing.config)
-                    != _normalized_orchestration(validated_config)
-                    or (existing.config.get("blocked_agents") or {})
-                    != (validated_config.get("blocked_agents") or {})
-                ):
-                    raise OmnigentError(
-                        "Agent tools cannot change project orchestration or blocked agents "
-                        "through PATCH /v1/projects/{id}.",
-                        code=ErrorCode.FORBIDDEN,
+                if existing is None:
+                    raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+                expected_rev = project_config_revision(existing.config)
+
+                def _guarded_config_write(live_config: dict[str, Any]) -> dict[str, Any]:
+                    assert validated_config is not None
+                    live_blocked = live_config.get("blocked_agents")
+                    norm_live_blocked = (
+                        validate_blocked_agents(live_blocked)
+                        if isinstance(live_blocked, dict)
+                        else {}
                     )
-        project = await asyncio.to_thread(
-            project_store.update,
-            project_id,
-            user_id=user_id,
-            name=body.name,
-            config=validated_config,
-        )
+                    if _normalized_orchestration(live_config) != _normalized_orchestration(
+                        validated_config
+                    ) or norm_live_blocked != (validated_config.get("blocked_agents") or {}):
+                        raise OmnigentError(
+                            "Agent tools cannot change project orchestration or blocked agents "
+                            "through PATCH /v1/projects/{id}.",
+                            code=ErrorCode.FORBIDDEN,
+                        )
+                    return validated_config
+
+                project = await asyncio.to_thread(
+                    project_store.transform_config,
+                    project_id,
+                    user_id=user_id,
+                    expected_revision=expected_rev,
+                    transform=_guarded_config_write,
+                )
+                if project is None:
+                    raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+                if body.name is not None:
+                    project = await asyncio.to_thread(
+                        project_store.update,
+                        project_id,
+                        user_id=user_id,
+                        name=body.name,
+                        config=None,
+                    )
+        if project is None:
+            project = await asyncio.to_thread(
+                project_store.update,
+                project_id,
+                user_id=user_id,
+                name=body.name,
+                config=validated_config,
+            )
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         # A rename/config change is only ever seen by other connected clients

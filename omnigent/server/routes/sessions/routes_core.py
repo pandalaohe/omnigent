@@ -3135,10 +3135,7 @@ def register_core_routes(
                 if isinstance(payload, dict)
                 and (
                     payload.get("project_id") is not None
-                    or (
-                        request.headers.get("x-omnigent-session-choice") == "1"
-                        and ORCHESTRATION_SOURCE_HEADER in request.headers
-                    )
+                    or ORCHESTRATION_SOURCE_HEADER in request.headers
                     or (
                         payload.get("parent_session_id") is not None
                         and payload.get("agent_id") is None
@@ -9618,6 +9615,19 @@ def register_core_routes(
                     _delete_stored_session_bundle_after_failure, artifact_store, clone_location
                 )
 
+        from omnigent.project_agent_blocks import FORK_SAME_AGENT_LABEL_KEY
+
+        fork_extra_labels = (
+            {**(extra_labels or {}), FORK_SAME_AGENT_LABEL_KEY: "1"}
+            if not switching_agent
+            else extra_labels
+        )
+        fork_dropped_label_keys = (
+            {*(dropped_label_keys or ()), FORK_SAME_AGENT_LABEL_KEY}
+            if switching_agent
+            else dropped_label_keys
+        )
+
         try:
             new_conv = await asyncio.to_thread(
                 conversation_store.fork_conversation,
@@ -9639,8 +9649,8 @@ def register_core_routes(
                 override_reasoning_effort_set=effort_set,
                 override_terminal_launch_args=override_launch_args,
                 override_terminal_launch_args_set=launch_args_set,
-                dropped_label_keys=dropped_label_keys,
-                extra_labels=extra_labels,
+                dropped_label_keys=frozenset(fork_dropped_label_keys),
+                extra_labels=fork_extra_labels,
                 # Launch flags are CLI-specific. On an agent switch the fork may
                 # bind a different CLI (e.g. claude-code → pi), whose flag set
                 # differs — Claude Code's ``--permission-mode`` makes pi exit at

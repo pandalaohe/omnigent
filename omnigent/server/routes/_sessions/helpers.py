@@ -14362,10 +14362,12 @@ def _reject_server_reserved_label_seed(
             "MCP selection must be changed through the session MCP endpoint",
             code=ErrorCode.INVALID_INPUT,
         )
+    from omnigent.project_agent_blocks import FORK_SAME_AGENT_LABEL_KEY
     from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
     from omnigent.stores.conversation_store import (
         CREATED_BY_SESSION_LABEL_KEY,
         FAMILY_PIN_LABEL_PREFIX,
+        FORK_SOURCE_LABEL_KEY,
         SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
         SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
         SCHEDULED_TASK_LAUNCH_LABEL_KEY,
@@ -14394,6 +14396,8 @@ def _reject_server_reserved_label_seed(
         # Launches from a session carrying it are shared with that automation's grantees.
         SCHEDULED_TASK_LAUNCH_LABEL_KEY,
         CREATED_BY_SESSION_LABEL_KEY,
+        FORK_SOURCE_LABEL_KEY,
+        FORK_SAME_AGENT_LABEL_KEY,
     ):
         if key in labels:
             raise OmnigentError(

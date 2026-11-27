@@ -124,9 +124,27 @@ const NONE = "__none__";
 /** List-row id for the legacy all-hosts fallback row (never a real host id). */
 const ALL_HOSTS = "__all_hosts__";
 
-function resetDefaultsHelp(harness: string, capabilities?: HarnessCapabilityMap): string {
-  const native = callingDefaultParent(harness, capabilities) ? ", then Native host defaults" : "";
-  return `Clears this row; model first tries All hosts for the same agent, then all values use this host's Settings defaults${native}, then the agent's own default.`;
+function ResetDefaultsHelp({
+  harness,
+  capabilities,
+}: {
+  harness: string;
+  capabilities?: HarnessCapabilityMap;
+}) {
+  if (callingDefaultParent(harness, capabilities)) {
+    return (
+      <>
+        Clears this row; model first tries All hosts for the same agent, then all values use this
+        host&apos;s Settings defaults, then Native host defaults, then the agent&apos;s own default.
+      </>
+    );
+  }
+  return (
+    <>
+      Clears this row; model first tries All hosts for the same agent, then all values use this
+      host&apos;s Settings defaults, then the agent&apos;s own default.
+    </>
+  );
 }
 
 function CallingFieldLabel({ field }: { field: CallingDefaultField }) {
@@ -1442,7 +1460,7 @@ export function ProjectSettingsDialog({
         blocked: "default agent is blocked on this host",
       };
     }
-    let copyAgent = sourceAgent !== null;
+    const copyAgent = sourceAgent !== null;
     if (copyAgent && sourceAgent) {
       const selected = agentList.find((agent) => agent.id === sourceAgent);
       if (
@@ -1450,8 +1468,12 @@ export function ProjectSettingsDialog({
         selectedHarnessFor(selected) !== harness ||
         !agentUsableOnHost(selected, targetHost)
       ) {
-        copyAgent = false;
-        skipped.push("Agent unavailable");
+        return {
+          fields: {},
+          skipped: ["Agent unavailable"],
+          copyAgent: false,
+          blocked: "Agent unavailable",
+        };
       }
     }
     const targetAgent = copyAgent
@@ -1776,13 +1798,15 @@ export function ProjectSettingsDialog({
     const savedEntryOutcome = (collaboration?.setup_outcomes ?? []).find(
       (outcome) => outcome.host_id === row.hostId && outcome.kind === "entry",
     );
+    const activeOutcome = rowOutcome ?? savedEntryOutcome;
     const savedPath = savedEntries.get(row.hostId);
     const canRerun =
       projectId !== null &&
       savedPath !== undefined &&
       savedPath === row.path.trim() &&
       hostsById.get(row.hostId)?.status === "online" &&
-      (rowOutcome !== undefined || savedEntryOutcome !== undefined);
+      activeOutcome !== undefined &&
+      activeOutcome.status !== "not_configured";
     const rowError = entriesError?.hostId === row.hostId ? entriesError : null;
     if (!rowOutcomeWarning && !rowError && !canRerun) return null;
     return (
@@ -2004,7 +2028,7 @@ export function ProjectSettingsDialog({
             Reset to defaults
           </Button>
           <HelpTip label="About resetting defaults">
-            {resetDefaultsHelp(harness, capabilities)}
+            <ResetDefaultsHelp harness={harness} capabilities={capabilities} />
           </HelpTip>
         </div>
         <DropdownMenu

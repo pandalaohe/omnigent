@@ -1639,6 +1639,35 @@ async def admit_create(
             if drops and not await _close_drain_locks(app, owner, drops=drops):
                 raise HTTPException(503, {"code": "session_choice_unavailable"})
         if named:
+            if body.agent_id and project is not None:
+                from omnigent.native.native_coding_agents import public_agent_name
+                from omnigent.project_agent_blocks import assert_agent_allowed
+
+                named_agent_store = getattr(app.state, "agent_store", None)
+                named_agent = (
+                    await asyncio.to_thread(named_agent_store.get, body.agent_id)
+                    if named_agent_store is not None
+                    else None
+                )
+                named_host_store = getattr(app.state, "host_store", None)
+                named_host = (
+                    await asyncio.to_thread(named_host_store.get_host, host)
+                    if host is not None and named_host_store is not None
+                    else None
+                )
+                assert_agent_allowed(
+                    project=project,
+                    host_id=host,
+                    agent_id=body.agent_id,
+                    agent_label=(
+                        (public_agent_name(named_agent.name) or named_agent.name)
+                        if named_agent is not None
+                        else body.agent_id
+                    ),
+                    host_label=(
+                        named_host.name if named_host is not None and named_host.name else host
+                    ),
+                )
             work, _ = resolve_work_type(settings, body.work_type)
             if body.model_override is None:
                 link = resolved_link(

@@ -62,9 +62,10 @@ export function BlockedAgentsSection({
     [allAgents],
   );
   const inheritedSet = useMemo(() => new Set(inheritedBlocked), [inheritedBlocked]);
-  const ownOnly = useMemo(
-    () => ownBlocked.filter((id) => !inheritedSet.has(id)),
-    [ownBlocked, inheritedSet],
+  const ownSet = useMemo(() => new Set(ownBlocked), [ownBlocked]);
+  const inheritedOnly = useMemo(
+    () => inheritedBlocked.filter((id) => !ownSet.has(id)),
+    [inheritedBlocked, ownSet],
   );
 
   const searchable = addCandidates.length > COMBOBOX_OPTION_THRESHOLD;
@@ -218,14 +219,14 @@ export function BlockedAgentsSection({
           </Popover>
         </div>
       </div>
-      {inheritedBlocked.length === 0 && ownOnly.length === 0 ? (
+      {inheritedOnly.length === 0 && ownBlocked.length === 0 ? (
         <p className="text-xs text-muted-foreground">No agents blocked</p>
       ) : (
         <div
           className="flex min-w-0 flex-wrap gap-1.5"
           data-testid={`project-settings-blocked-chips-${hostKey}`}
         >
-          {inheritedBlocked.map((agentId) => (
+          {inheritedOnly.map((agentId) => (
             <span
               key={`inherited-${agentId}`}
               className="inline-flex max-w-full items-center gap-1.5 rounded-md border bg-muted/60 px-2 py-1 text-xs"
@@ -235,13 +236,16 @@ export function BlockedAgentsSection({
               <span className="shrink-0 text-muted-foreground">(All hosts)</span>
             </span>
           ))}
-          {ownOnly.map((agentId) => (
+          {ownBlocked.map((agentId) => (
             <span
               key={agentId}
               className="inline-flex max-w-full items-center gap-1.5 rounded-md border bg-background px-2 py-1 text-xs"
               data-testid={`project-settings-blocked-chip-${hostKey}-${agentId}`}
             >
               {renderChipContent(agentId)}
+              {inheritedSet.has(agentId) && (
+                <span className="shrink-0 text-muted-foreground">(All hosts)</span>
+              )}
               <button
                 type="button"
                 className="inline-flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground hover:text-foreground disabled:opacity-50"

@@ -2829,4 +2829,42 @@ describe("ProjectSettingsDialog", () => {
       "New project agent unavailable on this host",
     );
   });
+
+  it("keeps overlapping host-level blocked agent removable even when also blocked on All hosts", async () => {
+    const pi = pickerAgent({
+      id: "ag_pi",
+      name: "pi-native",
+      display_name: "Pi",
+      harness: "pi-native",
+    });
+    hostsMock.mockReturnValue({
+      data: [{ ...LAPTOP, configured_harnesses: { "pi-native": true } }],
+    });
+    availableAgentsMock.mockReturnValue({ data: [pi] });
+    listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/one")]);
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: {
+        blocked_agents: {
+          "*": ["ag_pi"],
+          h1: ["ag_pi"],
+        },
+      },
+    });
+    renderDialog();
+    const chip = await screen.findByTestId("project-settings-blocked-chip-h1-ag_pi");
+    expect(chip).toHaveTextContent("Pi");
+    expect(chip).toHaveTextContent("All hosts");
+    fireEvent.click(screen.getByTestId("project-settings-blocked-remove-h1-ag_pi"));
+    expect(screen.queryByTestId("project-settings-blocked-chip-h1-ag_pi")).not.toBeInTheDocument();
+    expect(screen.getByTestId("project-settings-blocked-inherited-h1-ag_pi")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        blocked_agents: { "*": ["ag_pi"] },
+      }),
+    );
+  });
 });

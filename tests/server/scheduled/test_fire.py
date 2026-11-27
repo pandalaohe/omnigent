@@ -6442,3 +6442,44 @@ async def test_fire_refuses_blocked_agent_before_worktree_creation(
     assert store.runs[0]["status"] == "failed"
     assert store.runs[0]["error_code"] == "agent_blocked_for_project"
     assert "blocked" in (store.runs[0]["error"] or "").lower()
+
+
+async def test_fire_refuses_blocked_agent_on_continued_sandbox_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Managed-continue sandbox reuse enforces project blocked_agents on the joined host."""
+    from omnigent.server.routes import sessions
+
+    task = _sandbox_continue_task(
+        last_run_conversation_id="conv_prev",
+        project_id="proj_1",
+        agent_id="ag_1",
+    )
+    own = continued_sandbox_host_id(task.id, task.workspace_id)
+    conv_store = _ExistingConversationStore(
+        _continued_session(host_id=own, workspace="/sandbox/ws")
+    )
+    managed_launch = AsyncMock()
+    monkeypatch.setattr(sessions, "_run_managed_launch", managed_launch)
+    store = FakeScheduledTaskStore(rows={"task_1": task})
+    hosts = FakeHostStore({own: _FakeHost(own, "local", sandbox_provider="agent_sandbox")})
+
+    deps = _deps(
+        store,
+        conversation_store=conv_store,
+        host_store=hosts,
+        sandbox_config=_FakeSandboxConfig(),
+        project_store=_project({"blocked_agents": {own: ["ag_1"]}}),
+    )
+
+    async def _launch(conv: Any, task_arg: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(deps, launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.created == []
+    managed_launch.assert_not_awaited()
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "agent_blocked_for_project"

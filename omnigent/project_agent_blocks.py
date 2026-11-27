@@ -13,8 +13,10 @@ from typing import Any
 from omnigent.calling_defaults import default_agent_for_host_or_legacy
 from omnigent.entities import Project
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.util.uuid import normalize_uuid
 
 RESERVED_ALL_HOSTS = "*"
+FORK_SAME_AGENT_LABEL_KEY = "omnigent.fork.same_agent"
 MAX_BLOCKED_HOSTS = 64
 MAX_BLOCKED_AGENTS_PER_HOST = 64
 MAX_AGENT_ID_LEN = 200
@@ -29,6 +31,13 @@ def _setting(value: object) -> str | None:
     if isinstance(value, str) and value.strip():
         return value
     return None
+
+
+def _norm_id(value: str) -> str:
+    """Normalize supported UUID spellings while preserving unknown ids."""
+    if value == RESERVED_ALL_HOSTS or value.startswith(_LIBRARY_AGENT_ID_PREFIX):
+        return value
+    return normalize_uuid(value) or value
 
 
 def validate_blocked_agents(value: object) -> dict[str, list[str]]:
@@ -53,6 +62,7 @@ def validate_blocked_agents(value: object) -> dict[str, list[str]]:
                 f"blocked_agents[{host_key!r}] supports at most "
                 f"{MAX_BLOCKED_AGENTS_PER_HOST} agents"
             )
+        norm_host = _norm_id(host_key)
         seen: set[str] = set()
         entries: list[str] = []
         for item in raw_agents:
@@ -61,12 +71,15 @@ def validate_blocked_agents(value: object) -> dict[str, list[str]]:
                     f"blocked_agents[{host_key!r}] entries must be non-empty strings "
                     f"of at most {MAX_AGENT_ID_LEN} characters"
                 )
-            if item in seen:
+            norm_item = _norm_id(item)
+            if norm_item in seen:
                 raise _invalid(f"blocked_agents[{host_key!r}] contains duplicate agent {item!r}")
-            seen.add(item)
-            entries.append(item)
+            seen.add(norm_item)
+            entries.append(norm_item)
         if entries:
-            normalized[host_key] = entries
+            if norm_host in normalized:
+                raise _invalid(f"blocked_agents contains duplicate host key {host_key!r}")
+            normalized[norm_host] = entries
     return normalized
 
 
@@ -81,18 +94,20 @@ def blocked_agents(config: Mapping[str, Any] | None, host_id: str | None) -> fro
     raw = config.get("blocked_agents")
     if not isinstance(raw, Mapping):
         return frozenset()
+    norm_target_host = _norm_id(host_id) if host_id is not None else None
+    wanted_keys: set[str] = {RESERVED_ALL_HOSTS}
+    if norm_target_host is not None and norm_target_host != RESERVED_ALL_HOSTS:
+        wanted_keys.add(norm_target_host)
     blocked: set[str] = set()
-    keys: tuple[str, ...] = (
-        (RESERVED_ALL_HOSTS,)
-        if host_id is None or host_id == RESERVED_ALL_HOSTS
-        else (RESERVED_ALL_HOSTS, host_id)
-    )
-    for key in keys:
-        items = raw.get(key)
+    for raw_key, items in raw.items():
+        if not isinstance(raw_key, str) or not raw_key.strip():
+            continue
+        if _norm_id(raw_key) not in wanted_keys:
+            continue
         if isinstance(items, list):
             for item in items:
                 if isinstance(item, str) and item.strip():
-                    blocked.add(item)
+                    blocked.add(_norm_id(item))
     return frozenset(blocked)
 
 
@@ -106,7 +121,7 @@ def check_default_agents_not_blocked(config: Mapping[str, Any]) -> None:
     :raises OmnigentError: ``INVALID_INPUT`` (400) naming host and agent.
     """
     legacy_agent = _setting(config.get("agent_id"))
-    if legacy_agent is not None and legacy_agent in blocked_agents(config, None):
+    if legacy_agent is not None and _norm_id(legacy_agent) in blocked_agents(config, None):
         raise _invalid(
             f"Default agent {legacy_agent!r} for host {RESERVED_ALL_HOSTS!r} cannot be blocked"
         )
@@ -119,7 +134,16 @@ def check_default_agents_not_blocked(config: Mapping[str, Any]) -> None:
         host_keys.update(k for k in raw_blocked if isinstance(k, str) and k != RESERVED_ALL_HOSTS)
     for host_id in sorted(host_keys):
         default_agent = default_agent_for_host_or_legacy(config, host_id)
-        if default_agent is not None and default_agent in blocked_agents(config, host_id):
+        if default_agent is None and isinstance(raw_defaults, Mapping):
+            norm_h = _norm_id(host_id)
+            for dk, dv in raw_defaults.items():
+                if isinstance(dk, str) and _norm_id(dk) == norm_h and isinstance(dv, Mapping):
+                    default_agent = _setting(dv.get("agent_id"))
+                    if default_agent is not None:
+                        break
+        if default_agent is not None and _norm_id(default_agent) in blocked_agents(
+            config, host_id
+        ):
             raise _invalid(
                 f"Default agent {default_agent!r} for host {host_id!r} cannot be blocked"
             )
@@ -140,7 +164,7 @@ def assert_agent_allowed(
     """
     if project is None or not agent_id or agent_id.startswith(_LIBRARY_AGENT_ID_PREFIX):
         return
-    if agent_id not in blocked_agents(project.config, host_id):
+    if _norm_id(agent_id) not in blocked_agents(project.config, host_id):
         return
     display_agent = agent_label or agent_id
     display_host = host_label or host_id or "all hosts"

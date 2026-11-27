@@ -17506,7 +17506,12 @@ async def _create_session_from_existing_agent_impl(
     # a parent clone for the session's whole life, off a request that was
     # wrong when it arrived. Reject it while the caller is still here to be
     # told, and leave the parent-fallback to the cases it fits.
-    if body.sub_agent_name:
+    if body.sub_agent_name is not None:
+        if not body.sub_agent_name.strip():
+            raise OmnigentError(
+                "sub_agent_name must be a non-empty string",
+                code=ErrorCode.INVALID_INPUT,
+            )
         await asyncio.to_thread(
             _require_declared_subagent,
             agent=agent,
@@ -17978,7 +17983,14 @@ async def _create_session_from_existing_agent_impl(
             "permission_tier is only supported by Pi and Antigravity sessions",
             code=ErrorCode.INVALID_INPUT,
         )
-    if body.sub_agent_name is None:
+    is_runner_subagent = bool(
+        body.sub_agent_name
+        and body.sub_agent_name.strip()
+        and body.parent_session_id is not None
+        and _parent_for_routing is not None
+        and _parent_for_routing.agent_id == agent.id
+    )
+    if not is_runner_subagent:
         effective_project_id = project_id or child_project_id
         if effective_project_id is not None and project_store is not None:
             if parent_project is not None and parent_project.id == effective_project_id:

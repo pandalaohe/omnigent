@@ -2383,7 +2383,7 @@ export function AgentHarnessPicker({
             data-testid="new-chat-landing-project-blocked-note"
             onSelect={() => onOpenProjectSettings?.()}
             disabled={!onOpenProjectSettings}
-            className="text-xs text-muted-foreground"
+            className="whitespace-normal break-words text-xs text-muted-foreground"
           >
             {projectBlockedCount} agents blocked for this project on this host
           </DropdownMenuItem>
@@ -4232,18 +4232,18 @@ function NewChatLandingContent({
   // Readiness is meaningful only for a connected host; managed sandboxes
   // provision their own tooling and should not drive fallback warnings.
   const harnessWarningHost = !sandboxSelected ? selectedHost : undefined;
-  const rememberedNativeAgent = harnessEntries.find((agent) => agent.id === pickedAgentId);
+  const rememberedNativeAgent = visibleHarnessEntries.find((agent) => agent.id === pickedAgentId);
   const rememberedHarnessResolution = useMemo(
     () =>
       resolveHarnessPreference(
-        harnessEntries.map((agent) => ({
+        visibleHarnessEntries.map((agent) => ({
           harness: nativeCodingAgentForAvailableAgent(agent)?.harness ?? agent.harness ?? "",
           readiness: harnessReadinessOnHost(agent.harness, harnessWarningHost),
           value: agent,
         })),
         rememberedNativeAgent?.harness,
       ),
-    [harnessEntries, harnessWarningHost, rememberedNativeAgent?.harness],
+    [visibleHarnessEntries, harnessWarningHost, rememberedNativeAgent?.harness],
   );
   const automaticHarnessFallback =
     projectParam === "" &&
@@ -6495,6 +6495,10 @@ function NewChatLandingContent({
     sandboxProviderRows,
   ]);
 
+  const projectBlockedKey = useMemo(
+    () => [...projectBlockedIds].sort().join(","),
+    [projectBlockedIds],
+  );
   // Calling-defaults seed (K8): once project + host are known, resolve the
   // agent / model / effort through the server chain and seed the untouched
   // pickers. A touched pick survives a host switch only while the new host
@@ -6508,7 +6512,7 @@ function NewChatLandingContent({
     if (seedHostId === null && !sandboxSelected) return;
     const seedProjectId = configProjectId ?? "";
     if (!seedProjectId && effectiveAgentId === null) return;
-    const seedKey = `${seedProjectId}|${seedHostId ?? "sandbox"}|${agentPickGenerationRef.current}`;
+    const seedKey = `${seedProjectId}|${seedHostId ?? "sandbox"}|${agentPickGenerationRef.current}|${projectBlockedKey}`;
     if (callingSeedAppliedRef.current === seedKey) return;
     // Claim the key before the fetch: a failure leaves today's generic
     // defaults in place instead of retrying on every render.
@@ -6562,6 +6566,7 @@ function NewChatLandingContent({
       carryEnabled,
       carry,
       isAgentUsable: (agentId) => {
+        if (projectBlockedIds.has(agentId)) return false;
         const entry = agentList.find((candidate) => candidate.id === agentId);
         if (!entry) return false;
         const harness = nativeCodingAgentForAvailableAgent(entry)?.harness ?? entry.harness ?? null;
@@ -6629,7 +6634,14 @@ function NewChatLandingContent({
     // Reads the live picks at resolve time; only host / project / agent picks
     // start a new seed (the applied key guards the rest).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectParam, configProjectId, selectedHostId, sandboxSelected, effectiveAgentId]);
+  }, [
+    projectParam,
+    configProjectId,
+    selectedHostId,
+    sandboxSelected,
+    effectiveAgentId,
+    projectBlockedKey,
+  ]);
 
   // While a project's config is still loading, the last cached picker snapshot
   // (this user × project) previews its model so the composer doesn't flash

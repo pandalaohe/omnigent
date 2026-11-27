@@ -1885,17 +1885,22 @@ def create_hosts_router(
             and conv.agent_id is not None
         ):
             from omnigent.native.native_coding_agents import public_agent_name
-            from omnigent.project_agent_blocks import assert_agent_allowed
+            from omnigent.project_agent_blocks import (
+                FORK_SAME_AGENT_LABEL_KEY,
+                assert_agent_allowed,
+            )
             from omnigent.stores.conversation_store import FORK_SOURCE_LABEL_KEY
 
-            fork_source_id = (conv.labels or {}).get(FORK_SOURCE_LABEL_KEY)
-            same_agent_fork = False
-            if fork_source_id:
-                fork_source = await asyncio.to_thread(
-                    conversation_store.get_conversation, fork_source_id
-                )
-                if fork_source is not None and fork_source.agent_id == conv.agent_id:
-                    same_agent_fork = True
+            conv_labels = conv.labels or {}
+            same_agent_fork = conv_labels.get(FORK_SAME_AGENT_LABEL_KEY) == "1"
+            if not same_agent_fork and FORK_SAME_AGENT_LABEL_KEY not in conv_labels:
+                fork_source_id = conv_labels.get(FORK_SOURCE_LABEL_KEY)
+                if fork_source_id:
+                    fork_source = await asyncio.to_thread(
+                        conversation_store.get_conversation, fork_source_id
+                    )
+                    if fork_source is not None and fork_source.agent_id == conv.agent_id:
+                        same_agent_fork = True
             if not same_agent_fork:
                 bind_project_store = getattr(request.app.state, "project_store", None)
                 bind_project = (

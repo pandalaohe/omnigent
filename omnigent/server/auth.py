@@ -985,6 +985,9 @@ class UnifiedAuthProvider(AuthProvider):
         # a hit on one path would replay past both checks on every other.
         grant_id = payload.get("grant_id")
         scope = payload.get("scope")
+        purpose = payload.get("purpose")
+        if isinstance(purpose, str) and purpose:
+            request.state.auth_purpose = purpose
         # Only client-credentials tokens (scope without a grant) are machine
         # principals. Every user-backed credential carries the account generation.
         if self._account_check is not None and not (scope is not None and grant_id is None):
@@ -1049,7 +1052,7 @@ class UnifiedAuthProvider(AuthProvider):
                 return None
             return user_id
 
-        if self._account_check is None:
+        if self._account_check is None and purpose is None:
             remaining = payload.get("exp", 0) - time.time()
             if remaining > 0:
                 self._cookie_cache[cache_key] = (user_id, time.monotonic() + remaining)

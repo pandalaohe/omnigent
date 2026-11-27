@@ -45,6 +45,13 @@ def test_validate_blocked_agents_normalizes_and_rejects_bad_shapes() -> None:
     assert validate_blocked_agents({}) == {}
     assert validate_blocked_agents({"*": ["ag_a"], "h1": []}) == {"*": ["ag_a"]}
 
+    # UUID spelling normalization: bare, dashed, and ag_/host_ prefixed forms compare equal.
+    dashed_agent = "187b7cb7-ac30-abf4-debf-aa578d052ec7"
+    assert validate_blocked_agents({"*": [dashed_agent]}) == {"*": [AGENT_CLAUDE]}
+    with pytest.raises(OmnigentError) as dup_exc:
+        validate_blocked_agents({"*": [AGENT_CLAUDE, f"ag_{AGENT_CLAUDE}"]})
+    assert dup_exc.value.code == ErrorCode.INVALID_INPUT
+
     for bad in (
         "not-a-dict",
         {"h1": "ag_a"},
@@ -111,6 +118,18 @@ def test_check_default_agents_not_blocked_invariant() -> None:
             {"agent_id": "ag_ag", "blocked_agents": {"host-a": ["ag_ag"]}}
         )
     assert exc3.value.code == ErrorCode.INVALID_INPUT
+
+    # Different UUID spellings for the same agent or host still trigger D5
+    dashed_host = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    dashed_agent = "187b7cb7-ac30-abf4-debf-aa578d052ec7"
+    with pytest.raises(OmnigentError) as exc4:
+        check_default_agents_not_blocked(
+            {
+                "calling_defaults": {f"host_{'a' * 32}": {"agent_id": AGENT_CLAUDE}},
+                "blocked_agents": {dashed_host: [dashed_agent]},
+            }
+        )
+    assert exc4.value.code == ErrorCode.INVALID_INPUT
 
 
 def test_resolve_calling_d6_harness_gate() -> None:
@@ -275,6 +294,30 @@ async def test_patch_project_validation_d5_d1_and_agent_tool_guard(rework_app: F
         assert r31_icon.status_code == 200, r31_icon.text
         assert r31_icon.json()["config"]["icon"] == "rocket"
 
+        # Scenario 31: runner callers without orchestration header → 403
+        from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+
+        r31_tunnel = await client.patch(
+            f"/v1/projects/{project_id}",
+            headers={RUNNER_TUNNEL_TOKEN_HEADER: "tok-runner"},
+            json={"config": {**stored_cfg, "blocked_agents": {_HOST_A: [AGENT_CLAUDE]}}},
+        )
+        assert r31_tunnel.status_code == 403
+
+        # auth_purpose="runner" (minted runner JWT) is also rejected on protected keys
+        @rework_app.middleware("http")
+        async def _tag_runner_purpose(request: Any, call_next: Any) -> Any:
+            if request.headers.get("x-test-runner-purpose") == "1":
+                request.state.auth_purpose = "runner"
+            return await call_next(request)
+
+        r31_jwt = await client.patch(
+            f"/v1/projects/{project_id}",
+            headers={"x-test-runner-purpose": "1"},
+            json={"config": {**stored_cfg, "orchestration": {"child_cap": 3}}},
+        )
+        assert r31_jwt.status_code == 403
+
 
 @pytest.mark.asyncio
 async def test_settings_get_single_row_and_put_rejects_other_harness_and_d5(
@@ -342,6 +385,28 @@ async def test_settings_get_single_row_and_put_rejects_other_harness_and_d5(
             },
         )
         assert r13_other.status_code == 400
+
+        # D5 on PUT /settings: setting host default agent to a blocked agent → 400
+        assert (
+            await client.patch(
+                f"/v1/projects/{project_id}",
+                json={
+                    "config": {
+                        "calling_defaults": {_HOST_A: {"agent_id": AGENT_CLAUDE}},
+                        "blocked_agents": {_HOST_A: [AGENT_ID]},
+                    }
+                },
+            )
+        ).status_code == 200
+        rev2 = (await client.get(url, params={"host_id": _HOST_A})).json()["revision"]
+        r13_d5 = await client.put(
+            url,
+            json={
+                "expected_revision": rev2,
+                "host": {"host_id": _HOST_A, "agent_id": AGENT_ID},
+            },
+        )
+        assert r13_d5.status_code == 400
 
 
 @pytest.mark.asyncio
@@ -433,6 +498,7 @@ def test_fork_switch_blocked_and_same_agent_fork_allowed(monkeypatch: pytest.Mon
     )
     agents = _switch_agent_store()
     agents._agents[target_id] = replace(agents._agents[target_id], session_id=None)
+    assert source.agent_id is not None
     cache = _StubAgentCache({source.agent_id: "claude-sdk", target_id: "claude-sdk"})
     monkeypatch.setattr(runtime, "get_agent_cache", lambda: cache)
     store = _ConversationStore({source.id: source})
@@ -630,3 +696,13 @@ async def test_first_bind_refuses_switched_fork_and_allows_same_agent_fork() -> 
         )
         assert r_same.status_code != 409
         assert admission.queued == ["conv_fork_same"]
+
+    # Server-reserved fork labels rejected on client writes, and FORK_SAME_AGENT_LABEL_KEY
+    # preserves exemption even when the source conversation has been deleted.
+    from omnigent.project_agent_blocks import FORK_SAME_AGENT_LABEL_KEY
+    from omnigent.server.routes._sessions.helpers import _reject_server_reserved_label_seed
+
+    for reserved_key in (FORK_SOURCE_LABEL_KEY, FORK_SAME_AGENT_LABEL_KEY):
+        with pytest.raises(OmnigentError) as exc:
+            _reject_server_reserved_label_seed({reserved_key: "1"}, at_creation=True)
+        assert exc.value.code == ErrorCode.INVALID_INPUT
