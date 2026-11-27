@@ -544,17 +544,21 @@ def test_is_interactive_windows_rejects_invalid_handle(
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setitem(sys.modules, "msvcrt", types.SimpleNamespace(get_osfhandle=lambda _fd: -1))
 
-    class _FailIfCalled:
+    calls: list[object] = []
+
+    class _SpyGetConsoleMode:
         argtypes: list[object] = []
         restype: object = None
 
-        def __call__(self, *_args: object) -> int:
-            raise AssertionError("GetConsoleMode must not be called for INVALID_HANDLE_VALUE")
+        def __call__(self, *args: object) -> int:
+            calls.append(args)
+            return 1
 
-    fake_kernel32 = types.SimpleNamespace(GetConsoleMode=_FailIfCalled())
+    fake_kernel32 = types.SimpleNamespace(GetConsoleMode=_SpyGetConsoleMode())
     monkeypatch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: fake_kernel32, raising=False)
     monkeypatch.setattr(sys, "stdin", _FakeFdTTY(0))
     assert ch._is_interactive(_FakeFdTTY(2)) is False
+    assert calls == []
 
 
 def test_windows_nul_eof_einval_never_prompts_or_opens_browser(
