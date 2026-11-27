@@ -208,6 +208,23 @@ async def test_duplicate_repost_restores_the_drained_pending_input(
     assert await _message_texts(client, session_id) == ["first msg"]
 
 
+async def test_mirror_of_a_runtime_notice_keeps_the_mark(
+    client: httpx.AsyncClient,
+) -> None:
+    """A native mirror of a server notice persists ``runtime_notice``; typed text does not."""
+    session_id = await _create_session(client, "notice-mirror")
+    notice = "[System: approval offered. Pass it on.\n{}]"
+    pending_inputs.record(session_id, [{"type": "input_text", "text": notice}], notice_item=True)
+    await _post_item(client, session_id, text=notice, source_id="rec-1:0:message")
+    pending_inputs.record(session_id, [{"type": "input_text", "text": "typed by hand"}])
+    await _post_item(client, session_id, text="typed by hand", source_id="rec-2:0:message")
+
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    assert [
+        (item["content"][0]["text"], item.get("runtime_notice") is True) for item in items
+    ] == [(notice, True), ("typed by hand", False)]
+
+
 async def test_bad_source_id_is_rejected(client: httpx.AsyncClient) -> None:
     session_id = await _create_session(client, "idem-bad")
     resp = await client.post(

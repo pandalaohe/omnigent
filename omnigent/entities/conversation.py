@@ -436,6 +436,9 @@ class MessageData(BaseModel):
         client-settable by convention, not a trust signal. Also exempts the
         message from legacy markup cleanup on import.
     :param subagent_return_id: Native task id of an explicitly completed child.
+    :param runtime_notice: ``True`` for a user-role notice the runtime posted on
+        its own (approval offer, wake or status notice), not text a person typed.
+        Display-only: clients render it as a compact row; the model sees the text.
     :param phase: Assistant-only harness label for the message, e.g. Codex
         ``"commentary"`` (progress), ``"partial_answer"`` or ``"final_answer"``.
         Stored as given so clients can act on values added later; ``None``
@@ -449,6 +452,7 @@ class MessageData(BaseModel):
     is_meta: bool = Field(default=False, exclude_if=lambda value: value is False)
     is_handover_note: bool = Field(default=False, exclude_if=lambda value: value is False)
     user_authored: bool = Field(default=False, exclude_if=lambda value: value is False)
+    runtime_notice: bool = Field(default=False, exclude_if=lambda value: value is False)
     subagent_return_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     # Peer inputs remain context after restart, never an executable recovery trigger.
     peer_message_id: str | None = Field(default=None, exclude_if=lambda value: value is None)

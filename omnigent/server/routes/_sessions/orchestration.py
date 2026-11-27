@@ -6153,6 +6153,14 @@ async def _persist_external_conversation_item_unlocked(
                 and match_method != "fifo_fallback"
             ):
                 item = item.model_copy(update={"created_by": drained.created_by})
+            if (
+                drained.notice_item
+                and isinstance(item.data, MessageData)
+                and match_method != "fifo_fallback"
+            ):
+                item = item.model_copy(
+                    update={"data": item.data.model_copy(update={"runtime_notice": True})}
+                )
             # A web client that sends stable_id gets store-level idempotency:
             # use it directly as the item id so the append is a no-op on retry.
             # source_id from the forwarder takes precedence when both are set.
@@ -11557,6 +11565,7 @@ async def _forward_event_to_runner(
     runner_body.pop("input_generation", None)
     runner_body.pop("_input_admission_required", None)
     runner_body.pop("_runtime_notice", None)
+    runner_body.pop("runtime_notice", None)
     requires_pi_input = await _resolve_harness_async(conv) == "pi"
 
     async def apply_input_identity(input_id: str) -> None:
@@ -12854,6 +12863,7 @@ async def _dispatch_session_event_to_runner_impl(
                     created_by=created_by,
                     stable_id=web_stable_id,
                     runtime_notice=body.data.get("_runtime_notice") is True,
+                    notice_item=body.data.get("runtime_notice") is True,
                     background_titles_enabled=background_titles_enabled,
                     admission_id=usage_admission["admission_id"] if usage_admission else None,
                     auto_retry=(
@@ -15885,6 +15895,7 @@ async def _post_system_message(
                 {"type": "input_text", "text": text},
                 *({"type": "input_image", "file_id": file_id} for file_id in (image_ids or [])),
             ],
+            "runtime_notice": True,
         },
     )
     if confirm_delivery:

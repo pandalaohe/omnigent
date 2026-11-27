@@ -574,6 +574,7 @@ function userMessageToBlock(item: MessageItem): UserMessageBlock {
         { type: "input_text" | "input_image" | "input_file" }
       > => c.type === "input_text" || c.type === "input_image" || c.type === "input_file",
     ),
+    ...(item.runtime_notice === true ? { runtimeNotice: true as const } : {}),
   };
 }
 

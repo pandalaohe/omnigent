@@ -370,6 +370,12 @@ describe("itemsToBlocks — flat shape", () => {
     ]);
   });
 
+  it("carries the server's runtime-notice mark onto the user block", () => {
+    const notice = { ...userMessage("resp_n", "Host load is high"), runtime_notice: true };
+    expect(itemsToBlocks([notice])).toMatchObject([{ type: "user_message", runtimeNotice: true }]);
+    expect(itemsToBlocks([userMessage("resp_u", "hello")])[0]).not.toHaveProperty("runtimeNotice");
+  });
+
   it.each([
     '<teammate-message teammate_id="reviewer">Review this</teammate-message>',
     '<agent-message from="reviewer">Review this</agent-message>',

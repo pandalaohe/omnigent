@@ -4760,6 +4760,8 @@ class SessionMessageItem(_SessionItemCommon):
     :param is_handover_note: ``True`` for a server-authored session handover.
     :param user_authored: ``True`` for confirmed or conservatively
         preserved user input; omitted when ``False``.
+    :param runtime_notice: ``True`` for a notice the runtime posted on its
+        own, rendered as a compact row; omitted when ``False``.
     :param subagent_return_id: Native task id of an explicitly completed
         child; omitted when unset.
     :param interrupted: ``True`` for a partial assistant response from an
@@ -4779,6 +4781,7 @@ class SessionMessageItem(_SessionItemCommon):
     is_meta: bool = False
     is_handover_note: bool = False
     user_authored: bool = False
+    runtime_notice: bool = False
     subagent_return_id: str | None = None
     peer_message_id: str | None = None
     auto_retry: AutoRetryMetadata | None = None

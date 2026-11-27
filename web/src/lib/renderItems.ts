@@ -237,6 +237,8 @@ export type Bubble =
        * optimistic→committed swap (no remount/flink).
        */
       stableKey?: string;
+      /** The server marked this message as a runtime notice. */
+      runtimeNotice?: true;
     }
   | {
       kind: "assistant";
@@ -975,6 +977,7 @@ function walkBubbles(
         // Carry the optimistic temp id (when promoted) so bubbleKey holds
         // steady across the optimistic→committed swap — no remount/flink.
         stableKey: b.type === "user_message" ? b.stableKey : undefined,
+        ...(b.type === "user_message" && b.runtimeNotice ? { runtimeNotice: true as const } : {}),
       });
       if (chipIndexes !== undefined) {
         for (const chipIndex of chipIndexes) {

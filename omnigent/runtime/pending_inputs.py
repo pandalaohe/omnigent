@@ -272,6 +272,8 @@ class DrainedInput:
     runner_claim_id: str | None = None
     sending_since_ms: int | None = None
     peer_message_id: str | None = None
+    # The persisted mirror is a runtime notice (``MessageData.runtime_notice``).
+    notice_item: bool = False
 
 
 @dataclass
@@ -359,6 +361,7 @@ class _Entry:
     auto_retry: AutoRetryMetadata | None = None
     peer_message_id: str | None = None
     runtime_notice: bool = False
+    notice_item: bool = False
     # The claiming attempt's runner confirmed its terminal holds this input.
     agent_received: bool = False
 
@@ -439,6 +442,7 @@ def record(
     runner_managed: bool = False,
     peer_message_id: str | None = None,
     runtime_notice: bool = False,
+    notice_item: bool = False,
 ) -> str:
     """
     Record an un-consumed web-composer user message.
@@ -464,6 +468,8 @@ def record(
         send one.
     :param auto_retry: Trusted marker from retry admission or a saved input;
         its input id must equal ``stable_id``.
+    :param notice_item: The message is a runtime notice; a text-matched
+        mirror persists with ``MessageData.runtime_notice``.
     :returns: The index-assigned pending id, e.g. ``"pending_a1b2c3"``.
 
     Beyond :data:`_MAX_ENTRIES_PER_CONVERSATION` unheld entries without a
@@ -494,6 +500,7 @@ def record(
             last_runner_renewal=_now() if runner_managed else None,
             peer_message_id=peer_message_id,
             runtime_notice=runtime_notice,
+            notice_item=notice_item,
         )
         entries = _pending.setdefault(conversation_id, {})
         entries[pending_id] = entry
@@ -1168,6 +1175,7 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         runner_claim_id=drained.runner_claim_id,
         sending_since_ms=drained.sending_since_ms,
         peer_message_id=drained.peer_message_id,
+        notice_item=drained.notice_item,
     )
     with _lock:
         entries = _pending.get(conversation_id, {})
@@ -1604,6 +1612,7 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         injected_prefix=entry.injected_prefix,
         auto_retry=entry.auto_retry,
         peer_message_id=entry.peer_message_id,
+        notice_item=entry.notice_item,
     )
 
 

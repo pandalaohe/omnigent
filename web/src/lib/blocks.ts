@@ -263,6 +263,8 @@ export interface UserMessageBlock {
    * Absent on blocks hydrated from history (`items`), which mount fresh.
    */
   stableKey?: string;
+  /** The server marked this message as a runtime notice (`runtime_notice`). */
+  runtimeNotice?: true;
 }
 
 // ── Tool calls ───────────────────────────────────────────

@@ -10066,6 +10066,7 @@ function committedUserBlock(
   createdAtS?: number,
   webStableId?: string,
   deliveryUnconfirmed = false,
+  runtimeNotice = false,
 ): UserMessageBlock {
   return {
     type: "user_message",
@@ -10088,6 +10089,7 @@ function committedUserBlock(
     },
     content,
     stableKey,
+    ...(runtimeNotice ? { runtimeNotice: true as const } : {}),
   };
 }
 
@@ -11479,6 +11481,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                   matched.createdAtS,
                   alias,
                   deliveryUnconfirmed,
+                  event.data.runtime_notice === true,
                 ),
               ),
             };
@@ -11520,6 +11523,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                 matchedHead.createdAtS,
                 alias,
                 deliveryUnconfirmed,
+                event.data.runtime_notice === true,
               ),
             ),
           };
@@ -11539,6 +11543,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
               undefined,
               alias,
               deliveryUnconfirmed,
+              event.data.runtime_notice === true,
             ),
           ),
         };

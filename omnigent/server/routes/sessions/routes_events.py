@@ -2414,6 +2414,12 @@ def register_events_routes(
         receipt = None
         if body.type == "message":
             answer_id = body.data.pop("workflow_answer", None)
+            # Only the server's own notices and a bound runner may mark a runtime notice.
+            claimed_notice = body.data.pop("runtime_notice", None) is True
+            if (claimed_notice and _has_runner_created_by_authority(request, conv)) or (
+                isinstance(request, Request) and getattr(request.state, "runtime_notice", False)
+            ):
+                body.data["runtime_notice"] = True
             for key in (
                 "auto_retry",
                 "retry_guard",
