@@ -705,9 +705,10 @@ class FakeWebSocket {
   emit(type: string, ev: unknown) {
     for (const fn of this.listeners[type] ?? []) fn(ev);
   }
-  open() {
+  open(sendLegacyOutput = true) {
     this.readyState = FakeWebSocket.OPEN;
     this.emit("open", {});
+    if (sendLegacyOutput) this.emit("message", { data: new ArrayBuffer(0) });
   }
 }
 
@@ -783,6 +784,91 @@ describe("TerminalSession", () => {
     );
     return { session, states, container, socket: FakeWebSocket.instances.at(-1)! };
   }
+
+  it("resumes at the last parsed byte and keeps the ConPTY screen and split escape", async () => {
+    const { session, states, socket } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    const epoch = "0123456789abcdef".repeat(2);
+    const resolve = async () => ({ url: "ws://example.test/attach?route=relay", isRelay: true });
+    const meta = (target: FakeWebSocket, offset: number, through: number, prelude: string | null) =>
+      target.emit("message", {
+        data: JSON.stringify({ type: "replay_meta", epoch, offset, through, prelude }),
+      });
+    const output = (target: FakeWebSocket, text: string | number[]) => {
+      const bytes = typeof text === "string" ? new TextEncoder().encode(text) : text;
+      const data = new ArrayBuffer(bytes.length);
+      new Uint8Array(data).set(bytes);
+      target.emit("message", { data });
+    };
+    const ack = (offset: number) => JSON.stringify({ type: "output_ack", offset });
+    const resizes = (target: FakeWebSocket) =>
+      target.sent.filter((data) => typeof data === "string" && data.includes('"resize"'));
+    expect(new URL(socket.url).searchParams.get("conpty_replay")).toBe("2");
+
+    socket.open(false);
+    term.resize(40, 8);
+    expect(session.canPaste()).toBe(false);
+    expect(resizes(socket)).toHaveLength(0);
+    expect(states).toHaveLength(0);
+    const before = "\x1b[?2004hbefore\r\n";
+    meta(socket, 0, before.length, "");
+    output(socket, before);
+    await vi.waitFor(() => expect(socket.sent).toContain(ack(before.length)));
+    expect(session.pastesBracketed()).toBe(true);
+
+    const partialEscape = "\x1b[3";
+    const cursor = before.length + partialEscape.length;
+    output(socket, partialEscape);
+    expect(socket.sent).not.toContain(ack(cursor));
+    expect(session.reconnect(resolve)).toBe(true);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    socket.emit("close", { code: 1006, reason: "late" });
+    expect(states.at(-1)).toEqual({ kind: "connected" });
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
+    const resumed = FakeWebSocket.instances[1]!;
+    expect(Object.fromEntries(new URL(resumed.url).searchParams)).toEqual({
+      route: "relay",
+      conpty_replay: "2",
+      replay_epoch: epoch,
+      since_offset: String(cursor),
+    });
+    resumed.open(false);
+    const missed = "1mafter\x1b[?2004l";
+    const through = cursor + missed.length;
+    meta(resumed, cursor, through, null);
+    expect(resizes(resumed)).toHaveLength(0);
+    expect(session.pastesBracketed()).toBe(true);
+    expect(session.paste("one\ntwo", false)).toBe(false);
+    expect(states).toHaveLength(1);
+    output(resumed, missed);
+    await vi.waitFor(() => expect(resumed.sent).toContain(ack(through)));
+    expect(session.bufferText()).toBe("before\nafter");
+    expect(term.buffer.active.getLine(1)?.getCell(0)?.getFgColor()).toBe(1);
+    expect(session.canPaste()).toBe(true);
+    expect(session.pastesBracketed()).toBe(false);
+    expect(resizes(resumed)).toHaveLength(1);
+    expect(states).toHaveLength(2);
+
+    output(resumed, [0xe4]);
+    await vi.waitFor(() => expect(resumed.sent).toContain(ack(through + 1)));
+    meta(resumed, 100, 105, "");
+    output(resumed, [0xbd, 0xa0, 0x6e, 0x65, 0x77]);
+    await vi.waitFor(() => expect(resumed.sent).toContain(ack(105)));
+    expect(session.bufferText()).toBe("new");
+
+    expect(session.reconnect(resolve)).toBe(true);
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(3));
+    const legacy = FakeWebSocket.instances[2]!;
+    legacy.open(false);
+    expect(session.canPaste()).toBe(false);
+    output(legacy, "full legacy history");
+    await vi.waitFor(() => expect(session.canPaste()).toBe(true));
+    expect(session.bufferText()).toBe("full legacy history");
+    expect(
+      legacy.sent.some((data) => typeof data === "string" && data.includes("output_ack")),
+    ).toBe(false);
+    session.dispose();
+  });
 
   it("requests paste without Enter for armed and recorded Cmd+V", () => {
     const clipboard = vi.fn();

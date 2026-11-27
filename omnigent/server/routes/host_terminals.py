@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import secrets
+from urllib.parse import urlencode
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request, Response, WebSocket
@@ -35,6 +36,7 @@ from omnigent.server.terminal_refusals import (
 )
 from omnigent.stores.host_store import Host
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.terminals.ws_common import terminal_replay_params
 
 
 def create_host_terminals_router(
@@ -192,12 +194,15 @@ def create_host_terminals_router(
             return
         await websocket.accept()
         browser_resize = websocket.headers.get("origin") not in (None, OMNIGENT_INTERNAL_WS_ORIGIN)
-        browser_resize_query = "?browser_resize=true" if browser_resize else ""
+        params = terminal_replay_params(websocket.query_params)
+        if browser_resize:
+            params["browser_resize"] = "true"
+        query = f"?{urlencode(params)}" if params else ""
         try:
             async with _TunneledWSConn(
                 registry=service.tunnels,
                 session=session,
-                runner_path=f"/v1/host-terminals/{terminal_id}/attach{browser_resize_query}",
+                runner_path=f"/v1/host-terminals/{terminal_id}/attach{query}",
             ) as runner_ws:
                 await _shuttle_ws_frames(websocket, runner_ws)
         except _RunnerWSClosed as exc:

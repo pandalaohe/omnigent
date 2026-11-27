@@ -460,6 +460,62 @@ function parseWindowsPtyMessage(message: string): IWindowsPty | null {
   return { backend: "conpty", buildNumber: pty.build };
 }
 
+interface ReplayPosition {
+  epoch: string;
+  received: number;
+  parsed: number;
+  through: number;
+}
+
+function parseReplayMeta(
+  message: string,
+): { epoch: string; offset: number; through: number; prelude: string | null } | null {
+  if (!message.includes('"replay_meta"')) return null;
+  try {
+    const frame: {
+      type?: unknown;
+      epoch?: unknown;
+      offset?: unknown;
+      through?: unknown;
+      prelude?: unknown;
+    } | null = JSON.parse(message);
+    if (
+      frame?.type === "replay_meta" &&
+      typeof frame.epoch === "string" &&
+      /^[0-9a-f]{32}$/.test(frame.epoch) &&
+      typeof frame.offset === "number" &&
+      Number.isSafeInteger(frame.offset) &&
+      frame.offset >= 0 &&
+      typeof frame.through === "number" &&
+      Number.isSafeInteger(frame.through) &&
+      frame.through >= frame.offset &&
+      (frame.prelude === null || typeof frame.prelude === "string")
+    ) {
+      return {
+        epoch: frame.epoch,
+        offset: frame.offset,
+        through: frame.through,
+        prelude: frame.prelude,
+      };
+    }
+  } catch {
+    // Unknown or malformed text frames are ignored.
+  }
+  return null;
+}
+
+function terminalSocket(url: string, position: ReplayPosition | null): WebSocket {
+  const endpoint = new URL(url);
+  endpoint.searchParams.set("conpty_replay", "2");
+  if (position) {
+    endpoint.searchParams.set("replay_epoch", position.epoch);
+    endpoint.searchParams.set("since_offset", String(position.parsed));
+  }
+  const socket = new WebSocket(endpoint.href);
+  socket.binaryType = "arraybuffer";
+  return socket;
+}
+
 /** Whether a clipboard event is attributable to recent input on this attach. */
 export function hadRecentTerminalInput(lastInputAt: number, now: number): boolean {
   return (
@@ -706,17 +762,24 @@ export class TerminalSession {
   private readonly container: HTMLElement;
   private readonly term: Terminal;
   private readonly fit: TerminalFitAddon;
-  private readonly ws: WebSocket;
+  private ws: WebSocket;
+  private socketCtl = new AbortController();
   private readonly listenerCtl: AbortController;
   private readonly resizeObserver: ResizeObserver;
   private readonly dataDispose: { dispose: () => void };
   private readonly osc52Dispose: { dispose: () => void };
+  private readonly onState: ConnectionStateListener;
+  private readonly onActivity?: TerminalActivityListener;
   /** Drops xterm's replies to the queries tmux answers, once the runner lists them. */
   private queryReplies: { dispose: () => void } | null = null;
-  private readonly codexPalette: CodexTerminalPalette | null;
+  private codexPalette: CodexTerminalPalette | null;
   private readonly onClipboardRequest?: TerminalClipboardListener;
   private readonly onClipboardAction?: TerminalClipboardAction;
-  private readonly hostClipboard: HostClipboardConnection;
+  private hostClipboard: HostClipboardConnection;
+  private replayPosition: ReplayPosition | null = null;
+  private awaitingAttach = true;
+  private catchingUp = false;
+  private outputDrain: Promise<void> = Promise.resolve();
   /** Whether this visible, interactive attach may write the local clipboard. */
   private clipboardEnabled: boolean;
   /**
@@ -799,6 +862,8 @@ export class TerminalSession {
     assumeLivenessSupport = false,
   ) {
     this.container = container;
+    this.onState = onState;
+    this.onActivity = onActivity;
     this.onClipboardAction = onClipboardAction;
     this.livenessSupported = assumeLivenessSupport;
     this.codexPalette = adaptCodexPalette ? new CodexTerminalPalette() : null;
@@ -845,11 +910,8 @@ export class TerminalSession {
       this.term.resize(80, 24);
     }
 
-    this.ws = new WebSocket(url);
+    this.ws = terminalSocket(url, null);
     this.hostClipboard = new HostClipboardConnection(this.ws);
-    // Default is Blob, which forces an async read per chunk. ArrayBuffer
-    // keeps the path synchronous and matches xterm.js's preferred input.
-    this.ws.binaryType = "arraybuffer";
 
     // AbortController-scoped listeners so the cleanup's ws.close()
     // can't fire stale `close`/`error` events into the next mount —
@@ -904,98 +966,14 @@ export class TerminalSession {
       { capture: true, signal },
     );
 
-    this.ws.addEventListener(
-      "open",
-      () => {
-        // Send the size first so tmux re-renders at the right
-        // dimensions before the user sees the default 80×24 followed
-        // by a reflow.
-        this.sendResize();
-        this.sendLivenessInitPing();
-        if (this.focusOnConnect) this.term.focus();
-        onState({ kind: "connected" });
-      },
-      { signal },
-    );
-
-    // Throttle activity notifications so rapid output (e.g. `yes`, large
-    // `cat`) doesn't re-arm the 1.5 s idle timer on every WS frame.
-    let lastActivityTs = 0;
-    this.ws.addEventListener(
-      "message",
-      (ev) => {
-        if (ev.data instanceof ArrayBuffer) {
-          const bytes = new Uint8Array(ev.data);
-          this.term.write(this.codexPalette?.write(bytes) ?? bytes);
-          const now = performance.now();
-          if (now - lastActivityTs > 300) {
-            lastActivityTs = now;
-            onActivity?.();
-          }
-        } else if (typeof ev.data === "string") {
-          const pongId = parseTerminalPongMessage(ev.data);
-          if (pongId !== null) {
-            this.livenessSupported = true;
-            if (this.pendingLivenessProbe?.id === pongId) {
-              this.pendingLivenessProbe.finish("alive");
-            }
-            return;
-          }
-          if (this.hostClipboard.receive(ev.data)) return;
-          const windowsPty = parseWindowsPtyMessage(ev.data);
-          if (windowsPty) {
-            // ConPTY's resize/reflow contract differs from a POSIX PTY.
-            this.term.options.windowsPty = windowsPty;
-            this.imeAnchor ??= attachImeHeuristic(this.term);
-          } else {
-            const text = parseTerminalClipboardMessage(ev.data);
-            if (text !== null) this.requestClipboardWrite(text);
-          }
-          const tmuxAnswers = parseTmuxRepliesMessage(ev.data);
-          if (tmuxAnswers !== null) {
-            this.queryReplies?.dispose();
-            this.queryReplies =
-              tmuxAnswers.size > 0 ? suppressRepliesTmuxSends(this.term, tmuxAnswers) : null;
-            if (!this.fit.tmuxBacked) {
-              this.fit.tmuxBacked = true;
-              this.sendResize();
-            }
-          }
-          // Unknown text frames stay ignored for protocol forward compatibility.
-        }
-      },
-      { signal },
-    );
-
-    this.ws.addEventListener(
-      "close",
-      (ev) => {
-        this.finishLivenessProbe("closed");
-        this.touchSelection?.cancel();
-        this.hostClipboard.close();
-        this.clearFittedSize();
-        onState({ kind: "closed", reason: ev.reason || `code ${ev.code}`, code: ev.code });
-      },
-      { signal },
-    );
-
-    this.ws.addEventListener(
-      "error",
-      () => {
-        this.finishLivenessProbe("closed");
-        this.touchSelection?.cancel();
-        this.hostClipboard.close();
-        onState({ kind: "error" });
-      },
-      { signal },
-    );
+    this.listenToSocket();
 
     const sendInput = (d: string) => {
       onInput?.();
       // Stamp before the readyState guard so clipboard trust still reflects
       // local input during a momentary WebSocket hiccup.
       this.lastUserInputAt = performance.now();
-      if (this.ws.readyState !== WebSocket.OPEN) return;
+      if (!this.canPaste()) return;
       this.ws.send(INPUT_ENCODER.encode(d));
     };
     this.imeInput = new TerminalImeInput(this.term);
@@ -1374,7 +1352,12 @@ export class TerminalSession {
   }
 
   canPaste(): boolean {
-    return !this.disposed && this.ws.readyState === WebSocket.OPEN;
+    return (
+      !this.disposed &&
+      !this.awaitingAttach &&
+      !this.catchingUp &&
+      this.ws.readyState === WebSocket.OPEN
+    );
   }
 
   pastesBracketed(): boolean {
@@ -1430,7 +1413,7 @@ export class TerminalSession {
       const code = char.charCodeAt(0);
       return (code < 32 && code !== 9 && code !== 10) || (code >= 127 && code <= 159);
     });
-    if (hasControlCharacters || this.disposed || this.ws.readyState !== WebSocket.OPEN) {
+    if (hasControlCharacters || !this.canPaste()) {
       onResult(
         hasControlCharacters
           ? "This command contains terminal control characters."
@@ -1441,16 +1424,22 @@ export class TerminalSession {
     let finished = false;
     let listener: { dispose: () => void } | undefined;
     let timer: number | undefined;
+    const { signal } = this.socketCtl;
     const cancel = () => {
       finished = true;
       listener?.dispose();
       window.clearTimeout(timer);
-      this.listenerCtl.signal.removeEventListener("abort", cancel);
+      signal.removeEventListener("abort", cancel);
     };
     const tryPaste = () => {
-      if (finished || (/[\n\t]/.test(command) && !this.term.modes.bracketedPasteMode)) return;
+      if (
+        finished ||
+        this.catchingUp ||
+        (/[\n\t]/.test(command) && !this.term.modes.bracketedPasteMode)
+      )
+        return;
       cancel();
-      if (this.ws.readyState !== WebSocket.OPEN) {
+      if (!this.canPaste()) {
         onResult("The shell disconnected. Nothing was sent.");
         return;
       }
@@ -1462,7 +1451,7 @@ export class TerminalSession {
       cancel();
       onResult("The shell is not ready to safely paste this command. Nothing was sent.");
     }, 5000);
-    this.listenerCtl.signal.addEventListener("abort", cancel, { once: true });
+    signal.addEventListener("abort", cancel, { once: true });
     tryPaste();
     return cancel;
   }
@@ -1543,6 +1532,210 @@ export class TerminalSession {
     this.pendingLivenessProbe?.finish(result);
   }
 
+  /** Move a replay-capable ConPTY attach to a new transport without replacing xterm. */
+  reconnect(resolve: () => Promise<{ url: string; isRelay: boolean }>): boolean {
+    if (this.disposed || !this.replayPosition) return false;
+    this.socketCtl.abort();
+    this.finishLivenessProbe("closed");
+    this.touchSelection?.cancel();
+    this.cancelBarWrites();
+    this.hostClipboard.close();
+    this.lastUserInputAt = 0;
+    this.ws.close();
+    const controller = new AbortController();
+    this.socketCtl = controller;
+    this.awaitingAttach = true;
+    this.catchingUp = false;
+    this.lastSentSize = null;
+    // Messages on the old transport are detached. Drain what xterm already
+    // accepted so the new transport starts at the last parsed byte.
+    void Promise.all([resolve(), this.outputDrain])
+      .then(([{ url, isRelay }]) => {
+        if (controller.signal.aborted) return;
+        this.ws = terminalSocket(url, this.replayPosition);
+        this.hostClipboard = new HostClipboardConnection(this.ws);
+        this.livenessSupported = isRelay;
+        this.listenToSocket();
+      })
+      .catch(() => {
+        if (!controller.signal.aborted)
+          this.onState({ kind: "closed", reason: "Reconnect failed", code: 1006 });
+      });
+    return true;
+  }
+
+  private listenToSocket(): void {
+    const socket = this.ws;
+    const { signal } = this.socketCtl;
+    let legacyConpty = false;
+    socket.addEventListener(
+      "open",
+      () => {
+        if (signal.aborted) return;
+        this.sendLivenessInitPing();
+      },
+      { signal },
+    );
+
+    // Throttle activity notifications so rapid output (e.g. `yes`, large
+    // `cat`) doesn't re-arm the 1.5 s idle timer on every WS frame.
+    let lastActivityTs = 0;
+    socket.addEventListener(
+      "message",
+      (ev) => {
+        if (signal.aborted) return;
+        if (ev.data instanceof ArrayBuffer) {
+          const bytes = new Uint8Array(ev.data);
+          if (this.awaitingAttach && !this.catchingUp && !legacyConpty && !this.replayPosition) {
+            // Legacy tmux can omit the capability frame before its first output.
+            this.finishAttach();
+          }
+          if (!bytes.length) return;
+          this.writeSocketOutput(socket, signal, bytes);
+          const now = performance.now();
+          if (now - lastActivityTs > 300) {
+            lastActivityTs = now;
+            this.onActivity?.();
+          }
+        } else if (typeof ev.data === "string") {
+          const replay = parseReplayMeta(ev.data);
+          if (replay) {
+            this.catchingUp = true;
+            if (replay.prelude !== null) this.resetOutput(replay.prelude);
+            const { epoch, offset, through } = replay;
+            const position = { epoch, received: offset, parsed: offset, through };
+            this.replayPosition = position;
+            if (offset === through) {
+              void this.outputDrain.then(() => {
+                if (this.replayPosition === position) this.finishReplay(signal);
+              });
+            }
+            return;
+          }
+          const pongId = parseTerminalPongMessage(ev.data);
+          if (pongId !== null) {
+            this.livenessSupported = true;
+            if (this.pendingLivenessProbe?.id === pongId) {
+              this.pendingLivenessProbe.finish("alive");
+            }
+            return;
+          }
+          if (this.hostClipboard.receive(ev.data)) return;
+          const windowsPty = parseWindowsPtyMessage(ev.data);
+          if (windowsPty) {
+            legacyConpty = true;
+            // ConPTY's resize/reflow contract differs from a POSIX PTY.
+            this.term.options.windowsPty = windowsPty;
+            this.imeAnchor ??= attachImeHeuristic(this.term);
+          } else {
+            const text = parseTerminalClipboardMessage(ev.data);
+            if (text !== null) this.requestClipboardWrite(text);
+          }
+          const tmuxAnswers = parseTmuxRepliesMessage(ev.data);
+          if (tmuxAnswers !== null) {
+            if (this.awaitingAttach && this.replayPosition) {
+              this.replayPosition = null;
+              this.resetOutput();
+            }
+            this.queryReplies?.dispose();
+            this.queryReplies =
+              tmuxAnswers.size > 0 ? suppressRepliesTmuxSends(this.term, tmuxAnswers) : null;
+            if (!this.fit.tmuxBacked) {
+              this.fit.tmuxBacked = true;
+              this.sendResize();
+            }
+            this.finishAttach();
+          }
+          // Unknown text frames stay ignored for protocol forward compatibility.
+        }
+      },
+      { signal },
+    );
+
+    socket.addEventListener(
+      "close",
+      (ev) => {
+        if (signal.aborted) return;
+        this.finishLivenessProbe("closed");
+        this.touchSelection?.cancel();
+        this.hostClipboard.close();
+        this.clearFittedSize();
+        this.onState({ kind: "closed", reason: ev.reason || `code ${ev.code}`, code: ev.code });
+      },
+      { signal },
+    );
+
+    socket.addEventListener(
+      "error",
+      () => {
+        if (signal.aborted) return;
+        this.finishLivenessProbe("closed");
+        this.touchSelection?.cancel();
+        this.hostClipboard.close();
+        this.onState({ kind: "error" });
+      },
+      { signal },
+    );
+  }
+
+  private resetOutput(prelude = ""): void {
+    if (this.codexPalette) this.codexPalette = new CodexTerminalPalette();
+    // Cancel a partial escape and reset both the screen and parser before replay.
+    this.outputDrain = new Promise((resolve) => {
+      this.term.write(INPUT_ENCODER.encode(`\x18\x1bc${prelude}`), resolve);
+    });
+  }
+
+  private finishAttach(): void {
+    if (!this.awaitingAttach) return;
+    this.awaitingAttach = false;
+    this.sendResize();
+    if (this.focusOnConnect) this.term.focus();
+    this.onState({ kind: "connected" });
+  }
+
+  private finishReplay(signal: AbortSignal): void {
+    if (signal.aborted || !this.catchingUp || this.ws.readyState !== WebSocket.OPEN) return;
+    this.catchingUp = false;
+    if (this.awaitingAttach) this.finishAttach();
+    else this.sendResize();
+  }
+
+  private writeSocketOutput(socket: WebSocket, signal: AbortSignal, bytes: Uint8Array): void {
+    if (this.awaitingAttach && !this.catchingUp) {
+      // An older runner can ignore the negotiation and send a new full seed.
+      this.catchingUp = true;
+      if (this.replayPosition) this.resetOutput();
+      this.replayPosition = null;
+      const output = this.codexPalette?.write(bytes) ?? bytes;
+      this.outputDrain = new Promise((resolve) => {
+        this.term.write(output, () => {
+          resolve();
+          this.finishReplay(signal);
+        });
+      });
+      return;
+    }
+    const output = this.codexPalette?.write(bytes) ?? bytes;
+    const replay = this.replayPosition;
+    if (!replay) {
+      this.term.write(output);
+      return;
+    }
+    const offset = replay.received + bytes.byteLength;
+    replay.received = offset;
+    this.outputDrain = new Promise((resolve) => {
+      this.term.write(output, () => {
+        replay.parsed = offset;
+        resolve();
+        if (!signal.aborted && socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ type: "output_ack", offset }));
+          if (this.replayPosition === replay && offset >= replay.through) this.finishReplay(signal);
+        }
+      });
+    });
+  }
+
   /**
    * Tear down the bridge. Order matters: abort listeners FIRST so
    * the cleanup's ``ws.close()`` can't fire a stale ``close``
@@ -1560,6 +1753,7 @@ export class TerminalSession {
     this.touchSelection?.dispose();
     this.cancelBarWrites();
     this.listenerCtl.abort();
+    this.socketCtl.abort();
     this.resizeObserver.disconnect();
     this.imeInput.dispose();
     this.imeAnchor?.detach();
@@ -1643,7 +1837,7 @@ export class TerminalSession {
   }
 
   private sendResize(): void {
-    if (this.ws.readyState !== WebSocket.OPEN) return;
+    if (!this.canPaste()) return;
     // Keep the last real size while hidden; the ResizeObserver re-fits once
     // the surface is laid out again.
     if (!this.hasLayoutBox()) return;

@@ -113,6 +113,7 @@ from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_NOT_FOUND,
     WS_CLOSE_WRONG_REPLICA,
     parse_terminal_ping_reply,
+    terminal_replay_params,
 )
 from omnigent.util.websocket_logging import websocket_protocol_logger
 
@@ -250,7 +251,10 @@ def create_terminal_attach_router(
                 _get_runner_client_for_resource_access,
             )
 
-            params = {"read_only": "true" if read_only else "false"}
+            params = {
+                "read_only": "true" if read_only else "false",
+                **terminal_replay_params(websocket.query_params),
+            }
             try:
                 client = await _get_runner_client_for_resource_access(session_id)
                 if client is not None:

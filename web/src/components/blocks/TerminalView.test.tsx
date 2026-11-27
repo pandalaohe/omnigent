@@ -106,6 +106,7 @@ const terminalSessionMock = vi.hoisted(() => ({
     onState: (state: ConnectionState) => void;
     onActivity?: () => void;
     dispose: ReturnType<typeof vi.fn>;
+    reconnect: ReturnType<typeof vi.fn>;
     probeLiveness: ReturnType<
       typeof vi.fn<(timeoutMs?: number) => Promise<TerminalSessionModule.LivenessProbeResult>>
     >;
@@ -253,6 +254,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
   ...(await importOriginal<typeof TerminalSessionModule>()),
   TerminalSession: class {
     dispose = vi.fn();
+    reconnect = vi.fn(() => false);
     probeLiveness = vi
       .fn<(timeoutMs?: number) => Promise<TerminalSessionModule.LivenessProbeResult>>()
       .mockResolvedValue("alive");
@@ -314,6 +316,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         onState,
         onActivity,
         dispose: this.dispose,
+        reconnect: this.reconnect,
         probeLiveness: this.probeLiveness,
         setTheme: this.setTheme,
         setClipboardEnabled: this.setClipboardEnabled,
@@ -2377,6 +2380,21 @@ describe("automatic reconnect", () => {
     } finally {
       delete (document as { visibilityState?: unknown }).visibilityState;
     }
+  });
+
+  it("keeps the replay-capable terminal mounted on a foreground reconnect", async () => {
+    await renderAndAttach();
+    const first = terminalSessionMock.instances[0];
+    first.reconnect.mockReturnValue(true);
+    closeNewest(1006);
+    act(() => window.dispatchEvent(new Event("online")));
+    await act(async () => {});
+
+    expect(first.reconnect).toHaveBeenCalledOnce();
+    expect(first.dispose).not.toHaveBeenCalled();
+    expect(terminalSessionMock.instances).toHaveLength(1);
+    expect(first.container.isConnected).toBe(true);
+    expect(screen.getByTestId("terminal-reconnecting")).toBeInTheDocument();
   });
 
   it("recovers an exhausted transport disconnect on visibilitychange, persisted pageshow, or manual Reconnect", async () => {
