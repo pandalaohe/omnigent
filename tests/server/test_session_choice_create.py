@@ -3990,6 +3990,11 @@ async def test_project_blocked_agents_enforced_at_funnel_choice_routing_and_suba
             "_resolve_native_smart_routing",
             AsyncMock(return_value=("choice-0", None, None, None)),
         )
+        mp.setattr(
+            env.app.state.agent_store,
+            "get_by_name",
+            lambda name: env.app.state.agent_store.get(agent_a) if name == "choice-0" else None,
+        )
         r30_sr = await env.client.post(
             "/v1/sessions",
             json={
@@ -4028,11 +4033,15 @@ async def test_j1_independent_opens_use_project_host_default_and_respect_boundar
 ):
     """Scenarios 19, 20, 21, 23: J1 with/without session choice, naming, and boundaries."""
     from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+    from omnigent.server import session_families
     from omnigent.server.routes.sessions import routes_core
 
     env = project_choice_env
     monkeypatch.setattr(
         routes_core, "require_orchestration_source", lambda *_args, **_kwargs: env.parent
+    )
+    monkeypatch.setattr(
+        session_families, "authorize_sibling_source", lambda *_args, **_kwargs: env.parent
     )
     projects = env.projects
     agent_a = env.agents[0]["id"]
