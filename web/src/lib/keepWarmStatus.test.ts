@@ -44,8 +44,15 @@ describe("formatKeepWarmCounters", () => {
 });
 
 describe("keepWarmStopReason", () => {
-  it("returns null when no reason is stored", () => {
+  it("returns null when no reason is stored or stop_reason is omitted on the wire", () => {
     expect(keepWarmStopReason(status())).toBeNull();
+    const wireOmitted: KeepWarmStatus = {
+      state: "on",
+      episode: { pings: 0, cost_usd: 0, estimated: false },
+      total: { pings: 0, cost_usd: 0, estimated: false },
+    };
+    expect(keepWarmStopReason(wireOmitted)).toBeNull();
+    expect(keepWarmTooltipLine(wireOmitted)).toBe("Keep-warm on · 0 pings $0.00");
   });
 
   it("names skipped attempts and keeps their cause after expiry", () => {

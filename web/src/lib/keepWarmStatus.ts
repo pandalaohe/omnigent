@@ -32,7 +32,7 @@ export function formatKeepWarmCounters(pings: number, costUsd: number, estimated
  * so the pause names its cause.
  */
 export function keepWarmStopReason(status: KeepWarmStatus): string | null {
-  if (status.stop_reason === null) return null;
+  if (status.stop_reason == null) return null;
   const reasons: Record<NonNullable<KeepWarmStatus["stop_reason"]>, string> = {
     cap: "cap reached",
     misses: "cache misses",

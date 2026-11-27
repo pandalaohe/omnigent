@@ -4276,19 +4276,24 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // current transcript; for a fresh one it is the initial state.
     mirrorActiveEntry();
     if (wasLive) {
-      // An open stream is not proof the entry is current: a session stream
-      // routed to the wrong replica stays open and heartbeats while delivering
-      // no events, and a reconnect loop that never re-opens holds the
-      // controller too. Verify the instantly-painted transcript against the
-      // committed snapshot in the background; item-id dedupe makes this a
-      // no-op when the entry really is current.
-      const controller = entry.getState().abortController;
-      void reconcileOnReconnect(
-        conversationId,
-        entrySetter(entry),
-        entryGetter(entry),
-        controller === null ? undefined : nativePreviewTombstonesByController.get(controller),
-      );
+      // Skip reconnect backfill while the initial cold bind is still hydrating:
+      // an unhydrated entry has empty pre-gap history and its in-flight bind
+      // already owns the snapshot fetch.
+      if (!entry.getState().loadingConversation) {
+        // An open stream is not proof the entry is current: a session stream
+        // routed to the wrong replica stays open and heartbeats while delivering
+        // no events, and a reconnect loop that never re-opens holds the
+        // controller too. Verify the instantly-painted transcript against the
+        // committed snapshot in the background; item-id dedupe makes this a
+        // no-op when the entry really is current.
+        const controller = entry.getState().abortController;
+        void reconcileOnReconnect(
+          conversationId,
+          entrySetter(entry),
+          entryGetter(entry),
+          controller === null ? undefined : nativePreviewTombstonesByController.get(controller),
+        );
+      }
       return;
     }
 
