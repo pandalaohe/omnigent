@@ -59,6 +59,7 @@ import {
   Loader2Icon,
   MessageSquareTextIcon,
   MoreHorizontalIcon,
+  MousePointerClickIcon,
   PencilLineIcon,
   RowsIcon,
   SearchIcon,
@@ -80,6 +81,7 @@ import {
 } from "@/components/ui/dialog";
 import {
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
@@ -140,6 +142,7 @@ import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileVie
 import { hasCommandModifier } from "@/lib/hotkeys";
 import { type ChangedSort, groupChangedFiles } from "./FlatFileList";
 import { CodeViewer } from "./CodeViewer";
+import type { AnnotateControl } from "./HtmlCommentViewer";
 import {
   MONACO_SPLIT_BREAKPOINT,
   type SaveStatus,
@@ -659,6 +662,11 @@ function FileViewerBody({
   const commentPath = frame?.path ?? path;
   // Ids of this page's element annotations the frame could not re-find.
   const [orphanIds, setOrphanIds] = useState<ReadonlySet<string>>(EMPTY_ORPHANS);
+  // The HTML preview's annotate toggle, shown in the toolbar while it is set.
+  const [annotateControl, setAnnotateControl] = useState<AnnotateControl | null>(null);
+  // An overflow toggle that hands focus elsewhere runs once the menu has
+  // stopped restoring focus to its trigger.
+  const overflowAfterCloseRef = useRef<(() => void) | null>(null);
   // Latest page for post settlement: by the time a request lands, an in-frame
   // navigation may already have pointed the viewer at another page.
   const commentPathRef = useRef(commentPath);
@@ -1596,6 +1604,11 @@ function FileViewerBody({
     icon: ReactNode;
     onSelect?: () => void;
     active?: boolean;
+    /** A toggle whose label does not name its state: sets aria-pressed, and its
+     * overflow row is a checkbox item labelled without the tooltip. */
+    pressed?: boolean;
+    /** Leave focus where it was on click (e.g. a chat caret or the preview frame). */
+    keepFocus?: boolean;
     disabled?: boolean;
     disabledLabel?: string;
     /** When set, render a picker (dropdown/submenu) over these mutually
@@ -1756,6 +1769,18 @@ function FileViewerBody({
       setCommentsOpen((prev) => !prev);
     },
   });
+  if (annotateControl) {
+    toolbarActions.push({
+      key: "annotate",
+      label: "Annotate",
+      tooltip: "Annotate (⌘⇧.) — screenshots reach agents that accept images",
+      icon: <MousePointerClickIcon className="size-4" />,
+      active: annotateControl.on,
+      pressed: annotateControl.on,
+      keepFocus: true,
+      onSelect: annotateControl.toggle,
+    });
+  }
   if (!isPdf && !isDeletedFile && isDiffAvailable) {
     toolbarActions.push({
       key: "diff",
@@ -1942,8 +1967,10 @@ function FileViewerBody({
         variant={action.active ? "default" : "ghost"}
         size="icon-sm"
         aria-label={action.disabledLabel ?? action.label}
+        aria-pressed={action.pressed}
         disabled={action.disabled}
         tabIndex={interactive ? undefined : -1}
+        onMouseDown={action.keepFocus ? (e) => e.preventDefault() : undefined}
         onClick={interactive ? action.onSelect : undefined}
       >
         {action.icon}
@@ -2200,13 +2227,30 @@ function FileViewerBody({
           <div className="flex items-center justify-end gap-1">
             {toolbarCollapsed ? (
               <>
-                <DropdownMenu>
+                <DropdownMenu
+                  onOpenChange={(menuOpen) => {
+                    // A reopen during the close animation drops a stale queued toggle.
+                    if (menuOpen) overflowAfterCloseRef.current = null;
+                  }}
+                >
                   <DropdownMenuTrigger asChild>
                     <Button type="button" variant="ghost" size="icon-sm" aria-label="More actions">
                       <MoreHorizontalIcon className="size-4" />
                     </Button>
                   </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end" className="w-auto min-w-40">
+                  <DropdownMenuContent
+                    align="end"
+                    className="w-auto min-w-40"
+                    onCloseAutoFocus={(e) => {
+                      const run = overflowAfterCloseRef.current;
+                      if (!run) return;
+                      overflowAfterCloseRef.current = null;
+                      const focused = document.activeElement;
+                      run();
+                      // Keep focus the action moved; otherwise return it to the trigger.
+                      if (document.activeElement !== focused) e.preventDefault();
+                    }}
+                  >
                     {toolbarActions
                       .filter((action) => !action.splitMenu)
                       .map((action) =>
@@ -2277,6 +2321,18 @@ function FileViewerBody({
                               <TooltipContent>{action.tooltip ?? action.label}</TooltipContent>
                             </Tooltip>
                           </TooltipProvider>
+                        ) : action.pressed !== undefined ? (
+                          <DropdownMenuCheckboxItem
+                            key={action.key}
+                            className="whitespace-nowrap"
+                            checked={action.pressed}
+                            onSelect={() => {
+                              overflowAfterCloseRef.current = action.onSelect ?? null;
+                            }}
+                          >
+                            {action.icon}
+                            {action.label}
+                          </DropdownMenuCheckboxItem>
                         ) : (
                           <DropdownMenuItem
                             key={action.key}
@@ -2451,6 +2507,7 @@ function FileViewerBody({
                 onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}
                 onFrameChange={setFrame}
                 onAnnotationOrphansChange={setOrphanIds}
+                onAnnotateControlChange={setAnnotateControl}
                 previewKey={previewKey}
                 attachToAgent={attachToAgent}
               />

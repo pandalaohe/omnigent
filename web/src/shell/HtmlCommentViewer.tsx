@@ -17,7 +17,7 @@
 import { createPortal } from "react-dom";
 import { ADD_COMMENT_BUTTON_CLASS_NAME } from "./addCommentButtonStyles";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { MessageSquarePlusIcon, MousePointerClickIcon } from "lucide-react";
+import { MessageSquarePlusIcon } from "lucide-react";
 import type { Comment } from "@/hooks/useComments";
 import { useCanEdit } from "@/hooks/usePermissions";
 import {
@@ -88,6 +88,15 @@ interface HtmlCommentViewerProps {
   onFrameChange?: (frame: { path: string; source: string } | null) => void;
   /** Reports the ids of rendered text or element comments that no longer resolve. */
   onAnnotationOrphansChange?: (ids: ReadonlySet<string>) => void;
+  /** Lifts the annotate toggle for the panel toolbar; null when annotation is
+   * unavailable or the user cannot edit. */
+  onAnnotateControlChange?: (control: AnnotateControl | null) => void;
+}
+
+/** Annotation mode state and toggle, rendered by the file panel toolbar. */
+export interface AnnotateControl {
+  on: boolean;
+  toggle: () => void;
 }
 
 /** Floating "Add comment" button position + the resolved selection it commits. */
@@ -348,6 +357,7 @@ export function HtmlCommentViewer({
   onSetActiveSelection,
   onFrameChange,
   onAnnotationOrphansChange,
+  onAnnotateControlChange,
 }: HtmlCommentViewerProps) {
   const canEdit = useCanEdit(conversationId);
   const isEmbed = hasOmnigentHostFetcher();
@@ -495,6 +505,8 @@ export function HtmlCommentViewer({
   onFrameChangeRef.current = onFrameChange;
   const onAnnotationOrphansChangeRef = useRef(onAnnotationOrphansChange);
   onAnnotationOrphansChangeRef.current = onAnnotationOrphansChange;
+  const onAnnotateControlChangeRef = useRef(onAnnotateControlChange);
+  onAnnotateControlChangeRef.current = onAnnotateControlChange;
   const openFileRef = useRef(openFile);
   openFileRef.current = openFile;
   // The workspace root/home can arrive after the channel effect has run, so the
@@ -895,6 +907,27 @@ export function HtmlCommentViewer({
     onAnnotationOrphansChangeRef.current?.(new Set([...annotate.orphanIds, ...renderedOrphans]));
   }, [annotate.orphanIds, renderedOrphans]);
 
+  // The toggle lives in the panel toolbar so nothing floats over the page.
+  // Turning the mode on from there hands keys to the frame, so Escape reaches
+  // the picker; turning it off leaves focus where the user had it.
+  const annotateShown = annotate.available && canEdit;
+  const toggleAnnotate = annotate.toggle;
+  const annotateOnRef = useRef(annotate.on);
+  annotateOnRef.current = annotate.on;
+  const toggleFromToolbar = useCallback(() => {
+    const turningOn = !annotateOnRef.current;
+    toggleAnnotate();
+    if (!turningOn) return;
+    iframeRef.current?.focus();
+    iframeRef.current?.contentWindow?.focus();
+  }, [toggleAnnotate]);
+  useEffect(() => {
+    onAnnotateControlChangeRef.current?.(
+      annotateShown ? { on: annotate.on, toggle: toggleFromToolbar } : null,
+    );
+  }, [annotateShown, annotate.on, toggleFromToolbar]);
+  useEffect(() => () => onAnnotateControlChangeRef.current?.(null), []);
+
   // When the composer closes (submit, cancel, mode off), focus returns to the
   // frame so the mode's shortcut and Escape work without a click.
   const hadPendingPickRef = useRef(false);
@@ -988,19 +1021,6 @@ export function HtmlCommentViewer({
             onSubmit={annotate.submitPick}
             onCancel={annotate.cancelPick}
           />
-        )}
-        {annotate.available && canEdit && (
-          <button
-            type="button"
-            aria-label="Annotate"
-            aria-pressed={annotate.on}
-            title="Annotate (⌘⇧.) — screenshots reach agents that accept images"
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={annotate.toggle}
-            className="absolute right-2 top-2 z-10 flex size-7 items-center justify-center rounded-md border border-border bg-popover/90 text-muted-foreground shadow-md backdrop-blur-xl backdrop-saturate-150 transition-colors hover:bg-secondary hover:text-foreground aria-pressed:bg-secondary aria-pressed:text-foreground"
-          >
-            <MousePointerClickIcon className="size-3.5" />
-          </button>
         )}
       </div>
       {floating &&

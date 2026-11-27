@@ -87,7 +87,7 @@ import { SpreadsheetPreview } from "./SpreadsheetPreview";
 import { useScrollRestore } from "./useScrollRestore";
 import { PreviewSearchBar } from "./PreviewSearchBar";
 import { renderLineTokens } from "./codeViewerRendering";
-import { HtmlCommentViewer } from "./HtmlCommentViewer";
+import { type AnnotateControl, HtmlCommentViewer } from "./HtmlCommentViewer";
 import { PreviewCommentBanner } from "./PreviewCommentBanner";
 import { TruncatedBanner } from "./TruncatedBanner";
 import { useLightbox } from "@/components/ImageLightbox";
@@ -631,6 +631,8 @@ export interface CodeViewerProps {
    * confirmed in the current document.
    */
   onAnnotationOrphansChange?: (ids: ReadonlySet<string>) => void;
+  /** Lifts the HTML preview's annotate toggle for the panel toolbar. */
+  onAnnotateControlChange?: (control: AnnotateControl | null) => void;
   /**
    * Remounts the HTML preview when bumped, so it mints a fresh artifact link
    * (e.g. after the user revokes links).
@@ -668,6 +670,7 @@ export function CodeViewer({
   onRequestEditMode,
   onFrameChange,
   onAnnotationOrphansChange,
+  onAnnotateControlChange,
   previewKey,
   attachToAgent = false,
 }: CodeViewerProps) {
@@ -1235,6 +1238,7 @@ export function CodeViewer({
         onSetActiveSelection={onSetActiveSelection}
         onFrameChange={onFrameChange}
         onAnnotationOrphansChange={onAnnotationOrphansChange}
+        onAnnotateControlChange={onAnnotateControlChange}
       />
     );
   }

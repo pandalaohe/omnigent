@@ -10,18 +10,19 @@
 //     never mints.
 //   • no `ready` within 5 s → an "unavailable" notice.
 
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { type ReactNode, startTransition, Suspense, useMemo, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { showToast } from "@/components/ui/toast";
 import type { Comment } from "@/hooks/useComments";
+import { useCanEdit } from "@/hooks/usePermissions";
 import { authenticatedFetch } from "@/lib/identity";
 import * as host from "@/lib/host";
 import { EmbeddedProvider } from "@/lib/embedded";
 import { type ElementAnchorV1, encodeElementAnchor } from "./annotationAnchor";
 import { FileViewerContext } from "./FileViewerContext";
-import { HtmlCommentViewer, resolveFrameLinkPath } from "./HtmlCommentViewer";
+import { type AnnotateControl, HtmlCommentViewer, resolveFrameLinkPath } from "./HtmlCommentViewer";
 import {
   type ActiveSelection,
   HTML_PANEL_SANDBOX,
@@ -122,6 +123,28 @@ function ViewerContext({
   );
 }
 
+/** Stands in for the file panel toolbar, which renders the lifted annotate toggle. */
+function AnnotateToolbarStub({
+  children,
+}: {
+  children: (onChange: (control: AnnotateControl | null) => void) => ReactNode;
+}) {
+  const [control, setControl] = useState<AnnotateControl | null>(null);
+  return (
+    <>
+      {control && (
+        <button
+          type="button"
+          aria-label="Annotate"
+          aria-pressed={control.on}
+          onClick={control.toggle}
+        />
+      )}
+      <div data-testid="html-viewer">{children(setControl)}</div>
+    </>
+  );
+}
+
 function renderViewer(
   props: {
     path?: string;
@@ -143,17 +166,22 @@ function renderViewer(
   const openFile = props.openFile ?? vi.fn();
   const viewer = (
     <ViewerContext openFile={openFile}>
-      <HtmlCommentViewer
-        conversationId="conv_1"
-        path={props.path ?? ENTRY_PATH}
-        content={props.content ?? ENTRY_SOURCE}
-        truncated={props.truncated ?? false}
-        comments={props.comments ?? []}
-        activeSelection={null}
-        onSetActiveSelection={onSetActiveSelection}
-        onFrameChange={onFrameChange}
-        onAnnotationOrphansChange={onAnnotationOrphansChange}
-      />
+      <AnnotateToolbarStub>
+        {(onAnnotateControlChange) => (
+          <HtmlCommentViewer
+            conversationId="conv_1"
+            path={props.path ?? ENTRY_PATH}
+            content={props.content ?? ENTRY_SOURCE}
+            truncated={props.truncated ?? false}
+            comments={props.comments ?? []}
+            activeSelection={null}
+            onSetActiveSelection={onSetActiveSelection}
+            onFrameChange={onFrameChange}
+            onAnnotationOrphansChange={onAnnotationOrphansChange}
+            onAnnotateControlChange={onAnnotateControlChange}
+          />
+        )}
+      </AnnotateToolbarStub>
     </ViewerContext>
   );
   const utils = render(props.embedded ? <EmbeddedProvider>{viewer}</EmbeddedProvider> : viewer);
@@ -1162,6 +1190,73 @@ describe("HtmlCommentViewer standalone (artifact URL)", () => {
 });
 
 describe("HtmlCommentViewer annotation toggle", () => {
+  it("lifts the toggle to the toolbar instead of floating it over the preview", async () => {
+    renderViewer();
+    const { postMessage } = await openFrame();
+    await sendAnnotateFromFrame(postMessage, { type: "annotate:ready" });
+
+    await screen.findByRole("button", { name: "Annotate" });
+    expect(
+      within(screen.getByTestId("html-viewer")).queryByRole("button", { name: "Annotate" }),
+    ).toBeNull();
+  });
+
+  it("hands focus to the frame when the toolbar turns the mode on, not off", async () => {
+    renderViewer();
+    const { postMessage, contentWindowFocus } = await openFrame();
+    observeAnnotatePort(postMessage);
+    await sendAnnotateFromFrame(postMessage, { type: "annotate:ready" });
+
+    const toggle = await screen.findByRole("button", { name: "Annotate" });
+    fireEvent.click(toggle);
+    expect(contentWindowFocus).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-pressed", "true"));
+
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-pressed", "false"));
+    expect(contentWindowFocus).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers no toggle to a user who cannot edit", async () => {
+    vi.mocked(useCanEdit).mockReturnValue(false);
+    try {
+      renderViewer();
+      const { postMessage } = await openFrame();
+      await sendAnnotateFromFrame(postMessage, { type: "annotate:ready" });
+      expect(screen.queryByRole("button", { name: "Annotate" })).toBeNull();
+    } finally {
+      vi.mocked(useCanEdit).mockReturnValue(true);
+    }
+  });
+
+  it("withdraws the toggle when the viewer unmounts", async () => {
+    const onAnnotateControlChange = vi.fn();
+    const { unmount } = render(
+      <ViewerContext openFile={vi.fn()}>
+        <HtmlCommentViewer
+          conversationId="conv_1"
+          path={ENTRY_PATH}
+          content={ENTRY_SOURCE}
+          truncated={false}
+          comments={[]}
+          activeSelection={null}
+          onSetActiveSelection={vi.fn()}
+          onAnnotateControlChange={onAnnotateControlChange}
+        />
+      </ViewerContext>,
+    );
+    const { postMessage } = await openFrame();
+    await sendAnnotateFromFrame(postMessage, { type: "annotate:ready" });
+    await waitFor(() =>
+      expect(onAnnotateControlChange).toHaveBeenLastCalledWith(
+        expect.objectContaining({ on: false }),
+      ),
+    );
+
+    unmount();
+    expect(onAnnotateControlChange).toHaveBeenLastCalledWith(null);
+  });
+
   it("stays hidden until the annotate channel reports ready", async () => {
     renderViewer();
     const { postMessage } = await openFrame();
@@ -1334,6 +1429,8 @@ describe("HtmlCommentViewer annotation path", () => {
     const toggle = await screen.findByRole("button", { name: "Annotate" });
     fireEvent.click(toggle);
     await waitFor(() => expect(toggle).toHaveAttribute("aria-pressed", "true"));
+    // The toolbar toggle focuses the frame itself; count only the composer's returns.
+    contentWindowFocus.mockClear();
 
     authenticatedFetchMock.mockResolvedValueOnce(
       new Response(JSON.stringify(elementComment("c-new", ENTRY_PATH, 300)), {
@@ -1739,15 +1836,19 @@ describe("HtmlCommentViewer zoom", () => {
     await waitFor(() => expect(previewParts().zoomBox.style.transform).toBe("scale(1.1)"));
     rerender(
       <ViewerContext openFile={openFile}>
-        <HtmlCommentViewer
-          conversationId="conv_1"
-          path={ENTRY_PATH}
-          content="<body><p>rewritten</p></body>"
-          truncated={false}
-          comments={[]}
-          activeSelection={null}
-          onSetActiveSelection={() => {}}
-        />
+        <AnnotateToolbarStub>
+          {() => (
+            <HtmlCommentViewer
+              conversationId="conv_1"
+              path={ENTRY_PATH}
+              content="<body><p>rewritten</p></body>"
+              truncated={false}
+              comments={[]}
+              activeSelection={null}
+              onSetActiveSelection={() => {}}
+            />
+          )}
+        </AnnotateToolbarStub>
       </ViewerContext>,
     );
     expect(previewParts().iframe.getAttribute("srcdoc")).toContain("rewritten");
