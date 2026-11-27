@@ -1690,9 +1690,148 @@ def _sed_script_writes(script: str) -> bool:
     return False
 
 
+_GIT_GLOBAL_FLAGS = (
+    "-p",
+    "--paginate",
+    "-P",
+    "--no-pager",
+    "--bare",
+    "--no-replace-objects",
+    "--literal-pathspecs",
+    "--glob-pathspecs",
+    "--noglob-pathspecs",
+    "--icase-pathspecs",
+    "--no-optional-locks",
+)
+
+
+def _cmd_raw_token_uncheckable(raw: str) -> bool:
+    """True when a cmd token hides a newline or single-quoted operator/metacharacter."""
+    if raw != "\n" and ("\r" in raw or "\n" in raw):
+        return True
+    if "'" not in raw:
+        return False
+    parts = re.findall(r'"[^"]*"|\'[^\']*\'|[^"\']+', raw)
+    if "".join(parts) != raw:
+        return True
+    unquoted_single = False
+    has_double = False
+    for part in parts:
+        if part.startswith('"'):
+            has_double = True
+        elif part.startswith("'"):
+            unquoted_single = True
+            if any(char in part for char in '&|<>;^%!"'):
+                return True
+        elif "'" in part:
+            return True
+    return unquoted_single and has_double
+
+
+def _windows_raw_token_unsafe(raw: str, dialect: str) -> bool:
+    """True when shell-specific syntax could hide expansions, escapes or operators."""
+    if dialect not in ("pwsh", "powershell", "cmd", *_HEREDOC_SHELLS):
+        return True
+    if dialect == "cmd":
+        # _windows_command_paths already checked cmd quoting; single quotes are split below.
+        return any(char in raw for char in "$`^!{}\r\n%")
+    parts = re.findall(r'"[^"]*"|\'[^\']*\'|[^"\']+', raw)
+    if "".join(parts) != raw:
+        return True
+    for part in parts:
+        if part.startswith("'"):
+            continue
+        if part.startswith('"'):
+            if any(char in part for char in "$`") or (dialect in _HEREDOC_SHELLS and "\\" in part):
+                return True
+        elif any(char in part for char in "$`^!{}\r\n") or (
+            dialect in _HEREDOC_SHELLS and "\\" in part
+        ):
+            return True
+    return False
+
+
+def _expand_cmd_single_quotes(
+    tokens: list[str], raw_tokens: list[str]
+) -> tuple[list[str], list[str]]:
+    """Split unquoted `'...'` tokens on whitespace because cmd.exe does not quote `'`."""
+    expanded_tokens: list[str] = []
+    expanded_raws: list[str] = []
+    for token, raw in zip(tokens, raw_tokens, strict=True):
+        if "'" in raw and '"' not in raw:
+            split = raw.split()
+            expanded_tokens.extend(split)
+            expanded_raws.extend(split)
+        else:
+            expanded_tokens.append(token)
+            expanded_raws.append(raw)
+    return expanded_tokens, expanded_raws
+
+
+def _conservative_operands(
+    tokens: list[str],
+    *,
+    keep_after_double_dash: bool = False,
+    skip: set[int] | frozenset[int] = frozenset(),
+) -> list[str]:
+    """Keep non-option tokens, plus post-`--` operands when a command takes pathspecs."""
+    after_dash = False
+    operands: list[str] = []
+    for index, value in enumerate(tokens):
+        if keep_after_double_dash and not after_dash and value == "--":
+            after_dash = True
+            continue
+        if index in skip:
+            continue
+        if after_dash or not value.startswith("-"):
+            operands.append(value)
+    return operands
+
+
+def _git_subcommand(
+    tokens: list[str],
+) -> tuple[str, int, list[str], set[int], set[int], list[str]] | None:
+    """Locate a git subcommand after recognized global options, tracking -C steps."""
+    candidates = tokens.copy()
+    chdirs: list[str] = []
+    chdir_indices: set[int] = set()
+    files: set[int] = set()
+    index = 1
+    while index < len(tokens):
+        value = tokens[index]
+        option, equals, attached = value.partition("=")
+        if value == "-C":
+            index += 1
+            if index == len(tokens):
+                return None
+            chdirs.append(tokens[index])
+            chdir_indices.add(index)
+            index += 1
+        elif value.startswith("-C") and len(value) > 2:
+            chdirs.append(value[2:])
+            chdir_indices.add(index)
+            index += 1
+        elif option in ("--git-dir", "--work-tree"):
+            if not equals:
+                index += 1
+                if index == len(tokens):
+                    return None
+                attached = tokens[index]
+            candidates[index] = attached
+            files.add(index)
+            index += 1
+        elif value in _GIT_GLOBAL_FLAGS:
+            index += 1
+        elif value.startswith("-"):
+            return None
+        else:
+            return value, index + 1, chdirs, chdir_indices, files, candidates
+    return None
+
+
 def _windows_path_operands(
     tokens: list[str], raw_tokens: list[str], shell: str, *, posix_executor: bool
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     """Exclude established data roles; unknown syntax keeps conservative candidates."""
     dialect = _command_name(shell)
     if posix_executor and dialect in _HEREDOC_SHELLS:
@@ -1703,30 +1842,82 @@ def _windows_path_operands(
             offset += 1
         tokens, raw_tokens = tokens[offset:], raw_tokens[offset:]
         if tokens[:1] == ["echo"]:
-            return tokens[:1]
+            return [], tokens[:1]
         if (
             len(tokens) > 1
             and tokens[0] == "printf"
             and not re.search(r"[$`*?\[{}]", raw_tokens[1])
             and not _script_word(raw_tokens[1]).startswith("-")
         ) or (len(tokens) == 2 and tokens[0] == "date" and tokens[1].startswith("+%")):
-            return tokens[:1]
+            return [], tokens[:1]
     if not tokens:
-        return []
-    conservative = [value for value in tokens if not value.startswith("-")]
+        return [], []
     if dialect in _HEREDOC_SHELLS and tokens[0] == "echo":
         if all(not re.search(r"\$(?!\?)|[`{}\r\n]", raw) for raw in raw_tokens[1:]):
-            return tokens[:1]
-    if dialect not in ("pwsh", "powershell", "cmd", *_HEREDOC_SHELLS) or any(
-        any(char in raw for char in "$`^!{}\r\n")
-        or (dialect == "cmd" and any(char in raw for char in "%'"))
-        or (dialect in _HEREDOC_SHELLS and "\\" in raw)
-        for raw in raw_tokens
-    ):
-        return conservative
+            return [], tokens[:1]
+    original_tokens = tokens
     command = tokens[0].lower().removesuffix(".exe")
+    relaxed_quotes = command == "git" or tokens[0].lower() in ("echo", "write-output")
+    if dialect == "cmd":
+        split_tokens, split_raws = _expand_cmd_single_quotes(tokens, raw_tokens)
+    else:
+        split_tokens, split_raws = tokens, raw_tokens
+    if relaxed_quotes:
+        tokens, raw_tokens = split_tokens, split_raws
+    git_info = _git_subcommand(tokens) if command == "git" else None
+    git_chdirs = git_info[2] if git_info is not None else []
+    git_chdir_indices = git_info[3] if git_info is not None else frozenset()
+    git_prefix_files = git_info[4] if git_info is not None else frozenset()
+    git_candidates = git_info[5] if git_info is not None else tokens
+    if relaxed_quotes:
+        conservative = _conservative_operands(
+            git_candidates,
+            keep_after_double_dash=command == "git",
+            skip=git_chdir_indices,
+        )
+        if git_prefix_files:
+            conservative = list(
+                dict.fromkeys(
+                    [*(git_candidates[i] for i in sorted(git_prefix_files)), *conservative]
+                )
+            )
+        if dialect == "cmd":
+            conservative = list(
+                dict.fromkeys(
+                    [
+                        *conservative,
+                        *_conservative_operands(
+                            original_tokens, keep_after_double_dash=command == "git"
+                        ),
+                    ]
+                )
+            )
+    else:
+        conservative = _conservative_operands(original_tokens)
+        if dialect == "cmd" and split_tokens != original_tokens:
+            conservative = list(
+                dict.fromkeys([*conservative, *_conservative_operands(split_tokens)])
+            )
+    if (
+        any(_windows_raw_token_unsafe(raw, dialect) for raw in raw_tokens)
+        if relaxed_quotes
+        else dialect not in ("pwsh", "powershell", "cmd", *_HEREDOC_SHELLS)
+        or any(
+            any(char in raw for char in "$`^!{}\r\n")
+            or (dialect == "cmd" and any(char in raw for char in "%'"))
+            or (dialect in _HEREDOC_SHELLS and "\\" in raw)
+            for raw in raw_tokens
+        )
+    ):
+        return git_chdirs, conservative
     if tokens[0].lower() in ("echo", "write-output"):
-        return conservative if any(value.startswith("-") for value in tokens[1:]) else tokens[:1]
+        return [], (
+            conservative if any(value.startswith("-") for value in tokens[1:]) else tokens[:1]
+        )
+    candidates = tokens.copy()
+    chdirs: list[str] = []
+    chdir_indices: set[int] = set()
+    files: set[int] = set()
     if command == "get-date":
         start = 1
         data_options = ("-Format", "-format")
@@ -1748,24 +1939,50 @@ def _windows_path_operands(
             "-q",
             "--fixed-strings",
         )
-    elif command == "git" and tokens[1:2] == ["commit"]:
-        start = 2
+    elif command == "git" and git_info is not None and git_info[0] in ("commit", "tag"):
+        subcommand, start, chdirs, chdir_indices, files, candidates = git_info
         data_options = ("-m", "--message")
         file_options = ("-F", "--file")
         flags = (
-            "-a",
-            "--all",
-            "-s",
-            "--signoff",
-            "--amend",
-            "--no-edit",
-            "--no-verify",
-            "--allow-empty",
-            "--allow-empty-message",
-            "-q",
-            "--quiet",
-            "-v",
-            "--verbose",
+            (
+                "-a",
+                "--all",
+                "-s",
+                "--signoff",
+                "--no-signoff",
+                "--amend",
+                "--no-edit",
+                "-n",
+                "--no-verify",
+                "--no-gpg-sign",
+                "--allow-empty",
+                "--allow-empty-message",
+                "-o",
+                "--only",
+                "-i",
+                "--include",
+                "--reset-author",
+                "-q",
+                "--quiet",
+                "-v",
+                "--verbose",
+            )
+            if subcommand == "commit"
+            else (
+                "-a",
+                "--annotate",
+                "-s",
+                "--sign",
+                "--no-sign",
+                "-f",
+                "--force",
+                "-d",
+                "--delete",
+                "-v",
+                "--verify",
+                "-l",
+                "--list",
+            )
         )
     elif command == "curl":
         start = 1
@@ -1803,10 +2020,8 @@ def _windows_path_operands(
         )
         flags = ("-print", "-print0", "-ls", "-a", "-and", "-o", "-or", "-not")
     else:
-        return conservative
-    candidates = tokens.copy()
+        return git_chdirs, conservative
     data = set()
-    files = set()
     certain = True
     options = True
     explicit_pattern = False
@@ -1817,6 +2032,8 @@ def _windows_path_operands(
         option, equals, attached = value.partition("=")
         if options and value == "--":
             options = False
+        elif not options and command == "git":
+            files.add(index)
         elif options and option in (*data_options, *file_options):
             if not equals:
                 index += 1
@@ -1833,6 +2050,43 @@ def _windows_path_operands(
             ):
                 data.add(index)
                 explicit_pattern = True
+        elif (
+            options
+            and command == "git"
+            and value.startswith("-")
+            and not value.startswith("--")
+            and len(value) > 2
+        ):
+            pos = 1
+            while pos < len(value):
+                short = f"-{value[pos]}"
+                if short in flags:
+                    pos += 1
+                elif short in data_options:
+                    if pos + 1 == len(value):
+                        index += 1
+                        if index == len(tokens):
+                            certain = False
+                        else:
+                            data.add(index)
+                    else:
+                        data.add(index)
+                    break
+                elif short in file_options:
+                    if pos + 1 == len(value):
+                        index += 1
+                        if index == len(tokens):
+                            certain = False
+                        else:
+                            candidates[index] = tokens[index]
+                            files.add(index)
+                    else:
+                        candidates[index] = value[pos + 1 :]
+                        files.add(index)
+                    break
+                else:
+                    certain = False
+                    break
         elif options and any(
             len(option) == 2 and value.startswith(option) and len(value) > 2
             for option in file_options
@@ -1852,11 +2106,16 @@ def _windows_path_operands(
     # Explicit patterns apply to all positionals, even those preceding the option.
     if positionals and not explicit_pattern:
         data.add(positionals[0])
-    return [
+    selected = [
         value
         for index, value in enumerate(candidates)
-        if (not certain or index not in data) and (index in files or not value.startswith("-"))
+        if index not in chdir_indices
+        and (not certain or index not in data)
+        and (index in files or not value.startswith("-"))
     ]
+    if not certain and dialect == "cmd" and command == "git":
+        selected = list(dict.fromkeys([*selected, *conservative]))
+    return chdirs, selected
 
 
 def is_powershell_version_query(command: str) -> bool:
@@ -1923,9 +2182,12 @@ def _windows_command_paths(
         )
         for raw in raw_tokens
     ]
+    if _command_name(context.shell) == "cmd":
+        if any(_cmd_raw_token_uncheckable(raw) for raw in raw_tokens):
+            raise ValueError("Uncheckable Windows shell quoting")
     segments: list[list[str]] = [[]]
     raw_segments: list[list[str]] = [[]]
-    candidates = []
+    candidates: list[tuple[str, TrustedHostContext]] = []
     index = 0
     while index < len(tokens):
         raw = raw_tokens[index]
@@ -1937,7 +2199,7 @@ def _windows_command_paths(
             index += 1
             if index == len(tokens) or re.fullmatch(r"[;&|<>()\n]+", raw_tokens[index]):
                 raise ValueError("Missing shell redirection target")
-            candidates.append(tokens[index])
+            candidates.append((tokens[index], context))
         else:
             segments[-1].append(tokens[index])
             raw_segments[-1].append(raw)
@@ -1981,14 +2243,14 @@ def _windows_command_paths(
                 )
             )
             candidates.extend(
-                value for value in segment[:option_index] if not value.startswith("-")
+                (value, context) for value in segment[:option_index] if not value.startswith("-")
             )
             if shell in _HEREDOC_SHELLS:
-                candidates.extend(segment[option_index + 2 :])
+                candidates.extend((value, context) for value in segment[option_index + 2 :])
         else:
             if agy_powershell and _command_name(context.shell) == "pwsh":
                 candidates.extend(
-                    option[1]
+                    (option[1], context)
                     for token in segment
                     if (
                         option := re.fullmatch(
@@ -2003,7 +2265,7 @@ def _windows_command_paths(
                     and re.fullmatch(r"[A-Za-z0-9_][\w./~^@{}-]+:[^:]+", segment[2])
                 ):
                     # A git tree object is addressed within the repository, not as an OS path.
-                    candidates.append(segment[0])
+                    candidates.append((segment[0], context))
                     continue
                 if (
                     len(segment) == 6
@@ -2014,7 +2276,7 @@ def _windows_command_paths(
                     and raw_segment[4].startswith(("'", '"'))
                     and raw_segment[5] == "}"
                 ):
-                    candidates.append(segment[0])
+                    candidates.append((segment[0], context))
                     continue
                 # In expression position, a bare .NET member has no filesystem operand.
                 # The complete command still requires approval.
@@ -2027,15 +2289,32 @@ def _windows_command_paths(
                     ):
                         continue
                     segment, raw_segment = segment[1:], raw_segment[1:]
-            candidates.extend(
-                _windows_path_operands(
-                    segment, raw_segment, context.shell, posix_executor=posix_executor
-                )
+            git_chdirs, segment_candidates = _windows_path_operands(
+                segment, raw_segment, context.shell, posix_executor=posix_executor
             )
-    for token in candidates:
+            target_context = context
+            for chdir_token in git_chdirs:
+                if not chdir_token:
+                    continue
+                expanded_dir = _expand_trusted(chdir_token, target_context, assigned)
+                if expanded_dir is None:
+                    raise _UnresolvedWindowsVariable(
+                        f"Unresolved Windows path variable: {chdir_token}"
+                    )
+                resolved_dir = _resolve(expanded_dir, target_context).path
+                paths.append(resolved_dir)
+                target_context = replace(target_context, cwd=resolved_dir)
+                drive = ntpath.splitdrive(resolved_dir)[0]
+                if len(drive) == 2:
+                    target_context = replace(
+                        target_context,
+                        drive_cwds={**target_context.drive_cwds, drive.upper(): resolved_dir},
+                    )
+            candidates.extend((value, target_context) for value in segment_candidates)
+    for token, token_context in candidates:
         if token:
             try:
-                expanded = _expand_trusted(token, context, assigned)
+                expanded = _expand_trusted(token, token_context, assigned)
             except _UnresolvedWindowsVariable:
                 if not agy_powershell or "$" not in token:
                     raise
@@ -2052,7 +2331,7 @@ def _windows_command_paths(
                     continue
                 raise _UnresolvedWindowsVariable(f"Unresolved Windows path variable: {token}")
             token = expanded
-            paths.append(_resolve(token, context).path)
+            paths.append(_resolve(token, token_context).path)
     return tuple(paths)
 
 

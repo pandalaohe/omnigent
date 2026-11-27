@@ -1560,6 +1560,218 @@ def test_windows_shell_data_roles_preserve_path_protections(command, rule):
 
 
 @pytest.mark.parametrize(
+    ("platform", "shell"),
+    [
+        ("windows", r"C:\work\Git\bin\bash.exe"),
+        ("windows", "pwsh"),
+        ("windows", "cmd"),
+        ("linux", "bash"),
+        ("darwin", "zsh"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("tool", "key"),
+    [("bash", "command"), ("sys_os_shell", "command"), ("run_command", "CommandLine")],
+)
+@pytest.mark.parametrize(
+    "command",
+    [
+        'git commit -m "feat: add x"',
+        "git commit -m 'fix(scope): y'",
+        'git commit --message="docs: z"',
+        "git commit --message='docs: z'",
+        'git commit -am "feat: add x"',
+        'git commit -sm "feat: add x"',
+        'git -C C:/work/project commit -m "feat: add x" -- a.py',
+        'git -C "" commit -m "feat: add x"',
+        'git tag -a v1 -m "release: 1"',
+        'git tag -am "release: 1" v1',
+        'git -C C:/work/project tag -a v1 -m "release: 1"',
+        'echo "a: b"',
+        "echo 'a: b'",
+    ],
+)
+def test_windows_colon_data_args_across_dialects_keep_normal_tiers(
+    platform, shell, tool, key, command
+):
+    if platform != "windows" and "C:/work/project" in command:
+        command = command.replace("C:/work/project", "/opt/work/project")
+    host = (
+        windows_host(shell=shell)
+        if platform == "windows"
+        else posix_host(platform=platform, shell=shell)
+    )
+    expected = (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ALLOW, Verdict.ALLOW)
+    assert (
+        tuple(decision(tier, tool, {key: command}, host).action for tier in PERMISSION_TIERS)
+        == expected
+    )
+
+
+@pytest.mark.parametrize("shell", [r"C:\work\Git\bin\bash.exe", "pwsh"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        'git commit -m "feat: add x\n\nbody: details"',
+        "git commit -m 'feat: fix! {ok} $1\nbody: details'",
+        "git -C 'C:\\work\\project' commit -m \"feat: add x\"",
+    ],
+)
+def test_windows_quoted_multiline_and_literal_git_messages_keep_normal_tiers(shell, command):
+    host = windows_host(shell=shell)
+    expected = (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ALLOW, Verdict.ALLOW)
+    assert (
+        tuple(
+            decision(tier, "sys_os_shell", {"command": command}, host).action
+            for tier in PERMISSION_TIERS
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("shell", [r"C:\work\Git\bin\bash.exe", "pwsh", "cmd"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo x > file.txt:stream",
+        "Set-Content -Path a.txt:s -Value 1",
+        "Set-Content -Path:a.txt:s -Value 1",
+        "cp a b:c",
+        "cp a file.txt:stream",
+        'git commit -m "feat: add x" -- file.txt:stream',
+        'git commit -m "feat: add x" -- -file.txt:stream',
+        'git -C file.txt:stream commit -m "feat: add x"',
+        'git -Cfile.txt:stream commit -m "feat: add x"',
+        'git -C=file.txt:stream commit -m "feat: add x"',
+        'git --git-dir=file.txt:stream commit -m "feat: add x"',
+        'git commit -aF file.txt:stream -m "feat: add x"',
+        'git commit -aFfile.txt:stream -m "feat: add x"',
+        "git tag -a v1 -F file.txt:stream",
+        'git tag -a v1 -m "release: 1" -F file.txt:stream',
+        'git tag -a v1 -m "release: 1" -- -file.txt:stream',
+        "git tag -aFfile.txt:stream v1",
+        'git tag --unknown -m "release: 1" v1',
+    ],
+)
+def test_windows_real_ads_and_git_file_targets_stay_denied(shell, command):
+    host = windows_host(shell=shell)
+    for tier in PERMISSION_TIERS:
+        assert decision(tier, "sys_os_shell", {"command": command}, host).action == Verdict.DENY
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git commit -m 'fix: file.txt:stream'",
+        "git commit -m 'fix: -F file.txt:stream'",
+        "git commit --message='docs: file.txt:stream'",
+        "git commit --message='docs: \"file.txt:stream\"'",
+        "git commit --message='docs: & type file.txt:stream'",
+        "git commit --message='docs: > file.txt:stream'",
+        r"git commit -m'fix: > C:\Windows\report'",
+        "git commit --message='docs: %MISSING%'",
+        'git commit --message="docs: x\ntype file.txt:stream"',
+        "other --opt='a: file.txt:stream'",
+        "rg 'a: b' file.txt",
+        "rg ' -a:b' file.txt",
+        "git commit -m ' -a:b'",
+        "git commit -m 'fix: & type file.txt:stream'",
+        "git commit -m 'fix: > file.txt:stream'",
+        'git commit -m "feat: x\ntype file.txt:stream"',
+        'git commit -m "feat: %MISSING%"',
+    ],
+)
+def test_windows_cmd_unquoted_single_quote_smuggling_and_newlines_stay_denied(command):
+    host = windows_host(shell="cmd")
+    for tier in PERMISSION_TIERS:
+        assert decision(tier, "sys_os_shell", {"command": command}, host).action == Verdict.DENY
+
+
+@pytest.mark.parametrize("shell", [r"C:\work\Git\bin\bash.exe", "pwsh", "cmd"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        'git -C .. -C control commit -m "feat: add x"',
+        'git -C .. commit -m "feat: add x" -F control/tier',
+        'git --git-dir=control -C .. commit -m "feat: add x"',
+        'git -C .. commit -m "feat: add x" -- control/tier',
+    ],
+)
+def test_windows_git_global_and_tag_file_options_keep_control_path_protection(shell, command):
+    host = windows_host(shell=shell)
+    assert decision("auto", "sys_os_shell", {"command": command}, host).rule_id == "control-path"
+
+
+def test_windows_git_direct_control_paths_and_non_git_quote_rules_stay_unchanged():
+    host = windows_host(shell="pwsh")
+    assert (
+        decision(
+            "auto",
+            "sys_os_shell",
+            {"command": r'git -C C:\work\control commit -m "feat: add x"'},
+            host,
+        ).rule_id
+        == "control-path"
+    )
+    assert (
+        decision(
+            "auto",
+            "sys_os_shell",
+            {"command": r"git tag -a v1 -F C:\work\control\tier"},
+            host,
+        ).rule_id
+        == "control-path"
+    )
+    assert (
+        decision(
+            "auto",
+            "sys_os_shell",
+            {"command": "git commit -m 'fix: -F ../control/tier x'"},
+            windows_host(shell="cmd"),
+        ).rule_id
+        == "control-path"
+    )
+    unresolved = decision(
+        "auto",
+        "run_command",
+        {"CommandLine": 'git -C "$UNKNOWN" commit -m "plain"'},
+        host,
+    )
+    assert unresolved.action == Verdict.DENY
+    assert "Unresolved Windows path variable" in unresolved.reason
+    env_host = windows_host(
+        shell="pwsh", environment={"SystemRoot": r"C:\Windows", "USERPROFILE": r"C:\work\sample"}
+    )
+    assert (
+        decision(
+            "auto",
+            "sys_os_shell",
+            {"command": 'git -C .. commit -m "$env:USERPROFILE" -F control/tier'},
+            env_host,
+        ).rule_id
+        == "control-path"
+    )
+    assert (
+        decision(
+            "auto",
+            "sys_os_shell",
+            {"command": 'git commit -m "$env:USERPROFILE" -- -file.txt:stream'},
+            env_host,
+        ).action
+        == Verdict.DENY
+    )
+    assert (
+        decision(
+            "auto",
+            "sys_os_shell",
+            {"command": 'rg -e "a: b\nc" file.txt'},
+            host,
+        ).action
+        == Verdict.DENY
+    )
+
+
+@pytest.mark.parametrize(
     "shell,command",
     [
         ("bash", 'echo "exit=$?"'),
