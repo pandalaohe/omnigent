@@ -606,6 +606,7 @@ async def _create_session(
     title: str | None = None,
     labels: dict[str, str] | None = None,
     terminal_launch_args: list[str] | None = None,
+    permission_tier: str | None = None,
 ) -> dict[str, Any]:
     """
     Create a session and return the response JSON.
@@ -619,6 +620,7 @@ async def _create_session(
     :param terminal_launch_args: Optional native-terminal
         pass-through CLI args, e.g.
         ``["--dangerously-skip-permissions"]``.
+    :param permission_tier: Optional explicit permission tier for a tiered harness.
     :returns: The ``POST /v1/sessions`` response body.
     """
     payload: dict[str, Any] = {"agent_id": agent_id}
@@ -638,6 +640,8 @@ async def _create_session(
         payload["labels"] = labels
     if terminal_launch_args is not None:
         payload["terminal_launch_args"] = terminal_launch_args
+    if permission_tier is not None:
+        payload["permission_tier"] = permission_tier
     resp = await client.post("/v1/sessions", json=payload)
     assert resp.status_code == 201, f"session create failed: {resp.status_code} {resp.text}"
     return resp.json()
@@ -8822,15 +8826,12 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
         relay_bindings.append((_session_id, _runner_id))
 
     relay_bindings: list[tuple[str, str]] = []
-    published: list[dict[str, Any]] = []
+    published: list[tuple[str, dict[str, Any]]] = []
     runner_client = _RecoveringRunnerClient()
     monkeypatch.setattr(sessions_module, "_registered_runner_id", _registered_runner_id)
     monkeypatch.setattr(sessions_module, "_get_runner_client", _get_runner_client)
     monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", _ensure_runner_relay_ready)
-    monkeypatch.setattr(
-        "omnigent.server.routes.sessions.session_stream.publish",
-        lambda _session_id, event: published.append(event),
-    )
+    _capture_published(monkeypatch, published)
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     sid = session["id"]
@@ -8891,7 +8892,12 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
     # The rebind init must be the versioned envelope: its snapshot is what
     # carries session state (harness_override et al.) to the runner.
     assert init_post["json"]["session_init"]["snapshot"] is not None
-    assert [event["status"] for event in published] == ["failed", "idle"]
+    statuses = [
+        event["status"]
+        for session_id, event in published
+        if session_id == sid and event["type"] == "session.status"
+    ]
+    assert statuses == ["failed", "idle"]
     assert cache_after == "idle"
     assert relay_bindings == [(sid, "runner_recovered")]
 
@@ -16752,10 +16758,10 @@ _APPROVE_FOR_ME = PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"]
 
 
 @pytest.mark.parametrize(
-    ("harness", "reported", "launch_args", "expected"),
+    ("harness", "reported", "launch_args", "permission_tier", "expected"),
     [
         pytest.param(
-            "codex-native", "read-only", _APPROVE_FOR_ME, "read-only", id="reported-mode"
+            "codex-native", "read-only", _APPROVE_FOR_ME, None, "read-only", id="reported-mode"
         ),
         # Anyone who can edit the session can write the label, so it can't claim
         # a mode that skips approval.
@@ -16763,19 +16769,16 @@ _APPROVE_FOR_ME = PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"]
             "codex-native",
             "full-access",
             _APPROVE_FOR_ME,
+            None,
             "approve-for-me",
             id="reported-approval-skipping-mode",
         ),
-        pytest.param("cursor-native", None, ["--auto-review"], "auto-review", id="cursor"),
+        pytest.param("cursor-native", None, ["--auto-review"], None, "auto-review", id="cursor"),
+        pytest.param("antigravity-native", None, [], "full", "skip", id="antigravity"),
         pytest.param(
-            "antigravity-native",
-            None,
-            ["--dangerously-skip-permissions"],
-            "skip",
-            id="antigravity",
+            "devin-native", None, ["--permission-mode", "smart"], None, "smart", id="devin"
         ),
-        pytest.param("devin-native", None, ["--permission-mode", "smart"], "smart", id="devin"),
-        pytest.param(None, "read-only", _APPROVE_FOR_ME, None, id="harness-without-modes"),
+        pytest.param(None, "read-only", _APPROVE_FOR_ME, None, None, id="harness-without-modes"),
     ],
 )
 async def test_session_snapshot_reports_its_permission_mode(
@@ -16783,6 +16786,7 @@ async def test_session_snapshot_reports_its_permission_mode(
     harness: str | None,
     reported: str | None,
     launch_args: list[str],
+    permission_tier: str | None,
     expected: str | None,
 ) -> None:
     """The snapshot names the mode a session reports, over the one it launched in."""
@@ -16793,6 +16797,7 @@ async def test_session_snapshot_reports_its_permission_mode(
         agent["id"],
         labels={"omnigent.codex_native.approval_mode": reported} if reported else None,
         terminal_launch_args=launch_args,
+        permission_tier=permission_tier,
     )
 
     snapshot = await client.get(f"/v1/sessions/{session['id']}")
