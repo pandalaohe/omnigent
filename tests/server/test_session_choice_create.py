@@ -3750,6 +3750,7 @@ async def project_choice_env(runtime_init, db_uri, tmp_path, mock_llm, monkeypat
     app.state.host_registry = None
     app.state.startup_admission = None
     from omnigent.server.routes import _session_create_validation, _workspace_validation
+    from omnigent.server.routes._sessions import helpers as helpers_mod
     from omnigent.server.routes._sessions import orchestration as orch_mod
 
     monkeypatch.setattr(sessions, "_get_runner_client", AsyncMock(return_value=None))
@@ -3775,6 +3776,11 @@ async def project_choice_env(runtime_init, db_uri, tmp_path, mock_llm, monkeypat
     )
     monkeypatch.setattr(
         _session_create_validation,
+        "validate_existing_host_workspace",
+        AsyncMock(side_effect=lambda **kw: kw["workspace"]),
+    )
+    monkeypatch.setattr(
+        helpers_mod,
         "validate_existing_host_workspace",
         AsyncMock(side_effect=lambda **kw: kw["workspace"]),
     )
@@ -3913,6 +3919,11 @@ async def test_project_blocked_agents_enforced_at_funnel_choice_routing_and_suba
     )
     assert r30_blank.status_code == 400, r30_blank.text
 
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+    from omnigent.server.routes._sessions import orchestration as orch_mod
+
+    monkeypatch.setattr(orch_mod, "_require_declared_subagent", lambda **_kw: None)
+
     parent_b = env.store.create_conversation(
         agent_id=agent_b, host_id=HOST, project_id=proj_id, workspace="/opt/work/project"
     )
@@ -3929,8 +3940,6 @@ async def test_project_blocked_agents_enforced_at_funnel_choice_routing_and_suba
     )
     assert r30_spoof.status_code == 409, r30_spoof.text
     assert r30_spoof.json()["error"]["code"] == "agent_blocked_for_project"
-
-    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
 
     parent_a = env.store.create_conversation(
         agent_id=agent_a, host_id=HOST, project_id=proj_id, workspace="/opt/work/project"
