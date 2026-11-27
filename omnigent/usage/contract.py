@@ -11,6 +11,7 @@ from pydantic import (
     ConfigDict,
     Field,
     HttpUrl,
+    PrivateAttr,
     StrictFloat,
     StrictInt,
     model_serializer,
@@ -407,6 +408,7 @@ class UsageAccountView(BaseModel):
     source_type: str | None = None
     source: str | None = None
     source_at: float | None = None
+    _retained_windows: dict[str, tuple[UsageWindowView, float]] = PrivateAttr(default_factory=dict)
 
 
 class UsageOverview(BaseModel):

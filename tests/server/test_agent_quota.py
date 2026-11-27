@@ -1586,3 +1586,626 @@ def test_repeated_overview_and_pool_reads_do_not_write(db_uri):
         assert dml == []
     finally:
         event.remove(engine, "after_cursor_execute", observe)
+
+
+@pytest.mark.parametrize(
+    "native_limits,expected_ids",
+    [
+        (
+            [
+                {
+                    "limit_id": "codex",
+                    "windows": [
+                        {
+                            "kind": "primary",
+                            "used_percent": 97.0,
+                            "window_duration_mins": 10080,
+                            "resets_at": NOW + 4 * 86400,
+                        }
+                    ],
+                }
+            ],
+            ["7d"],
+        ),
+        (
+            [
+                {
+                    "limit_id": "codex",
+                    "windows": [
+                        {
+                            "kind": "primary",
+                            "used_percent": 40.0,
+                            "window_duration_mins": 300,
+                            "resets_at": NOW + 10800,
+                        },
+                        {
+                            "kind": "secondary",
+                            "used_percent": 97.0,
+                            "window_duration_mins": 10080,
+                            "resets_at": NOW + 4 * 86400,
+                        },
+                    ],
+                }
+            ],
+            ["codex-primary", "7d"],
+        ),
+        (
+            [
+                {
+                    "limit_id": "codex",
+                    "windows": [
+                        {
+                            "kind": "primary",
+                            "used_percent": 40.0,
+                            "window_duration_mins": 300,
+                            "resets_at": NOW + 10800,
+                        },
+                        {
+                            "kind": "secondary",
+                            "used_percent": 97.0,
+                            "window_duration_mins": 10080,
+                            "resets_at": NOW + 4 * 86400,
+                        },
+                    ],
+                },
+                {
+                    "limit_id": "relay",
+                    "windows": [
+                        {
+                            "kind": "secondary",
+                            "used_percent": 20.0,
+                            "window_duration_mins": 10080,
+                            "resets_at": NOW + 4 * 86400,
+                        }
+                    ],
+                },
+            ],
+            ["codex-primary", "7d", "relay-secondary"],
+        ),
+    ],
+)
+def test_native_codex_weekly_window_maps_to_board_reserve_window_id(
+    service, native_limits, expected_ids
+):
+    from omnigent.server.session_choice import parse_session_choice
+
+    board = UsageReportV2.model_validate(
+        {
+            "schema_version": 2,
+            "observed_at": NOW,
+            "fresh_until": NOW + 900,
+            "status": "available",
+            "product": "codex",
+            "windows": [
+                {
+                    "id": "7d",
+                    "kind": "weekly",
+                    "percent_used": 96.0,
+                    "window_minutes": 10080,
+                    "resets_at": NOW + 4 * 86400,
+                }
+            ],
+            "balances": [{"id": "credits", "remaining": 5000.0, "unit": "credits"}],
+        }
+    )
+    service.report_account(OWNER, "codex-pro", board, now=NOW)
+    native = {"captured_at": NOW + 60, "limits": native_limits}
+    service.note_reading(OWNER, HOST, "codex", native, now=NOW + 60)
+
+    tile = account(service.overview(OWNER, now=NOW + 60), "codex-pro")
+    assert [w.id for w in tile.windows] == expected_ids
+    weekly = next(w for w in tile.windows if w.id == "7d")
+    assert weekly.remaining_pct == pytest.approx(3.0)
+    assert weekly.kind == "weekly"
+
+    settings = parse_session_choice(
+        {
+            "enabled": True,
+            "workTypes": [{"id": "work", "label": "Work"}],
+            "limits": {"codex-pro": {"reserve": {"mode": "total", "window": "7d", "pct": 4}}},
+        }
+    )
+    line = service.tile_lines(OWNER, now=NOW + 60, settings=settings)["tiles"]["codex-pro"]
+    assert line["state"] == "warn"
+    assert line["remaining_pct"] == pytest.approx(3.0)
+    assert line["read_at"] == NOW + 60
+
+
+def test_empty_and_null_reports_retain_last_known_windows_until_reset(db_uri):
+    from omnigent.server.session_choice import parse_session_choice
+
+    service = service_with_store(db_uri)
+    reset_at = NOW + 4 * 86400
+    settings = parse_session_choice(
+        {
+            "enabled": True,
+            "workTypes": [{"id": "work", "label": "Work"}],
+            "limits": {
+                "codex-pro": {"reserve": {"mode": "total", "window": "7d", "pct": 4}},
+                "legacy-pool": {"reserve": {"mode": "total", "window": "7d", "pct": 4}},
+            },
+        }
+    )
+
+    good = UsageReportV2.model_validate(
+        {
+            "schema_version": 2,
+            "observed_at": NOW,
+            "fresh_until": NOW + 300,
+            "status": "available",
+            "product": "codex",
+            "windows": [
+                {
+                    "id": "7d",
+                    "kind": "weekly",
+                    "percent_used": 96.0,
+                    "window_minutes": 10080,
+                    "resets_at": reset_at,
+                }
+            ],
+            "balances": [{"id": "credits", "remaining": 5000.0, "unit": "credits"}],
+        }
+    )
+    service.report_account(OWNER, "codex-pro", good, now=NOW)
+
+    # An available report with windows=[] must not erase stored windows.
+    empty_v2 = UsageReportV2.model_validate(
+        {
+            "schema_version": 2,
+            "observed_at": NOW + 60,
+            "fresh_until": NOW + 600,
+            "status": "available",
+            "windows": [],
+            "balances": [{"id": "credits", "remaining": 5000.0, "unit": "credits"}],
+        }
+    )
+    service.report_account(OWNER, "codex-pro", empty_v2, now=NOW + 60)
+    tile = account(service.overview(OWNER, now=NOW + 60), "codex-pro")
+    assert tile.freshness == "old"
+    assert tile.read_at == NOW
+    assert len(tile.windows) == 1 and tile.windows[0].remaining_pct == pytest.approx(4.0)
+    line = service.tile_lines(OWNER, now=NOW + 60, settings=settings)["tiles"]["codex-pro"]
+    assert line["state"] == "warn"
+    assert line["remaining_pct"] == pytest.approx(4.0)
+    assert line["read_at"] == NOW
+
+    # Same empty-refresh guard for v1 UsageReport.
+    v1_good = usage_report(
+        windows=[
+            {
+                "id": "7d",
+                "kind": "weekly",
+                "percent_used": 97.0,
+                "window_minutes": 10080,
+                "resets_at": reset_at,
+            }
+        ],
+        fresh_until=NOW + 300,
+    )
+    service.report_account(OWNER, "legacy-pool", v1_good, now=NOW)
+    v1_empty = UsageReport.model_validate(
+        {"observed_at": NOW + 60, "fresh_until": NOW + 600, "status": "available", "windows": []}
+    )
+    service.report_account(OWNER, "legacy-pool", v1_empty, now=NOW + 60)
+    v1_line = service.tile_lines(OWNER, now=NOW + 60, settings=settings)["tiles"]["legacy-pool"]
+    assert v1_line["state"] == "warn"
+    assert v1_line["remaining_pct"] == pytest.approx(3.0)
+    assert v1_line["read_at"] == NOW
+
+    # A fresh report whose 7d window has no computable remaining_pct (or omits 7d)
+    # still enforces reserve on the retained unexpired value.
+    omitted_v2 = UsageReportV2.model_validate(
+        {
+            "schema_version": 2,
+            "observed_at": NOW + 100,
+            "fresh_until": NOW + 900,
+            "status": "available",
+            "windows": [
+                {
+                    "id": "5h",
+                    "kind": "session",
+                    "percent_used": 20.0,
+                    "window_minutes": 300,
+                    "resets_at": NOW + 10800,
+                }
+            ],
+            "balances": [{"id": "credits", "remaining": 5000.0, "unit": "credits"}],
+        }
+    )
+    service.report_account(OWNER, "codex-pro", omitted_v2, now=NOW + 100)
+    omitted_line = service.tile_lines(OWNER, now=NOW + 100, settings=settings)["tiles"][
+        "codex-pro"
+    ]
+    assert omitted_line["state"] == "warn"
+    assert omitted_line["remaining_pct"] == pytest.approx(4.0)
+    assert omitted_line["read_at"] == NOW
+
+    unbounded_v2 = UsageReportV2.model_validate(
+        {
+            "schema_version": 2,
+            "observed_at": NOW + 120,
+            "fresh_until": NOW + 900,
+            "status": "available",
+            "windows": [
+                {
+                    "id": "7d",
+                    "kind": "weekly",
+                    "used_value": 50.0,
+                    "window_minutes": 10080,
+                }
+            ],
+            "balances": [{"id": "credits", "remaining": 5000.0, "unit": "credits"}],
+        }
+    )
+    service.report_account(OWNER, "codex-pro", unbounded_v2, now=NOW + 120)
+    service.flush(force=True)
+
+    # Retained last_windows also survives restart hydration.
+    restarted = service_with_store(db_uri)
+    restarted_line = restarted.tile_lines(OWNER, now=NOW + 120, settings=settings)["tiles"][
+        "codex-pro"
+    ]
+    assert restarted_line["state"] == "warn"
+    assert restarted_line["remaining_pct"] == pytest.approx(4.0)
+    assert restarted_line["read_at"] == NOW
+
+    # Once resets_at passes, the retained reading expires and no longer blocks.
+    after_reset = restarted.tile_lines(OWNER, now=reset_at + 1, settings=settings)["tiles"][
+        "codex-pro"
+    ]
+    assert after_reset["state"] == "unknown"
+    assert after_reset["remaining_pct"] is None
+
+
+def test_partial_refresh_across_sources_upgrade_bounds_and_weekly_model_mapping(db_uri):
+    from omnigent.server.session_choice import parse_session_choice
+    from tests.server.test_session_choice import pick, table
+
+    service = service_with_store(db_uri)
+    reset_at = NOW + 4 * 86400
+    settings = parse_session_choice(
+        {
+            "enabled": True,
+            "workTypes": [{"id": "work", "label": "Work"}],
+            "limits": {
+                "codex-pro": {
+                    "reserve": {"mode": "total", "window": "7d", "pct": 10, "stopPct": 5}
+                },
+                "claude-max": {
+                    "reserve": {"mode": "total", "window": "7d", "pct": 10, "stopPct": 5}
+                },
+            },
+        }
+    )
+
+    # 1. Native-to-native and native-to-board partial refreshes keep the newer native 2% stop.
+    service.report_account(
+        OWNER,
+        "codex-pro",
+        UsageReportV2.model_validate(
+            {
+                "schema_version": 2,
+                "observed_at": NOW,
+                "fresh_until": NOW + 900,
+                "status": "available",
+                "product": "codex",
+                "windows": [
+                    {
+                        "id": "7d",
+                        "kind": "weekly",
+                        "percent_used": 20.0,
+                        "window_minutes": 10080,
+                        "resets_at": reset_at,
+                    }
+                ],
+                "balances": [{"id": "credits", "remaining": 5000.0, "unit": "credits"}],
+            }
+        ),
+        now=NOW,
+    )
+    service.note_reading(
+        OWNER,
+        HOST,
+        "codex",
+        {
+            "captured_at": NOW + 100,
+            "limits": [
+                {
+                    "limit_id": "codex",
+                    "windows": [
+                        {
+                            "kind": "primary",
+                            "used_percent": 98.0,
+                            "window_duration_mins": 10080,
+                            "resets_at": reset_at,
+                        }
+                    ],
+                }
+            ],
+        },
+        now=NOW + 100,
+    )
+    # Native-to-native partial refresh: primary now carries only 5h.
+    service.note_reading(
+        OWNER,
+        HOST,
+        "codex",
+        {
+            "captured_at": NOW + 110,
+            "limits": [
+                {
+                    "limit_id": "codex",
+                    "windows": [
+                        {
+                            "kind": "primary",
+                            "used_percent": 10.0,
+                            "window_duration_mins": 300,
+                            "resets_at": NOW + 10800,
+                        }
+                    ],
+                }
+            ],
+        },
+        now=NOW + 110,
+    )
+    line_n2n = service.tile_lines(OWNER, now=NOW + 110, settings=settings)["tiles"]["codex-pro"]
+    assert line_n2n["state"] == "stop"
+    assert line_n2n["remaining_pct"] == pytest.approx(2.0)
+    assert line_n2n["read_at"] == NOW + 100
+    readings_n2n = service.pool_readings(QuotaContext(OWNER, HOST), now=NOW + 110)
+    assert (
+        pick(
+            table(
+                limits={
+                    "pool-0": {
+                        "reserve": {"mode": "total", "window": "7d", "pct": 10, "stopPct": 5}
+                    }
+                }
+            ),
+            readings={"pool-0": readings_n2n["codex-pro"]},
+            now=NOW + 110,
+        )
+        .skipped[0]
+        .why
+        == "stop"
+    )
+
+    # Native-to-board partial refresh: board wins read_at with only 5h.
+    service.report_account(
+        OWNER,
+        "codex-pro",
+        UsageReportV2.model_validate(
+            {
+                "schema_version": 2,
+                "observed_at": NOW + 120,
+                "fresh_until": NOW + 900,
+                "status": "available",
+                "windows": [
+                    {
+                        "id": "5h",
+                        "kind": "session",
+                        "percent_used": 10.0,
+                        "window_minutes": 300,
+                        "resets_at": NOW + 10800,
+                    }
+                ],
+                "balances": [{"id": "credits", "remaining": 5000.0, "unit": "credits"}],
+            }
+        ),
+        now=NOW + 120,
+    )
+    line_n2b = service.tile_lines(OWNER, now=NOW + 120, settings=settings)["tiles"]["codex-pro"]
+    assert line_n2b["state"] == "stop"
+    assert line_n2b["remaining_pct"] == pytest.approx(2.0)
+    assert line_n2b["read_at"] == NOW + 100
+
+    # 2. Retained last_windows stays bounded (<= 16 entries) across many reset-free IDs.
+    for batch in range(3):
+        service.report_account(
+            OWNER,
+            "bounded-acc",
+            UsageReportV2.model_validate(
+                {
+                    "schema_version": 2,
+                    "observed_at": NOW + batch,
+                    "status": "available",
+                    "windows": [{"id": f"w-{batch}-{i}", "percent_used": 50.0} for i in range(16)],
+                }
+            ),
+            now=NOW + batch,
+        )
+    bounded_record = service._accounts[(current_workspace_id(), OWNER, "bounded-acc")]
+    assert len(bounded_record["last_windows"]) <= 16
+
+    # 3. Pre-upgrade row (no last_windows) seeded before overwrite + past-reset null refresh
+    # does not suppress an unexpired retained stop.
+    store = UsageSnapshotStore(db_uri)
+    legacy_row = {
+        "schema_version": 1,
+        "account_id": "pre-upgrade",
+        "report": {
+            "schema_version": 2,
+            "observed_at": NOW,
+            "status": "available",
+            "windows": [
+                {
+                    "id": "7d",
+                    "kind": "weekly",
+                    "percent_used": 98.0,
+                    "window_minutes": 10080,
+                    "resets_at": reset_at,
+                }
+            ],
+            "balances": [{"id": "credits", "remaining": 100.0, "unit": "credits"}],
+        },
+        "read_at": NOW,
+        "fresh_until": NOW + 300,
+        "last_attempt_at": NOW,
+        "last_attempt_status": "available",
+        "sections": {
+            "windows": {
+                "read_at": NOW,
+                "fresh_until": NOW + 300,
+                "last_attempt_at": NOW,
+                "last_attempt_status": "available",
+            },
+            "balances": {
+                "read_at": NOW,
+                "fresh_until": NOW + 300,
+                "last_attempt_at": NOW,
+                "last_attempt_status": "available",
+            },
+        },
+        "reset_marks": {},
+        "report_log": [],
+    }
+    store.write(OWNER, "usage.account.pre-upgrade", legacy_row)
+    upgraded = service_with_store(db_uri, store=store)
+    upgraded.report_account(
+        OWNER,
+        "pre-upgrade",
+        UsageReportV2.model_validate(
+            {
+                "schema_version": 2,
+                "observed_at": NOW + 60,
+                "fresh_until": NOW + 600,
+                "status": "available",
+                "windows": [
+                    {
+                        "id": "7d",
+                        "kind": "weekly",
+                        "used_value": 50.0,
+                        "window_minutes": 10080,
+                        "resets_at": NOW - 10,
+                    }
+                ],
+                "balances": [{"id": "credits", "remaining": 100.0, "unit": "credits"}],
+            }
+        ),
+        now=NOW + 60,
+    )
+    upgrade_settings = parse_session_choice(
+        {
+            "enabled": True,
+            "workTypes": [{"id": "work", "label": "Work"}],
+            "limits": {
+                "pre-upgrade": {
+                    "reserve": {"mode": "total", "window": "7d", "pct": 10, "stopPct": 5}
+                }
+            },
+        }
+    )
+    upgraded_line = upgraded.tile_lines(OWNER, now=NOW + 60, settings=upgrade_settings)["tiles"][
+        "pre-upgrade"
+    ]
+    assert upgraded_line["state"] == "stop"
+    assert upgraded_line["remaining_pct"] == pytest.approx(2.0)
+    assert upgraded_line["read_at"] == NOW
+
+    # 4. Empty refresh preserves projected fresh_until (allowing fallback to fresh native probe
+    # once expired) and applies V1 metadata updates.
+    svc_empty = service_with_store(db_uri)
+    native_live = {
+        "captured_at": NOW + 10,
+        "limits": [
+            {
+                "limit_id": "codex",
+                "windows": [
+                    {
+                        "kind": "primary",
+                        "used_percent": 30.0,
+                        "window_duration_mins": 10080,
+                        "resets_at": reset_at,
+                    }
+                ],
+            }
+        ],
+    }
+    conn = SimpleNamespace(owner=OWNER, hello=SimpleNamespace(codex_rate_limits=native_live))
+    svc_empty.host_registry = SimpleNamespace(
+        online_host_ids=lambda workspace_id: [HOST],
+        get=lambda host_id, workspace_id=None: conn,
+    )
+    svc_empty.report_account(
+        OWNER,
+        "v1-codex",
+        usage_report(
+            account_product="codex",
+            display_name="Old Name",
+            observed_at=NOW,
+            fresh_until=NOW + 300,
+        ),
+        now=NOW,
+    )
+    svc_empty.report_account(
+        OWNER,
+        "v1-codex",
+        UsageReport.model_validate(
+            {
+                "observed_at": NOW + 20,
+                "fresh_until": NOW + 60,
+                "status": "available",
+                "display_name": "Updated Name",
+                "windows": [],
+            }
+        ),
+        now=NOW + 20,
+    )
+    v1_tile = account(svc_empty.overview(OWNER, now=NOW + 20), "v1-codex")
+    assert v1_tile.display_name == "Updated Name"
+    assert len(v1_tile.windows) == 1 and v1_tile.read_at == NOW
+    # After the empty report's fresh_until (NOW + 60) expires, live Host probe wins routing.
+    assert svc_empty.quotas(QuotaContext(OWNER, HOST), now=NOW + 61)[1]["codex"].state == "ok"
+
+    # 5. Claude board listing a weekly_model window before 7d maps native 'w' to '7d'.
+    service.report_account(
+        OWNER,
+        "claude-max",
+        UsageReportV2.model_validate(
+            {
+                "schema_version": 2,
+                "observed_at": NOW,
+                "fresh_until": NOW + 900,
+                "status": "available",
+                "product": "claude",
+                "windows": [
+                    {
+                        "id": "opus-7d",
+                        "kind": "weekly_model",
+                        "percent_used": 20.0,
+                        "window_minutes": 10080,
+                        "resets_at": reset_at,
+                    },
+                    {
+                        "id": "7d",
+                        "kind": "weekly",
+                        "percent_used": 20.0,
+                        "window_minutes": 10080,
+                        "resets_at": reset_at,
+                    },
+                ],
+            }
+        ),
+        now=NOW,
+    )
+    service.report(
+        OWNER,
+        HOST,
+        "claude",
+        {
+            "captured_at": NOW + 50,
+            "windows": [
+                {
+                    "label": "w",
+                    "used_percent": 98.0,
+                    "duration_mins": 10080,
+                    "resets_at": reset_at,
+                }
+            ],
+        },
+        now=NOW + 50,
+    )
+    claude_line = service.tile_lines(OWNER, now=NOW + 50, settings=settings)["tiles"]["claude-max"]
+    assert claude_line["state"] == "stop"
+    assert claude_line["remaining_pct"] == pytest.approx(2.0)
+    assert claude_line["read_at"] == NOW + 50
