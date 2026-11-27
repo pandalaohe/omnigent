@@ -243,6 +243,8 @@ def test_static_gif_remains_inline_and_obeys_image_cap(
         "omnigent.server.server_config.load_server_config",
         lambda: {"attachment_max_image_bytes": len(original) - 1},
     )
+    # Without filesystem support, exceeding the inline image cap returns 413.
+    client.app.state.host_registry.get("d75381f2c94b4e49a3c684946d4ddbc4").hello.capabilities = []
     assert _upload(client, session_id, "capped.gif", original, "image/gif").status_code == 413
 
 
@@ -594,7 +596,7 @@ async def test_read_upload_capped_boundary(size: int, rejected: bool) -> None:
         ("notes.txt", "text/plain", "attachment_max_text_bytes"),
     ],
 )
-def test_configured_inline_limit_rejects_upload(
+def test_configured_inline_limit_rejects_upload_without_filesystem_support(
     upload_client: tuple[TestClient, str],
     monkeypatch: pytest.MonkeyPatch,
     filename: str,
@@ -605,8 +607,310 @@ def test_configured_inline_limit_rejects_upload(
         "omnigent.server.server_config.load_server_config", lambda: {config_key: 10}
     )
     client, session_id = upload_client
+    client.app.state.host_registry.get("d75381f2c94b4e49a3c684946d4ddbc4").hello.capabilities = []
     response = _upload(client, session_id, filename, b"x" * 11, content_type)
     assert response.status_code == 413, response.text
+    assert "10 bytes" in response.text
+    assert "inline limit" in response.text
+
+
+@pytest.mark.parametrize(
+    ("filename", "content_type", "config_key"),
+    [
+        ("picture.png", "image/png", "attachment_max_image_bytes"),
+        ("drawing.svg", "image/svg+xml", "attachment_max_uncompressed_image_bytes"),
+        ("report.pdf", "application/pdf", "attachment_max_pdf_bytes"),
+        ("notes.txt", "text/plain", "attachment_max_text_bytes"),
+    ],
+)
+def test_oversized_inline_type_routes_to_filesystem_when_supported(
+    upload_client: tuple[TestClient, str],
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    content_type: str,
+    config_key: str,
+) -> None:
+    """Oversized image/PDF/text routes by path on capable sessions without decoding."""
+    from omnigent.runtime import content_resolver
+
+    compress_spy = Mock(side_effect=AssertionError("oversized image must not decode in memory"))
+    monkeypatch.setattr(content_resolver, "compress_image_attachment", compress_spy)
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {config_key: 10, "filesystem_attachment_max_bytes": 500 * 1024 * 1024},
+    )
+    client, session_id = upload_client
+    payload = b"oversized-bytes-1234567890"
+    response = _upload(client, session_id, filename, payload, content_type)
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["metadata"]["source_metadata"] == {"delivery": "filesystem"}
+    stored = SqlAlchemyFileStore(db_uri).get(body["id"], session_id=session_id)
+    assert stored is not None
+    assert stored.content_type == content_type
+    assert stored.bytes == len(payload)
+    content = client.get(f"/v1/sessions/{session_id}/resources/files/{body['id']}/content")
+    assert content.status_code == 200
+    assert content.content == payload
+    compress_spy.assert_not_called()
+
+
+def test_oversized_pdf_and_text_reject_without_host_and_inline_under_budget(
+    upload_client: tuple[TestClient, str],
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Under inline budget stays inline; over inline budget returns 413 on an unbound session."""
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {
+            "attachment_max_pdf_bytes": 20,
+            "attachment_max_text_bytes": 10,
+            "filesystem_attachment_max_bytes": 500 * 1024 * 1024,
+        },
+    )
+    client, session_id = upload_client
+    SqlAlchemyConversationStore(db_uri).clear_host_binding(session_id)
+
+    # Under inline budget → still succeeds inline even without filesystem support.
+    small_pdf = _upload(client, session_id, "small.pdf", b"%PDF-1.4\n", "application/pdf")
+    assert small_pdf.status_code == 201, small_pdf.text
+    assert small_pdf.json()["metadata"].get("source_metadata") is None
+
+    # Over inline budget without filesystem support → clear 413 naming inline budget.
+    big_pdf = _upload(client, session_id, "big.pdf", b"%PDF-" + b"0" * 30, "application/pdf")
+    assert big_pdf.status_code == 413, big_pdf.text
+    assert "20 bytes" in big_pdf.text
+
+    big_txt = _upload(client, session_id, "big.txt", b"a" * 30, "text/plain")
+    assert big_txt.status_code == 413, big_txt.text
+    assert "10 bytes" in big_txt.text
+    assert len(SqlAlchemyFileStore(db_uri).list(session_id).data) == 1
+
+
+def test_oversized_pdf_rejects_with_413_when_policy_disables_filesystem(
+    upload_client: tuple[TestClient, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empty filesystem policy keeps oversized inline types rejected with 413."""
+    monkeypatch.setattr(
+        "omnigent.server.server_config.filesystem_attachment_policy",
+        lambda: FilesystemAttachmentPolicy(frozenset()),
+    )
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"attachment_max_pdf_bytes": 10, "filesystem_attachment_max_bytes": 1024},
+    )
+    client, session_id = upload_client
+    response = _upload(client, session_id, "big.pdf", b"%PDF-" + b"0" * 20, "application/pdf")
+    assert response.status_code == 413, response.text
+    assert "10 bytes" in response.text
+
+
+@pytest.mark.parametrize(
+    ("filename", "content_type"),
+    [
+        ("report.pdf", "application/pdf"),
+        ("notes.txt", "text/plain"),
+        ("photo.png", "image/png"),
+        ("icon.svg", "image/svg+xml"),
+    ],
+)
+def test_unified_per_file_limit_rejects_every_type_including_below_inline_budget(
+    upload_client: tuple[TestClient, str],
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    content_type: str,
+) -> None:
+    """When per-file cap is below the inline budget, it still bounds every upload."""
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_max_bytes": 16},
+    )
+    client, session_id = upload_client
+    response = _upload(client, session_id, filename, b"x" * 17, content_type)
+    assert response.status_code == 413, response.text
+    assert "16 bytes" in response.text
+
+
+@pytest.mark.asyncio
+async def test_oversized_pdf_and_text_materialize_as_attached_paths_on_runner(
+    upload_client: tuple[TestClient, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Oversized PDF and text uploads reach a native runner as [Attached: <path>] files."""
+    from omnigent.inner.native_attachments import resolve_file_reference
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "runner-data"))
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {
+            "attachment_max_pdf_bytes": 16,
+            "attachment_max_text_bytes": 16,
+            "filesystem_attachment_max_bytes": 500 * 1024 * 1024,
+        },
+    )
+    client, session_id = upload_client
+    pdf_bytes = b"%PDF-1.4\n" + b"p" * 64
+    txt_bytes = b"line\n" * 16
+
+    pdf_resp = _upload(client, session_id, "manual.pdf", pdf_bytes, "application/pdf")
+    txt_resp = _upload(client, session_id, "dump.txt", txt_bytes, "text/plain")
+    assert pdf_resp.status_code == 201, pdf_resp.text
+    assert txt_resp.status_code == 201, txt_resp.text
+
+    transport = httpx.ASGITransport(app=client.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
+        for uploaded, expected_bytes, expected_name in (
+            (pdf_resp.json(), pdf_bytes, "manual.pdf"),
+            (txt_resp.json(), txt_bytes, "dump.txt"),
+        ):
+            blocks = await resolve_file_reference(
+                {"type": "input_file", "file_id": uploaded["id"], "filename": expected_name},
+                session_id=session_id,
+                client=async_client,
+            )
+            assert blocks is not None and len(blocks) == 1
+            text = str(blocks[0]["text"])
+            assert text.startswith("[Attached: ") and text.endswith("]")
+            local_path = Path(text.removeprefix("[Attached: ").removesuffix("]"))
+            assert local_path.name == expected_name
+            assert local_path.read_bytes() == expected_bytes
+
+
+def test_real_default_budgets_inline_10mb_pdf_and_route_oversized_pdf_and_text(
+    upload_client: tuple[TestClient, str],
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With production defaults (20 MiB PDF / 10 MiB text / 500 MiB file cap),
+    a 10 MiB PDF stays inline while a 21 MiB PDF and 11 MiB text route by path."""
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_max_bytes": 500 * 1024 * 1024},
+    )
+    client, session_id = upload_client
+    small_pdf = _upload(
+        client, session_id, "ten.pdf", b"%PDF-1.4\n" + b"0" * (10 * 1024 * 1024), "application/pdf"
+    )
+    assert small_pdf.status_code == 201, small_pdf.text
+    assert small_pdf.json()["metadata"].get("source_metadata") is None
+
+    big_pdf = _upload(
+        client,
+        session_id,
+        "twentyone.pdf",
+        b"%PDF-1.4\n" + b"1" * (21 * 1024 * 1024),
+        "application/pdf",
+    )
+    assert big_pdf.status_code == 201, big_pdf.text
+    assert big_pdf.json()["metadata"]["source_metadata"] == {"delivery": "filesystem"}
+
+    big_txt = _upload(client, session_id, "eleven.txt", b"a" * (11 * 1024 * 1024), "text/plain")
+    assert big_txt.status_code == 201, big_txt.text
+    assert big_txt.json()["metadata"]["source_metadata"] == {"delivery": "filesystem"}
+
+    # Confirm the stored rows match sizes and delivery metadata.
+    store = SqlAlchemyFileStore(db_uri)
+    assert store.get(small_pdf.json()["id"], session_id=session_id).source_metadata is None
+    assert store.get(big_pdf.json()["id"], session_id=session_id).source_metadata == {
+        "delivery": "filesystem"
+    }
+    assert store.get(big_txt.json()["id"], session_id=session_id).source_metadata == {
+        "delivery": "filesystem"
+    }
+
+
+@pytest.mark.asyncio
+async def test_initial_upload_rejects_oversized_on_known_legacy_host_and_defers_pending_sandbox(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Initial-create uploads enforce the host check when a host is already selected,
+    while preserving deferred validation when managed-sandbox provisioning is still pending."""
+    from fastapi import HTTPException, UploadFile
+    from starlette.datastructures import Headers
+
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {
+            "attachment_max_pdf_bytes": 16,
+            "filesystem_attachment_max_bytes": 500 * 1024 * 1024,
+        },
+    )
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    file_store = SqlAlchemyFileStore(db_uri)
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    agent_store.create(
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        name="test-agent",
+        bundle_location="087b7cb7ac30abf4debfaa578d052ec6/bundle",
+    )
+    legacy_host_id = "a1111111111111111111111111111111"
+    host_registry = HostRegistry()
+    host_registry.register(
+        legacy_host_id,
+        Mock(),
+        HostHelloFrame(
+            version="0.14.0",
+            frame_protocol_version=1,
+            name="legacy",
+            capabilities=[],
+        ),
+        owner=None,
+    )
+    app = FastAPI()
+    app.state.host_registry = host_registry
+    captured: list[Any] = []
+    from omnigent.server.routes.sessions.routes_resources import register_resources_routes
+
+    register_resources_routes(
+        app.router,
+        conversation_store=conversation_store,
+        agent_store=agent_store,
+        file_store=file_store,
+        artifact_store=artifact_store,
+        host_registry=host_registry,
+        register_initial_file_upload=captured.append,
+    )
+    assert len(captured) == 1
+    initial_upload = captured[0]
+
+    legacy_conv = conversation_store.create_conversation(
+        title="legacy initial", agent_id="087b7cb7ac30abf4debfaa578d052ec6"
+    )
+    conversation_store.set_host_id(legacy_conv.id, legacy_host_id, workspace="/opt/work/proj")
+
+    pending_conv = conversation_store.create_conversation(
+        title="pending sandbox initial", agent_id="087b7cb7ac30abf4debfaa578d052ec6"
+    )
+
+    fake_request = SimpleNamespace(app=app, headers={}, cookies={}, state=SimpleNamespace())
+    pdf_payload = b"%PDF-1.4\n" + b"x" * 64
+
+    legacy_file = UploadFile(
+        BytesIO(pdf_payload),
+        filename="big.pdf",
+        headers=Headers({"content-type": "application/pdf"}),
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        await initial_upload(fake_request, legacy_conv.id, legacy_file)
+    assert exc_info.value.status_code == 413
+    assert "16 bytes" in str(exc_info.value.detail)
+    assert file_store.list(legacy_conv.id).data == []
+
+    pending_file = UploadFile(
+        BytesIO(pdf_payload),
+        filename="big.pdf",
+        headers=Headers({"content-type": "application/pdf"}),
+    )
+    stored = await initial_upload(fake_request, pending_conv.id, pending_file)
+    assert stored["metadata"]["source_metadata"] == {"delivery": "filesystem"}
+    assert len(file_store.list(pending_conv.id).data) == 1
 
 
 @pytest.mark.parametrize(

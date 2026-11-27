@@ -255,13 +255,87 @@ describe("validateAttachments", () => {
     expect(validateAttachments([image], { image_bytes: 64 * MB }).accepted).toEqual([image]);
   });
 
-  it("defers GIF image/file caps to the server while enforcing the request cap", () => {
+  it("defers GIF image/file caps to the server when file_bytes is omitted, and enforces unified file_bytes when set", () => {
     const gif = makeFile("moving.gif", "", 20);
-    const limits = { image_bytes: 1, file_bytes: 1, upload_bytes: 20 };
-    expect(validateAttachments([gif], limits).accepted).toEqual([gif]);
-    expect(validateAttachments([makeFile("moving.gif", "image/gif", 21)], limits).accepted).toEqual(
-      [],
+    const legacyLimits = { image_bytes: 1, upload_bytes: 20 };
+    expect(validateAttachments([gif], legacyLimits).accepted).toEqual([gif]);
+    expect(
+      validateAttachments([makeFile("moving.gif", "image/gif", 21)], legacyLimits).accepted,
+    ).toEqual([]);
+
+    const unifiedLimits = {
+      image_bytes: 1,
+      file_bytes: 25,
+      upload_bytes: 100,
+      oversize_to_filesystem: true,
+    };
+    expect(validateAttachments([gif], unifiedLimits).accepted).toEqual([gif]);
+    expect(
+      validateAttachments([makeFile("moving.gif", "image/gif", 26)], unifiedLimits).accepted,
+    ).toEqual([]);
+  });
+
+  it("uses the unified file_bytes cap across PDF, text, image, and SVG when filesystem delivery is allowed", () => {
+    const limits = {
+      file_bytes: 500 * MB,
+      upload_bytes: 2 * 1024 * MB,
+      image_bytes: 50 * MB,
+      uncompressed_image_bytes: 5 * MB,
+      pdf_bytes: 20 * MB,
+      text_bytes: 10 * MB,
+      oversize_to_filesystem: true,
+    };
+    const bigPdf = makeFile("manual.pdf", "application/pdf");
+    Object.defineProperty(bigPdf, "size", { value: 100 * MB });
+    const bigText = makeFile("dump.txt", "text/plain");
+    Object.defineProperty(bigText, "size", { value: 100 * MB });
+    const bigPng = makeFile("raw.png", "image/png");
+    Object.defineProperty(bigPng, "size", { value: 100 * MB });
+    const bigSvg = makeFile("diagram.svg", "image/svg+xml");
+    Object.defineProperty(bigSvg, "size", { value: 20 * MB });
+    const tooBigPdf = makeFile("huge.pdf", "application/pdf");
+    Object.defineProperty(tooBigPdf, "size", { value: 501 * MB });
+
+    const { accepted, errors } = validateAttachments(
+      [bigPdf, bigText, bigPng, bigSvg, tooBigPdf],
+      { extensions: [".zip"], all_types: true },
+      limits,
     );
+    expect(accepted).toEqual([bigPdf, bigText, bigPng, bigSvg]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain("huge.pdf");
+    expect(errors[0]).toContain("500 MB");
+
+    // When filesystem delivery is turned off by policy, the inline cap still bounds the composer.
+    const inlineOnly = validateAttachments([bigPdf], { extensions: [], all_types: false }, limits);
+    expect(inlineOnly.accepted).toHaveLength(0);
+    expect(inlineOnly.errors[0]).toContain("20 MB");
+
+    // Animated GIFs still honor the per-file cap when filesystem routing is off.
+    const bigGif = makeFile("loop.gif", "image/gif");
+    Object.defineProperty(bigGif, "size", { value: 100 * MB });
+    const hugeGif = makeFile("huge.gif", "image/gif");
+    Object.defineProperty(hugeGif, "size", { value: 501 * MB });
+    const inlineGif = validateAttachments(
+      [bigGif, hugeGif],
+      { extensions: [], all_types: false },
+      limits,
+    );
+    expect(inlineGif.accepted).toEqual([bigGif]);
+    expect(inlineGif.errors).toHaveLength(1);
+    expect(inlineGif.errors[0]).toContain("huge.gif");
+    expect(inlineGif.errors[0]).toContain("500 MB");
+
+    // Older servers omit oversize_to_filesystem even when publishing file_bytes,
+    // so PDFs remain capped by pdf_bytes rather than being accepted up to file_bytes.
+    const { oversize_to_filesystem: _omitted, ...legacyLimits } = limits;
+    const legacyPdf = validateAttachments(
+      [bigPdf],
+      { extensions: [".zip"], all_types: true },
+      legacyLimits,
+    );
+    expect(legacyPdf.accepted).toHaveLength(0);
+    expect(legacyPdf.errors[0]).toContain("20 MB");
   });
 
   it("treats a null limit as unlimited for that category", () => {

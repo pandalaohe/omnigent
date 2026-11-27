@@ -686,11 +686,21 @@ def image_compression_concurrency() -> int:
 
 
 def filesystem_attachment_upload_limit() -> int | None:
-    """Max byte size of a single filesystem attachment, or ``None`` unlimited.
+    """Max byte size of a single attachment file, or ``None`` unlimited.
 
-    Config key ``filesystem_attachment_max_bytes``; unlimited by default,
-    ``0`` also means unlimited.
+    Checks the persistent admin override (``<data_dir>/attachment_max_file_bytes``)
+    first so runtime changes survive release cutovers, then falls back to the
+    ``filesystem_attachment_max_bytes`` config key (unlimited by default; ``0``
+    also means unlimited).
     """
+    from omnigent.server.sharing_settings import (
+        _UnsetType,
+        read_attachment_max_file_bytes_override,
+    )
+
+    override = read_attachment_max_file_bytes_override()
+    if not isinstance(override, _UnsetType):
+        return override
     return _config_limit("filesystem_attachment_max_bytes", None)
 
 
@@ -733,15 +743,35 @@ def filesystem_attachment_total_bytes_limit() -> int | None:
 # One upload request carries the whole multipart body, so this bounds the
 # transient spool space a single attachment can cost before the handler runs.
 ATTACHMENT_UPLOAD_REQUEST_DEFAULT_BYTES = 2 * 1024**3
+# Framing headroom above a file limit so an upload right at the cap fits its
+# multipart boundary and headers.
+_ATTACHMENT_UPLOAD_MULTIPART_HEADROOM_BYTES = 1024 * 1024
+# Hard upper bound for admin-configured per-file attachment caps (100 GiB),
+# shared by the PUT /v1/sharing API and Admin settings UI.
+MAX_ADMIN_ATTACHMENT_FILE_BYTES = 100 * 1024**3
 
 
 def attachment_upload_request_limit() -> int | None:
     """Max encoded bytes of one attachment upload request, or ``None``.
 
     Config key ``attachment_max_upload_bytes``; defaults to 2 GiB, ``0``
-    means unlimited.
+    means unlimited. When an admin override sets a finite per-file limit above
+    the configured request cap, the request cap expands with multipart headroom
+    so the setting takes effect without a restart. An unlimited (``0``)
+    per-file override keeps the configured transport request ceiling intact.
     """
-    return _config_limit("attachment_max_upload_bytes", ATTACHMENT_UPLOAD_REQUEST_DEFAULT_BYTES)
+    from omnigent.server.sharing_settings import (
+        _UnsetType,
+        read_attachment_max_file_bytes_override,
+    )
+
+    request_limit = _config_limit(
+        "attachment_max_upload_bytes", ATTACHMENT_UPLOAD_REQUEST_DEFAULT_BYTES
+    )
+    override = read_attachment_max_file_bytes_override()
+    if isinstance(override, _UnsetType) or override is None or request_limit is None:
+        return request_limit
+    return max(request_limit, override + _ATTACHMENT_UPLOAD_MULTIPART_HEADROOM_BYTES)
 
 
 # Default "large" threshold for the archive cleanup: originals at or above

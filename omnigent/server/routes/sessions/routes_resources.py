@@ -229,6 +229,13 @@ def _human_byte_size(size: int) -> str:
     return f"{size} bytes"
 
 
+def _human_limit_label(size: int) -> str:
+    """Render an attachment size cap as whole MB when exact, else binary units."""
+    if size >= 1024**2 and size % (1024**2) == 0:
+        return f"{size // (1024**2)} MB"
+    return _human_byte_size(size)
+
+
 def _upload_request_too_large(limit_bytes: int) -> HTTPException:
     """Build the shared 413 for an oversized attachment upload request."""
     return HTTPException(
@@ -2664,29 +2671,82 @@ def register_resources_routes(
             raise HTTPException(
                 status_code=415, detail=_unsupported_attachment_detail(content_type, policy)
             )
-        if type_limit is None:
+        file.file.seek(0, os.SEEK_END)
+        upload_size = file.file.tell()
+        file.file.seek(0)
+        use_filesystem = type_limit is None
+        inline_read_limit: int | None = None
+        if use_filesystem:
             # Keep image/gif for animations, including unnamed browser uploads.
             # Other path files discard a misleading declared text type.
             if not animated_gif:
                 content_type = _resolve_content_type("application/octet-stream", file.filename)
             if not initial_input:
                 await _require_filesystem_attachment_support(request, conv)
+        else:
+            limits = attachment_limits()
+            if content_type.startswith("image/"):
+                limit_key = (
+                    "image_bytes"
+                    if content_type in _COMPRESSIBLE_IMAGE_MIMES
+                    else "uncompressed_image_bytes"
+                )
+            elif content_type == "application/pdf":
+                limit_key = "pdf_bytes"
+            else:
+                limit_key = "text_bytes"
+            inline_read_limit = limits[limit_key]
+            per_file_limit = limits["file_bytes"]
+            # Enforce the unified per-file cap across every type before routing
+            # or buffering bytes in memory.
+            if per_file_limit is not None and upload_size > per_file_limit:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Attachment exceeds the {_human_limit_label(per_file_limit)} limit.",
+                )
+            if inline_read_limit is not None and upload_size > inline_read_limit:
+                # Deliver oversized inline-eligible files (image/PDF/text) by
+                # path when the deployment policy and session runtime support it,
+                # skipping in-memory buffering and Pillow decode.
+                policy_allows_filesystem = policy.all_types or policy.matches(file.filename)
+                if not policy_allows_filesystem:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"Attachment exceeds the {_human_limit_label(inline_read_limit)} "
+                            "inline limit for this file type."
+                        ),
+                    )
+                # Check already-selected hosts even on initial create; only pending
+                # managed-sandbox provisioning (no host/runner yet) defers validation.
+                if not initial_input or conv.host_id is not None or conv.runner_id is not None:
+                    try:
+                        await _require_filesystem_attachment_support(request, conv)
+                    except OmnigentError as exc:
+                        if exc.code == ErrorCode.CONFLICT:
+                            raise HTTPException(
+                                status_code=413,
+                                detail=(
+                                    f"Attachment exceeds the {_human_limit_label(inline_read_limit)} "
+                                    "inline limit for this file type, and this session does not "
+                                    "support filesystem attachments."
+                                ),
+                            ) from exc
+                        raise
+                use_filesystem = True
         # Hold the quota check through the store below, so parallel uploads can't
         # all spend the same remaining allowance.
         attachment_lock = (
-            _attachment_upload_lock(session_id) if type_limit is None else contextlib.nullcontext()
+            _attachment_upload_lock(session_id) if use_filesystem else contextlib.nullcontext()
         )
         async with attachment_lock:
             filename = file.filename
-            if type_limit is None:
+            if use_filesystem:
                 # By-path files stream straight from the parser's spool into the
                 # artifact store: the size is already known from the spool and the
                 # bytes never materialize in memory. The route class above has
                 # already bounded the whole request, and the policy check sees the
                 # exact size.
-                file.file.seek(0, os.SEEK_END)
-                upload_size = file.file.tell()
-                file.file.seek(0)
                 _enforce_filesystem_attachment_policy(
                     [filename],
                     session_id=session_id,
@@ -2735,7 +2795,7 @@ def register_resources_routes(
                     raise HTTPException(
                         status_code=413,
                         detail=(
-                            f"Attachment exceeds the {per_file // (1024 * 1024)} MB "
+                            f"Attachment exceeds the {_human_limit_label(per_file)} "
                             "limit for this file type."
                             if per_file is not None
                             else "Attachment exceeds the configured size limit."
@@ -2750,18 +2810,7 @@ def register_resources_routes(
                         code=ErrorCode.INTERNAL_ERROR,
                     ) from exc
             else:
-                limits = attachment_limits()
-                if content_type.startswith("image/"):
-                    limit_key = (
-                        "image_bytes"
-                        if content_type in _COMPRESSIBLE_IMAGE_MIMES
-                        else "uncompressed_image_bytes"
-                    )
-                elif content_type == "application/pdf":
-                    limit_key = "pdf_bytes"
-                else:
-                    limit_key = "text_bytes"
-                read_limit = limits[limit_key]
+                read_limit = inline_read_limit
                 # Persist original dimensions only after a downscale.
                 source_dims: tuple[int, int] | None = None
                 if content_type in _COMPRESSIBLE_IMAGE_MIMES:

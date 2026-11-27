@@ -105,3 +105,40 @@ it.each([
   );
   await waitFor(() => expect(result.current.destinations.data).toBe(expected));
 });
+
+it("patches both file_bytes and upload_bytes in cached ServerInfo even if /v1/info refresh fails", async () => {
+  const { getCachedServerInfo, refreshServerInfo } = await import("@/lib/capabilities");
+  const globalFetch = vi.fn().mockResolvedValueOnce(
+    Response.json({
+      attachment_oversize_to_filesystem: true,
+      attachment_limits: {
+        file_bytes: 500 * 1024 * 1024,
+        upload_bytes: 2 * 1024 ** 3,
+      },
+    }),
+  );
+  vi.stubGlobal("fetch", globalFetch);
+  try {
+    await refreshServerInfo();
+    // Follow-up /v1/info refresh fails after PUT succeeds.
+    globalFetch.mockRejectedValueOnce(new Error("offline"));
+    const threeGb = 3 * 1024 ** 3;
+    const ceiling = threeGb + 1024 * 1024;
+    fetchMock.mockResolvedValueOnce(
+      Response.json({
+        object: "sharing",
+        sibling_session_destinations: "any_host",
+        public_sharing_max_level: "read",
+        attachment_max_file_bytes: threeGb,
+        attachment_max_upload_bytes: ceiling,
+        attachment_max_file_bytes_editable: true,
+      }),
+    );
+    const { result } = renderHook(() => useSetSharing(), { wrapper: wrapper() });
+    await act(() => result.current.mutateAsync({ attachment_max_file_bytes: threeGb }));
+    expect(getCachedServerInfo()?.attachment_limits?.file_bytes).toBe(threeGb);
+    expect(getCachedServerInfo()?.attachment_limits?.upload_bytes).toBe(ceiling);
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});

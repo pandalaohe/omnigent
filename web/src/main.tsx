@@ -15,7 +15,7 @@ import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
 import { prefetchSessionHostChain } from "./hooks/useSession";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
 import { getBasePath, withBasePath } from "./lib/basePath";
-import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
+import { resolveServerInfo, subscribeServerInfo, type ServerInfo } from "./lib/capabilities";
 import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
 import { ExtensionProvider } from "./extensions/ExtensionProvider";
 import { createBootServerInfo, withBootTimeout } from "./lib/bootCapabilities";
@@ -150,8 +150,12 @@ function RootApp({ initialInfo }: { initialInfo: ServerInfo | "loading" }) {
     void bootServerInfo.settled.then((resolved) => {
       if (alive) setInfo(resolved);
     });
+    const unsubscribe = subscribeServerInfo((next) => {
+      if (alive) setInfo(next);
+    });
     return () => {
       alive = false;
+      unsubscribe();
     };
   }, []);
   useEffect(() => {

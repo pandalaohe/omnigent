@@ -55,6 +55,8 @@ export interface AttachmentLimits {
   uncompressed_image_bytes?: number | null;
   pdf_bytes?: number | null;
   text_bytes?: number | null;
+  /** True when the server routes oversized inline types to filesystem delivery. */
+  oversize_to_filesystem?: boolean;
 }
 
 export function clipboardFiles(data: DataTransfer | null | undefined): File[] {
@@ -276,17 +278,22 @@ function formatLimitBytes(bytes: number): string {
 /**
  * Effective per-file byte limit, or ``null`` when nothing bounds this file.
  *
- * With ``limits`` the server's published values win: the category's cap and
- * the upload-request cap both apply (whichever is smaller), and ``null``/
- * absent means that dimension is not checked. Without ``limits`` (an older
- * server), the fixed client ceilings apply.
+ * With ``limits`` the server's published values win: when filesystem delivery
+ * is permitted for this file and ``file_bytes`` is published, the unified
+ * per-file cap (bounded by ``upload_bytes``) governs every type, because files
+ * above the inline budget are delivered by path server-side. When filesystem
+ * routing is unavailable (or an older payload omits ``file_bytes``), the
+ * category's inline cap applies. Without ``limits`` (an older server), the
+ * fixed client ceilings apply.
  */
 function limitBytesFor(
   file: File,
   limits: AttachmentLimits | undefined,
   category: AttachmentCategory,
+  policy: FilesystemAttachmentsInfo | null,
 ): number | null {
-  const gif = file.type === "image/gif" || extensionOf(file.name || "") === ".gif";
+  const ext = extensionOf(file.name || "");
+  const gif = file.type === "image/gif" || ext === ".gif";
   const compressible = COMPRESSIBLE_IMAGE_MIMES.has(file.type || "") || gif;
   if (limits === undefined) {
     // Non-compressible images (SVG, …) can't be shrunk server-side, so they
@@ -297,10 +304,29 @@ function limitBytesFor(
         : ATTACHMENT_SIZE_LIMITS_MB[category];
     return limitMb * 1024 * 1024;
   }
+  const oversizeToFilesystem = limits.oversize_to_filesystem === true;
+  const canRouteByPath =
+    policy === null || policy.all_types || (ext !== "" && policy.extensions.includes(ext));
+  if (
+    limits.file_bytes !== undefined &&
+    (category === "file" || (oversizeToFilesystem && canRouteByPath))
+  ) {
+    const candidates = [limits.file_bytes, limits.upload_bytes].filter(
+      (value): value is number => typeof value === "number",
+    );
+    return candidates.length > 0 ? Math.min(...candidates) : null;
+  }
   // The browser cannot know whether a GIF has more than one frame. Static GIFs
   // use the image cap and animations use the filesystem cap, so let the server
-  // apply that choice after probing the file. The request cap applies to both.
-  if (gif) return typeof limits.upload_bytes === "number" ? limits.upload_bytes : null;
+  // apply that choice after probing the file. The per-file and request caps
+  // still apply to both when the server enforces unified per-file limits.
+  if (gif) {
+    const gifCaps = [
+      oversizeToFilesystem ? limits.file_bytes : undefined,
+      limits.upload_bytes,
+    ].filter((value): value is number => typeof value === "number");
+    return gifCaps.length > 0 ? Math.min(...gifCaps) : null;
+  }
   const categoryKey: keyof AttachmentLimits =
     category === "image"
       ? compressible
@@ -311,17 +337,18 @@ function limitBytesFor(
         : category === "text"
           ? "text_bytes"
           : "file_bytes";
-  const candidates = [limits[categoryKey], limits.upload_bytes].filter(
-    (value): value is number => typeof value === "number",
-  );
+  const candidates = [
+    limits[categoryKey],
+    oversizeToFilesystem ? limits.file_bytes : undefined,
+    limits.upload_bytes,
+  ].filter((value): value is number => typeof value === "number");
   return candidates.length > 0 ? Math.min(...candidates) : null;
 }
 
 /**
  * Split *files* into accepted attachments and rejection messages. A file is
- * rejected when it exceeds the effective per-category size limit — the
- * server's published ``attachment_limits`` when given, else the fixed
- * ceilings above.
+ * rejected when it exceeds the effective size limit — the server's published
+ * ``attachment_limits`` when given, else the fixed ceilings above.
  */
 export function validateAttachments(
   files: File[],
@@ -344,7 +371,7 @@ export function validateAttachments(
       );
       continue;
     }
-    const limitBytes = limitBytesFor(file, limits, category);
+    const limitBytes = limitBytesFor(file, limits, category, policy);
     if (limitBytes !== null && file.size > limitBytes) {
       const limitLabel = category === "file" ? "files" : `${category} files`;
       errors.push(

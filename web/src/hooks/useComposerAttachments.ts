@@ -211,7 +211,11 @@ export function useComposerAttachments({
       if (insertChips) {
         // Insert first: the insert is a text change, which clears the error. Publish this batch's
         // rejections after it.
-        const { accepted, errors } = validateAttachments(pasted, policyRef.current);
+        const { accepted, errors } = validateAttachments(
+          pasted,
+          policyRef.current,
+          limitsRef.current,
+        );
         const refused =
           accepted.length > 0 ? insertChips(accepted, e.currentTarget, filesRef.current) : [];
         if (refused.length > 0) addFiles(refused);
