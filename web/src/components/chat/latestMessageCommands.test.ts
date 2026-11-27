@@ -66,12 +66,17 @@ describe("latestMessages", () => {
     const notice = prompt("n1", {
       content: [{ type: "input_text", text: "[System: session resumed]" }],
     });
+    const marked = prompt("n2", {
+      content: [{ type: "input_text", text: "Host load is high" }],
+      runtimeNotice: true,
+    });
     const latest = latestMessages([
       prompt("u1"),
       response("r1"),
       prompt("u2"),
       response("r2"),
       notice,
+      marked,
     ]);
     expect(latest.response).toMatchObject({ responseId: "r2" });
     expect(latest.prompt).toMatchObject({ itemId: "u2" });

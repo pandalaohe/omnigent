@@ -914,7 +914,7 @@ export function shouldShowWorkingIndicator(showsWorking: boolean, bubbles: Bubbl
  */
 export function isSystemBubble(bubble: Bubble): boolean {
   if (bubble.kind !== "user") return false;
-  return isSystemUserContent(bubble.content);
+  return isSystemUserContent(bubble.content, bubble.runtimeNotice);
 }
 
 function CompactionLoadingIndicator({ createdAtS }: { createdAtS?: number }) {

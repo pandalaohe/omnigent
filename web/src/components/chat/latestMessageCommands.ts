@@ -36,7 +36,9 @@ export interface LatestMessages {
 
 /** Whether a user row is something the person sent: a shell command, or text that isn't a notice. */
 function isPrompt(bubble: UserBubble): boolean {
-  return bubble.shellCommand !== undefined || !isSystemUserContent(bubble.content);
+  return (
+    bubble.shellCommand !== undefined || !isSystemUserContent(bubble.content, bubble.runtimeNotice)
+  );
 }
 
 /** The newest response and the newest prompt among `bubbles`. */

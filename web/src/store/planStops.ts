@@ -86,7 +86,7 @@ function isUserRequest(block: AnyBlock): boolean {
   return (
     block.type === "slash_command" ||
     (block.type === "user_message" &&
-      !isSystemUserContent(block.content) &&
+      !isSystemUserContent(block.content, block.runtimeNotice) &&
       splitSessionMessageOrigin(messageText(block.content)) === null)
   );
 }
