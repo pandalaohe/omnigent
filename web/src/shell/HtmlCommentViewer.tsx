@@ -884,12 +884,17 @@ export function HtmlCommentViewer({
     onAnnotationOrphansChangeRef.current?.(new Set([...annotate.orphanIds, ...renderedOrphans]));
   }, [annotate.orphanIds, renderedOrphans]);
 
-  // The toggle lives in the panel toolbar so nothing floats over the page. A
-  // toolbar click hands keys to the frame, so Escape reaches the picker.
+  // The toggle lives in the panel toolbar so nothing floats over the page.
+  // Turning the mode on from there hands keys to the frame, so Escape reaches
+  // the picker; turning it off leaves focus where the user had it.
   const annotateShown = annotate.available && canEdit;
   const toggleAnnotate = annotate.toggle;
+  const annotateOnRef = useRef(annotate.on);
+  annotateOnRef.current = annotate.on;
   const toggleFromToolbar = useCallback(() => {
+    const turningOn = !annotateOnRef.current;
     toggleAnnotate();
+    if (!turningOn) return;
     iframeRef.current?.focus();
     iframeRef.current?.contentWindow?.focus();
   }, [toggleAnnotate]);

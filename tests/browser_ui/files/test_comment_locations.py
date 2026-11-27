@@ -84,7 +84,8 @@ def test_annotate_toggle_sits_in_the_toolbar_not_over_the_preview(
     expect(page_menu).to_be_visible()
     toggle = viewer.get_by_role("button", name="Annotate", exact=True)
     more = viewer.get_by_role("button", name="More actions", exact=True)
-    expect(toggle.or_(more)).to_be_visible(timeout=15_000)
+    desktop = width >= 1024
+    expect(toggle if desktop else more).to_be_visible(timeout=15_000)
     frame_box = preview.bounding_box()
     assert frame_box
     # Nothing the viewer draws may sit over the frame's top-right corner.
@@ -94,8 +95,7 @@ def test_annotate_toggle_sits_in_the_toolbar_not_over_the_preview(
     )
     assert covering == "IFRAME"
     page_menu.click()
-    frame_focused = "document.activeElement?.tagName === 'IFRAME'"
-    if toggle.is_visible():
+    if desktop:
         box = toggle.bounding_box()
         assert box and box["y"] + box["height"] <= frame_box["y"]
         expect(toggle).to_have_attribute("aria-pressed", "false")
@@ -110,12 +110,18 @@ def test_annotate_toggle_sits_in_the_toolbar_not_over_the_preview(
         more.click()
         expect(row).to_have_attribute("aria-checked", "false")
         row.click()
-        page.wait_for_function(frame_focused)
+        # Turning the mode on hands keys to the frame, not back to the menu trigger.
+        page.wait_for_function("document.activeElement?.tagName === 'IFRAME'")
         more.click()
         expect(row).to_have_attribute("aria-checked", "true")
         page.screenshot(path=output / f"annotate-toolbar-{width}-menu-on.png")
         row.click()
-        page.wait_for_function(frame_focused)
+        # Turning it off leaves focus with the menu trigger, as for any other row.
+        page.wait_for_function(
+            "document.activeElement?.getAttribute('aria-label') === 'More actions'"
+        )
+        more.click()
+        expect(row).to_have_attribute("aria-checked", "false")
         page.keyboard.press("Escape")
         expect(row).to_have_count(0)
     expect(viewer).to_be_visible()

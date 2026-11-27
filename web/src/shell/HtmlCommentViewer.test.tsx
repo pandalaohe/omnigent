@@ -1138,14 +1138,20 @@ describe("HtmlCommentViewer annotation toggle", () => {
     ).toBeNull();
   });
 
-  it("hands focus to the frame when the toolbar toggles", async () => {
+  it("hands focus to the frame when the toolbar turns the mode on, not off", async () => {
     renderViewer();
     const { postMessage, contentWindowFocus } = await openFrame();
     observeAnnotatePort(postMessage);
     await sendAnnotateFromFrame(postMessage, { type: "annotate:ready" });
 
-    fireEvent.click(await screen.findByRole("button", { name: "Annotate" }));
-    expect(contentWindowFocus).toHaveBeenCalled();
+    const toggle = await screen.findByRole("button", { name: "Annotate" });
+    fireEvent.click(toggle);
+    expect(contentWindowFocus).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-pressed", "true"));
+
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-pressed", "false"));
+    expect(contentWindowFocus).toHaveBeenCalledTimes(1);
   });
 
   it("offers no toggle to a user who cannot edit", async () => {

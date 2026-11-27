@@ -1582,6 +1582,8 @@ function FileViewerBody({
     /** A toggle whose label does not name its state: sets aria-pressed, and its
      * overflow row is a checkbox item labelled without the tooltip. */
     pressed?: boolean;
+    /** Leave focus where it was on click (e.g. a chat caret or the preview frame). */
+    keepFocus?: boolean;
     disabled?: boolean;
     disabledLabel?: string;
     /** When set, render a picker (dropdown/submenu) over these mutually
@@ -1746,6 +1748,7 @@ function FileViewerBody({
       icon: <MousePointerClickIcon className="size-4" />,
       active: annotateControl.on,
       pressed: annotateControl.on,
+      keepFocus: true,
       onSelect: annotateControl.toggle,
     });
   }
@@ -1935,6 +1938,7 @@ function FileViewerBody({
         aria-pressed={action.pressed}
         disabled={action.disabled}
         tabIndex={interactive ? undefined : -1}
+        onMouseDown={action.keepFocus ? (e) => e.preventDefault() : undefined}
         onClick={interactive ? action.onSelect : undefined}
       >
         {action.icon}
@@ -2191,7 +2195,12 @@ function FileViewerBody({
           <div className="flex items-center justify-end gap-1">
             {toolbarCollapsed ? (
               <>
-                <DropdownMenu>
+                <DropdownMenu
+                  onOpenChange={(menuOpen) => {
+                    // A reopen during the close animation drops a stale queued toggle.
+                    if (menuOpen) overflowAfterCloseRef.current = null;
+                  }}
+                >
                   <DropdownMenuTrigger asChild>
                     <Button type="button" variant="ghost" size="icon-sm" aria-label="More actions">
                       <MoreHorizontalIcon className="size-4" />
@@ -2204,8 +2213,10 @@ function FileViewerBody({
                       const run = overflowAfterCloseRef.current;
                       if (!run) return;
                       overflowAfterCloseRef.current = null;
-                      e.preventDefault();
+                      const focused = document.activeElement;
                       run();
+                      // Keep focus the action moved; otherwise return it to the trigger.
+                      if (document.activeElement !== focused) e.preventDefault();
                     }}
                   >
                     {toolbarActions
