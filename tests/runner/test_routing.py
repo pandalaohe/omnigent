@@ -355,3 +355,37 @@ async def test_runner_router_existing_conversation_returns_none_when_unpinned() 
         assert router.client_for_existing_conversation("conv_test") is None
     finally:
         await router.aclose()
+
+
+def test_runner_router_host_is_online_checks_local_registry_and_host_store() -> None:
+    """host_is_online honors either a local host tunnel or a fresh host-store row."""
+
+    class _HostRegistry:
+        def __init__(self, ids: set[str]) -> None:
+            self._ids = ids
+
+        def get(self, host_id: str) -> object | None:
+            return object() if host_id in self._ids else None
+
+    class _HostStore:
+        def __init__(self, ids: set[str]) -> None:
+            self._ids = ids
+
+        def is_online(self, host_id: str) -> bool:
+            return host_id in self._ids
+
+    router = RunnerRouter(
+        registry=TunnelRegistry(),
+        conversation_store=_ConversationStore({}),  # type: ignore[arg-type]
+        host_registry=_HostRegistry({"local-host"}),  # type: ignore[arg-type]
+        host_store=_HostStore({"remote-host"}),  # type: ignore[arg-type]
+    )
+    assert router.host_is_online("local-host") is True
+    assert router.host_is_online("remote-host") is True
+    assert router.host_is_online("offline-host") is False
+
+    bare_router = RunnerRouter(
+        registry=TunnelRegistry(),
+        conversation_store=_ConversationStore({}),  # type: ignore[arg-type]
+    )
+    assert bare_router.host_is_online("any-host") is False

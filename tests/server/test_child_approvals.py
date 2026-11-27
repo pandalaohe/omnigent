@@ -814,8 +814,20 @@ async def _offer_tasks():
     helpers._terminal_resolution_tasks.clear()
 
 
+class _StubWebSocket:
+    """Minimal WebSocket double accepted by TunnelRegistry and HostRegistry."""
+
+    async def send_text(self, data: str) -> None:
+        return None
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        return None
+
+
 @pytest.fixture
 async def tree(app, client, monkeypatch):
+    import time
+
     agent = await create_test_agent(client)
     root_id = agent["_session_id"]
     response = await client.post(
@@ -827,13 +839,17 @@ async def tree(app, client, monkeypatch):
     root = service.store.get_conversation(root_id)
     service.change(root, "grant", [approvals.APPROVAL_KIND], "approval:fixture")
     binding = "test-parent-binding"
-    service.store.set_runner_id(root_id, token_bound_runner_id(binding))
+    runner_id = token_bound_runner_id(binding)
+    service.store.set_runner_id(root_id, runner_id)
+    service.store.touch_runner_liveness([runner_id], int(time.time()))
     client.headers[RUNNER_TUNNEL_TOKEN_HEADER] = binding
     offer = AsyncMock(return_value=True)
     monkeypatch.setattr(orchestration, "_post_system_message", offer)
     return SimpleNamespace(
+        app=app,
         root_id=root_id,
         child_id=child_id,
+        runner_id=runner_id,
         store=service.store,
         service=service,
         client=client,
@@ -1800,3 +1816,372 @@ async def test_parent_receipt_can_take_longer_than_five_seconds(tree, monkeypatc
     monkeypatch.setattr(tree.store, "append", slow_append)
     assert await _answer(tree) == {"status": "answered"}
     assert future.done()
+
+
+class _VirtualClock:
+    """Deterministic monotonic clock + asyncio.sleep synchronized on sleep re-entry."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self._waiters: list[tuple[float, asyncio.Future[None]]] = []
+        self._parked = asyncio.Event()
+
+    def monotonic(self) -> float:
+        return self.now
+
+    async def sleep(self, delay: float) -> None:
+        target = self.now + max(0.0, delay)
+        if target <= self.now:
+            await asyncio.sleep(0)
+            return
+        waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._waiters.append((target, waiter))
+        self._parked.set()
+        await waiter
+
+    async def advance(
+        self,
+        seconds: float,
+        *,
+        task: asyncio.Task[None] | None = None,
+        step: float = 5.0,
+    ) -> None:
+        end = self.now + seconds
+        while self.now < end:
+            if not self._waiters and task is not None and not task.done():
+                self._parked.clear()
+                await asyncio.wait_for(self._parked.wait(), timeout=2)
+            self.now = min(end, self.now + step)
+            ready = [w for target, w in self._waiters if target <= self.now]
+            self._waiters = [(target, w) for target, w in self._waiters if target > self.now]
+            if not ready:
+                continue
+            self._parked.clear()
+            for waiter in ready:
+                if not waiter.done():
+                    waiter.set_result(None)
+            if task is not None:
+                park_wait = asyncio.create_task(self._parked.wait())
+                done, _ = await asyncio.wait(
+                    {park_wait, task},
+                    timeout=2,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                park_wait.cancel()
+                await asyncio.gather(park_wait, return_exceptions=True)
+                assert done, "deadline task neither re-parked nor finished after virtual tick"
+                if task.done():
+                    return
+
+
+async def test_offer_waits_past_60s_while_parent_live_and_falls_back_at_backstop(
+    tree, monkeypatch
+):
+    clock = _VirtualClock()
+    monkeypatch.setattr(approvals, "time", SimpleNamespace(monotonic=clock.monotonic))
+    monkeypatch.setattr(
+        approvals, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": clock.sleep})
+    )
+    assert approvals.OFFER_TIMEOUT_S == 1800.0
+    await _publish(tree, _claude_params("echo ready"))
+    deadline_task = approvals._deadlines[(tree.child_id, "elicit_pi_dialog")]
+    offered_text = tree.offer.call_args.args[1]
+    assert "60 s" not in offered_text
+    assert "waits for your decision" in offered_text
+    assert "30-minute backstop" in offered_text
+
+    # Past 60 s and up to just before the 30 min backstop, the card stays offered.
+    await clock.advance(65.0, task=deadline_task)
+    assert _pending(tree)["triage"]["state"] == "offered"
+    assert pending_elicitations.display_count(tree.child_id, 1) == 0
+    assert pending_elicitations.display_count(tree.root_id, 1) == 0
+
+    await clock.advance(1730.0, task=deadline_task, step=60.0)
+    assert _pending(tree)["triage"]["state"] == "offered"
+    assert pending_elicitations.display_count(tree.child_id, 1) == 0
+
+    # At the 30 min backstop, the card surfaces to the user.
+    await clock.advance(5.0, task=deadline_task)
+    await asyncio.wait_for(deadline_task, timeout=2)
+    assert _pending(tree)["triage"]["state"] == "unanswered"
+    assert pending_elicitations.display_count(tree.child_id, 1) == 1
+    assert pending_elicitations.display_count(tree.root_id, 1) == 1
+
+
+async def test_offer_shown_on_pass_to_user_after_60s_and_stays_passed(tree, monkeypatch):
+    clock = _VirtualClock()
+    monkeypatch.setattr(approvals, "time", SimpleNamespace(monotonic=clock.monotonic))
+    monkeypatch.setattr(
+        approvals, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": clock.sleep})
+    )
+    await _publish(tree, _claude_params("echo ready"))
+    deadline_task = approvals._deadlines[(tree.child_id, "elicit_pi_dialog")]
+    await clock.advance(120.0, task=deadline_task)
+    assert _pending(tree)["triage"]["state"] == "offered"
+    assert pending_elicitations.display_count(tree.child_id, 1) == 0
+
+    assert await _answer(
+        tree, "pass_to_user", note="需要你确认是否执行这条命令。", recommend="approve"
+    ) == {"status": "passed"}
+    assert _pending(tree)["triage"]["state"] == "passed"
+    assert pending_elicitations.display_count(tree.child_id, 1) == 1
+    assert (tree.child_id, "elicit_pi_dialog") not in approvals._deadlines
+
+    await clock.advance(2000.0, step=100.0)
+    assert _pending(tree)["triage"]["state"] == "passed"
+    assert _pending(tree)["triage"]["note"] == "需要你确认是否执行这条命令。"
+
+
+async def test_stalled_liveness_check_does_not_delay_backstop(tree, monkeypatch):
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    real_get = tree.store.get_conversation
+
+    def stalled_get(session_id):
+        if session_id == tree.root_id and not entered.is_set():
+            entered.set()
+            try:
+                assert release.wait(5), "test must unblock stalled store lookup"
+            finally:
+                finished.set()
+        return real_get(session_id)
+
+    monkeypatch.setattr(approvals, "OFFER_LIVENESS_POLL_S", 0.02)
+    monkeypatch.setattr(approvals, "OFFER_TIMEOUT_S", 0.12)
+    await _publish(tree, _claude_params("echo ready"))
+    monkeypatch.setattr(tree.store, "get_conversation", stalled_get)
+    try:
+        await poll_until_async(entered.is_set, timeout_s=2)
+        await poll_until_async(
+            lambda: (
+                _pending(tree)["triage"]["state"] == "unanswered"
+                and pending_elicitations.display_count(tree.root_id, 1) == 1
+            ),
+            timeout_s=2,
+        )
+        assert not release.is_set()
+    finally:
+        release.set()
+        await poll_until_async(finished.is_set, timeout_s=2)
+
+
+def _count_liveness_polls(monkeypatch):
+    """Wrap _parent_can_answer so tests can wait for completed poll ticks without sleeps."""
+    real = approvals._parent_can_answer
+    count = 0
+
+    def counted(root_session_id, store):
+        nonlocal count
+        result = real(root_session_id, store)
+        count += 1
+        return result
+
+    monkeypatch.setattr(approvals, "_parent_can_answer", counted)
+    return lambda: count
+
+
+@pytest.mark.parametrize("reason", ["archived", "closed_label", "closed_title", "revoked"])
+async def test_offer_falls_back_when_parent_archived_closed_or_revoked(tree, monkeypatch, reason):
+    from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
+
+    monkeypatch.setattr(approvals, "OFFER_LIVENESS_POLL_S", 0.01)
+    polls = _count_liveness_polls(monkeypatch)
+    await _publish(tree, _claude_params("echo ready"))
+    await poll_until_async(lambda: polls() >= 2, timeout_s=2)
+    assert _pending(tree)["triage"]["state"] == "offered"
+    assert pending_elicitations.display_count(tree.child_id, 1) == 0
+
+    if reason == "archived":
+        tree.store.update_conversation(tree.root_id, archived=True)
+    elif reason == "closed_label":
+        tree.store.set_labels(tree.root_id, {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE})
+    elif reason == "closed_title":
+        tree.store.update_conversation(tree.root_id, title=f"mother:closed:{tree.root_id}")
+    elif reason == "revoked":
+        root = tree.store.get_conversation(tree.root_id)
+        tree.service.change(root, "revoke", [approvals.APPROVAL_KIND], "user-revoked")
+
+    await poll_until_async(
+        lambda: (
+            _pending(tree)["triage"]["state"] == "unanswered"
+            and pending_elicitations.display_count(tree.root_id, 1) == 1
+        ),
+        timeout_s=2,
+    )
+    assert pending_elicitations.display_count(tree.child_id, 1) == 1
+
+
+async def test_closed_parent_receives_no_offer(tree):
+    from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
+
+    tree.store.set_labels(tree.root_id, {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE})
+    event = {
+        "type": "response.elicitation_request",
+        "elicitation_id": "elicit_pi_dialog",
+        "params": _claude_params("echo ready").model_dump(),
+    }
+    await approvals.publish_request(tree.child_id, event, tree.store)
+    assert "triage" not in _pending(tree)
+    assert pending_elicitations.display_count(tree.child_id, 1) == 1
+    tree.offer.assert_not_awaited()
+
+
+async def test_offer_runner_offline_fallback_and_relaunchable_host(tree, monkeypatch):
+    from omnigent.host.frames import HostHelloFrame
+    from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
+    from omnigent.server.routes._sessions.common import _intentional_stop_sessions
+
+    monkeypatch.setattr(approvals, "OFFER_LIVENESS_POLL_S", 0.01)
+    polls = _count_liveness_polls(monkeypatch)
+
+    # Clear the fixture's fresh DB stamp and use a real local tunnel entry.
+    tree.store.clear_runner_liveness(tree.runner_id)
+    tree.app.state.tunnel_registry.register(
+        tree.runner_id,
+        _StubWebSocket(),
+        HelloFrame(runner_version="0.0.0-test", frame_protocol_version=1),
+    )
+    try:
+        # 1. Hostless runner goes offline -> not relaunchable -> falls back to user.
+        await _publish(tree, _claude_params("echo ready"), elicitation_id="elicit_hostless")
+        await poll_until_async(lambda: polls() >= 2, timeout_s=2)
+        assert (
+            pending_elicitations.lookup("elicit_hostless", conversation_id=tree.child_id)[1][
+                "params"
+            ]["triage"]["state"]
+            == "offered"
+        )
+        tree.app.state.tunnel_registry.deregister(tree.runner_id)
+    finally:
+        tree.app.state.tunnel_registry.deregister(tree.runner_id)
+    await poll_until_async(
+        lambda: (
+            pending_elicitations.lookup("elicit_hostless", conversation_id=tree.child_id)[1][
+                "params"
+            ]["triage"]["state"]
+            == "unanswered"
+        ),
+        timeout_s=2,
+    )
+
+    # 2. Host-bound runner offline while host is online -> stays offered (relaunchable)
+    #    until the host also goes offline.
+    host_id = "1" * 32
+    tree.store.set_host_id(tree.root_id, host_id, workspace="/opt/work/omnigent/fork/wt")
+    tree.app.state.host_registry.register(
+        host_id,
+        _StubWebSocket(),
+        HostHelloFrame(version="0.0.0-test", frame_protocol_version=1, name="host-a"),
+        "user@example.com",
+    )
+    try:
+        before = polls()
+        await _publish(tree, _claude_params("echo ready"), elicitation_id="elicit_relaunch")
+        await poll_until_async(lambda: polls() >= before + 2, timeout_s=2)
+        assert (
+            pending_elicitations.lookup("elicit_relaunch", conversation_id=tree.child_id)[1][
+                "params"
+            ]["triage"]["state"]
+            == "offered"
+        )
+        # Intentional stop marks even a live-host runner non-relaunchable.
+        _intentional_stop_sessions[tree.root_id] = tree.runner_id
+        try:
+            await poll_until_async(
+                lambda: (
+                    pending_elicitations.lookup("elicit_relaunch", conversation_id=tree.child_id)[
+                        1
+                    ]["params"]["triage"]["state"]
+                    == "unanswered"
+                ),
+                timeout_s=2,
+            )
+        finally:
+            _intentional_stop_sessions.pop(tree.root_id, None)
+
+        # Fresh offer stays offered on live host, then falls back once host disconnects.
+        before = polls()
+        await _publish(tree, _claude_params("echo ready"), elicitation_id="elicit_host_drop")
+        await poll_until_async(lambda: polls() >= before + 2, timeout_s=2)
+        assert (
+            pending_elicitations.lookup("elicit_host_drop", conversation_id=tree.child_id)[1][
+                "params"
+            ]["triage"]["state"]
+            == "offered"
+        )
+    finally:
+        tree.app.state.host_registry.deregister(host_id)
+
+    await poll_until_async(
+        lambda: (
+            pending_elicitations.lookup("elicit_host_drop", conversation_id=tree.child_id)[1][
+                "params"
+            ]["triage"]["state"]
+            == "unanswered"
+        ),
+        timeout_s=2,
+    )
+
+
+async def test_user_only_cards_remain_immediately_shown_without_deadline(tree):
+    await _publish(tree, _claude_params("/bin/rm -rf /etc"), elicitation_id="elicit_floor")
+    floor_params = pending_elicitations.lookup("elicit_floor", conversation_id=tree.child_id)[1][
+        "params"
+    ]
+    assert floor_params["triage"]["mode"] == "note_only"
+    assert floor_params["triage"]["state"] == "unanswered"
+    assert pending_elicitations.display_count(tree.child_id, 1) == 1
+    assert (tree.child_id, "elicit_floor") not in approvals._deadlines
+
+    tree.offer.reset_mock()
+    event = {
+        "type": "response.elicitation_request",
+        "elicitation_id": "elicit_ask_user",
+        "params": _claude_params(command=None, tool="AskUserQuestion").model_dump(),
+    }
+    await approvals.publish_request(tree.child_id, event, tree.store)
+    ask_params = pending_elicitations.lookup("elicit_ask_user", conversation_id=tree.child_id)[1][
+        "params"
+    ]
+    assert "triage" not in ask_params
+    assert (tree.child_id, "elicit_ask_user") not in approvals._deadlines
+    tree.offer.assert_not_awaited()
+
+
+async def test_offer_falls_back_when_parent_is_succeeded(tree, monkeypatch):
+    from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
+
+    monkeypatch.setattr(approvals, "OFFER_LIVENESS_POLL_S", 0.01)
+    await _publish(tree, _claude_params("echo ready"))
+    successor_runner = token_bound_runner_id("test-successor-binding")
+    successor = tree.store.create_conversation(runner_id=successor_runner)
+    tree.app.state.tunnel_registry.register(
+        successor_runner,
+        _StubWebSocket(),
+        HelloFrame(runner_version="0.0.0-test", frame_protocol_version=1),
+    )
+    try:
+        tree.store.set_labels(successor.id, {SUCCEEDS_LABEL_KEY: tree.root_id})
+        tree.store.set_labels(tree.root_id, {SUCCEEDED_BY_LABEL_KEY: successor.id})
+        monkeypatch.setattr(
+            tree.store, "get_succession", lambda old, new: SimpleNamespace(phase="done")
+        )
+        # An uninformed successor does not keep the offer hidden for 30 min.
+        await poll_until_async(
+            lambda: (
+                _pending(tree)["triage"]["state"] == "unanswered"
+                and pending_elicitations.display_count(tree.child_id, 1) == 1
+            ),
+            timeout_s=2,
+        )
+        # The completed successor can still answer or pass the surfaced offer.
+        tree.client.headers[RUNNER_TUNNEL_TOKEN_HEADER] = "test-successor-binding"
+        assert await _answer(
+            tree,
+            "pass_to_user",
+            caller_id=successor.id,
+            note="交接后请由你决定这次调用。",
+            recommend="approve",
+        ) == {"status": "passed"}
+    finally:
+        tree.client.headers[RUNNER_TUNNEL_TOKEN_HEADER] = "test-parent-binding"
+        tree.app.state.tunnel_registry.deregister(successor_runner)

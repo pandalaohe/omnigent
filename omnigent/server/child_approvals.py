@@ -1,4 +1,4 @@
-"""Single-use child approval offers, with a fixed handoff deadline and parent receipts."""
+"""Single-use child approval offers, held while the parent is live, with backstop and receipts."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import logging
 import posixpath
 import re
 import shlex
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -38,12 +39,15 @@ from omnigent.stores.conversation_store import (
     SUCCEEDED_BY_LABEL_KEY,
     SUCCEEDS_LABEL_KEY,
     ConversationStore,
+    runner_seen_is_fresh,
 )
 from omnigent.stores.file_store import FileStore
+from omnigent.util.session_lifecycle import is_session_closed
 
 logger = logging.getLogger(__name__)
 APPROVAL_KIND = "answer-child-approvals"
-OFFER_TIMEOUT_S = 60.0
+OFFER_TIMEOUT_S = 1800.0
+OFFER_LIVENESS_POLL_S = 5.0
 RECEIPT_TIMEOUT_S = 60.0
 USER_ONLY_TOOLS = frozenset(
     {
@@ -650,8 +654,52 @@ def _active_root(root: Conversation) -> bool:
     return (
         root.parent_conversation_id is None
         and not root.archived
+        and not is_session_closed(root.labels, root.title)
         and not root.labels.get(SUCCEEDED_BY_LABEL_KEY)
     )
+
+
+def _holder_is_live(holder: Conversation, store: ConversationStore) -> bool:
+    from omnigent.server.routes._sessions.common import (
+        _intentional_stop_sessions,
+        get_server_host_registry,
+        get_server_runner_router,
+    )
+
+    router = get_server_runner_router()
+
+    def host_online(host_id: str | None) -> bool:
+        if not host_id:
+            return False
+        if router is not None:
+            return router.host_is_online(host_id)
+        host_registry = get_server_host_registry()
+        return host_registry is not None and host_registry.get(host_id) is not None
+
+    if holder.runner_id is not None:
+        if _intentional_stop_sessions.get(holder.id) == holder.runner_id:
+            return False
+        if router is None:
+            return True
+        if router.runner_is_online(holder.runner_id) or runner_seen_is_fresh(
+            holder.runner_last_seen
+        ):
+            return True
+        return host_online(holder.host_id)
+
+    if holder.host_id is not None:
+        return host_online(holder.host_id)
+    connectivity = store.get_session_connectivity([holder.id]).get(holder.id)
+    return connectivity is None or not (connectivity.needs_workspace or connectivity.imported)
+
+
+def _parent_can_answer(root_session_id: str, store: ConversationStore) -> bool:
+    root = store.get_conversation(root_session_id)
+    if root is None or not _active_root(root):
+        return False
+    if APPROVAL_KIND not in StandingApprovalService(store).resolve(root)["kinds"]:
+        return False
+    return _holder_is_live(root, store)
 
 
 def card_lock(session_id: str, elicitation_id: str) -> asyncio.Lock:
@@ -686,7 +734,33 @@ def _offered_entry(session_id: str, elicitation_id: str, offer_id: str) -> dict[
 async def _deadline(
     session_id: str, elicitation_id: str, offer_id: str, store: ConversationStore
 ) -> None:
-    await asyncio.sleep(OFFER_TIMEOUT_S)
+    backstop = time.monotonic() + OFFER_TIMEOUT_S
+    while True:
+        remaining = backstop - time.monotonic()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(OFFER_LIVENESS_POLL_S, remaining))
+        event = _offered_entry(session_id, elicitation_id, offer_id)
+        if event is None or event["params"]["triage"]["state"] != "offered":
+            return
+        remaining = backstop - time.monotonic()
+        if remaining <= 0:
+            break
+        root_session_id = event["params"]["triage"].get("root_session_id")
+        if not isinstance(root_session_id, str):
+            break
+        try:
+            live = await asyncio.wait_for(
+                asyncio.to_thread(_parent_can_answer, root_session_id, store),
+                timeout=remaining,
+            )
+        except TimeoutError:
+            break
+        except Exception:
+            logger.exception("Child approval parent liveness check failed for %s", session_id)
+            live = True
+        if not live:
+            break
     async with card_lock(session_id, elicitation_id):
         event = _offered_entry(session_id, elicitation_id, offer_id)
         if event is not None and event["params"]["triage"]["state"] == "offered":
@@ -712,8 +786,9 @@ def offer_text(session_id: str, title: str, elicitation_id: str, params: Mapping
     instruction = (
         "A session in your tree is waiting on this prompt. Answer it with sys_approval_answer "
         "only if you are already authorized to decide it; otherwise pass it to the user with "
-        "a note and a recommendation. It shows to the user as a normal card in 60 s if you "
-        "have not answered."
+        "a note and a recommendation. The card waits for your decision and is not shown to the "
+        "user until you pass it to them, this session becomes unavailable, or the 30-minute "
+        "backstop elapses."
         if triage["mode"] == "answer"
         else "This prompt can only be answered by the user; it is already showing. "
         "Add a note and a recommendation with sys_approval_answer."
