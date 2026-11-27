@@ -1528,10 +1528,12 @@ def test_skipped_runtime_notice_is_drained_as_uncertain_and_tracked_retired() ->
     notice_attempt = str(
         pending_inputs.delivery_attributes_for("conv", notice_id)["delivery_attempt_id"]
     )
-    # Restoring a held runtime notice preserves its notice flag.
-    held = pending_inputs.resolve("conv", notice_id, hold=True)
-    assert held is not None and held.runtime_notice is True
-    pending_inputs.restore("conv", held)
+    # Reconstructing an evicted/removed runtime notice via restore preserves its flag.
+    removed = pending_inputs.resolve("conv", notice_id, hold=False)
+    assert removed is not None and removed.runtime_notice is True
+    pending_inputs.reset_for_tests()
+    pending_inputs.restore("conv", removed)
+    assert pending_inputs.snapshot_for("conv")[0]["pending_id"] == notice_id
 
     peer_id = pending_inputs.record(
         "conv",
@@ -1557,6 +1559,10 @@ def test_skipped_runtime_notice_is_drained_as_uncertain_and_tracked_retired() ->
         "conv", pending_id=notice_id, attempt_id=notice_attempt
     )
     assert pending_inputs.was_retired_runtime_notice("conv", stable_id="a" * 32)
+    # A different attempt reusing the same stable_id must not inherit retirement.
+    assert not pending_inputs.was_retired_runtime_notice(
+        "conv", pending_id=notice_id, attempt_id="f" * 32, stable_id="a" * 32
+    )
     assert not pending_inputs.was_retired_runtime_notice(
         "conv", pending_id=peer_id, attempt_id=peer_attempt
     )

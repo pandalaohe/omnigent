@@ -3483,10 +3483,14 @@ def create_runner_app(
             extra={"session_id": session_id},
         )
         if queued:
-            _undelivered_input_reports.setdefault(session_id, []).extend(
-                _prompt_wait_expired_failure(body) for body in queued
-            )
-            _wake_input_report_delivery()
+            reports = [
+                _prompt_wait_expired_failure(body)
+                for body in queued
+                if body.get("runtime_notice") is not True
+            ]
+            if reports:
+                _undelivered_input_reports.setdefault(session_id, []).extend(reports)
+                _wake_input_report_delivery()
 
     def _human_wait_holds(session_ids: set[str], approval_waits: dict[str, list[str]]) -> bool:
         """Whether a session parked on a human still holds the idle watchdog open.

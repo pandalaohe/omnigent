@@ -6609,23 +6609,26 @@ async def _settle_input_only_failure(
     input_stable_id = event.get("input_stable_id")
     pending_id = event.get("pending_id")
     delivery_attempt_id = event.get("delivery_attempt_id")
-    await _settle_undelivered_native_input(
-        conversation_store,
-        session_id,
-        response_id,
-        input_stable_id if isinstance(input_stable_id, str) else None,
-        reason_code=_native_input_reason_code(event),
-        pending_id=pending_id if isinstance(pending_id, str) else None,
-        delivery_attempt_id=delivery_attempt_id if isinstance(delivery_attempt_id, str) else None,
-        fallback_content=_undelivered_input_content(event),
-    )
-    if pending_inputs.was_retired_runtime_notice(
-        session_id,
-        pending_id=pending_id if isinstance(pending_id, str) else None,
-        attempt_id=delivery_attempt_id if isinstance(delivery_attempt_id, str) else None,
-        stable_id=input_stable_id if isinstance(input_stable_id, str) else None,
-    ):
-        return
+    async with _native_mirror_lock(session_id):
+        await _settle_undelivered_native_input(
+            conversation_store,
+            session_id,
+            response_id,
+            input_stable_id if isinstance(input_stable_id, str) else None,
+            reason_code=_native_input_reason_code(event),
+            pending_id=pending_id if isinstance(pending_id, str) else None,
+            delivery_attempt_id=(
+                delivery_attempt_id if isinstance(delivery_attempt_id, str) else None
+            ),
+            fallback_content=_undelivered_input_content(event),
+        )
+        if pending_inputs.was_retired_runtime_notice(
+            session_id,
+            pending_id=pending_id if isinstance(pending_id, str) else None,
+            attempt_id=delivery_attempt_id if isinstance(delivery_attempt_id, str) else None,
+            stable_id=input_stable_id if isinstance(input_stable_id, str) else None,
+        ):
+            return
     error_item = _error_item_from_sse(event, response_id=response_id)
     if error_item is None or conversation_store is None:
         return
@@ -10617,6 +10620,8 @@ def _build_native_terminal_message_event(
         event["input_id"] = event.get("stable_id") or uuid.uuid4().hex
         event["input_admission_deadline"] = _input_admission_deadline(body.data)
     event.update(input_attributes(input_delivery))
+    if body.data.get("_runtime_notice") is True and not body.data.get("peer_message_id"):
+        event["runtime_notice"] = True
     # Carry the persisted override in-band like the non-native forwards: a
     # runner whose session cache is cold (fresh process, missed init) must
     # not resolve this turn from the spec and evict the override harness.
@@ -14679,27 +14684,29 @@ async def _relay_runner_stream_once(
                         # mirrored back. Settle it before the error item;
                         # annotations stay pending for an explicit retry.
                         raw_input_stable_id = event.get("input_stable_id")
-                        await _settle_undelivered_native_input(
-                            conversation_store,
-                            session_id,
-                            error_item.response_id
-                            if error_item is not None
-                            else current_response_id,
-                            raw_input_stable_id,
-                            reason_code=reason_code,
-                            pending_id=event.get("pending_id"),
-                            delivery_attempt_id=event.get("delivery_attempt_id"),
-                        )
-                        if pending_inputs.was_retired_runtime_notice(
-                            session_id,
-                            pending_id=pending_id if isinstance(pending_id, str) else None,
-                            attempt_id=attempt_id if isinstance(attempt_id, str) else None,
-                            stable_id=(
-                                raw_input_stable_id
-                                if isinstance(raw_input_stable_id, str)
-                                else None
-                            ),
-                        ):
+                        async with _native_mirror_lock(session_id):
+                            await _settle_undelivered_native_input(
+                                conversation_store,
+                                session_id,
+                                error_item.response_id
+                                if error_item is not None
+                                else current_response_id,
+                                raw_input_stable_id,
+                                reason_code=reason_code,
+                                pending_id=event.get("pending_id"),
+                                delivery_attempt_id=event.get("delivery_attempt_id"),
+                            )
+                            retired_notice = pending_inputs.was_retired_runtime_notice(
+                                session_id,
+                                pending_id=pending_id if isinstance(pending_id, str) else None,
+                                attempt_id=attempt_id if isinstance(attempt_id, str) else None,
+                                stable_id=(
+                                    raw_input_stable_id
+                                    if isinstance(raw_input_stable_id, str)
+                                    else None
+                                ),
+                            )
+                        if retired_notice:
                             error_item = None
                             event.pop("error", None)
                             if isinstance(failure_response := event.get("response"), dict):

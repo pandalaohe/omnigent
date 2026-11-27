@@ -1177,27 +1177,25 @@ async def test_runtime_notice_settlement_emits_no_unconfirmed_card_while_user_in
                 async with _stream_runner([dict(failure), dict(failure)]) as client:
                     await orchestration._relay_runner_stream_once(conv.id, client, store)
             elif case == "input-only-failure":
+                # Match the exact runner wire shape from _prompt_wait_expired_failure.
                 event = {
                     "type": "response.failed",
+                    "input_only": True,
                     "response": {
-                        "id": "resp_input_only",
+                        "id": "resp_" + "1" * 32,
                         "error": {
-                            "code": "native_input_rejected",
-                            "message": "paste refused",
+                            "code": "native_prompt_wait_expired",
+                            "message": "The terminal prompt went unanswered.",
                             "undelivered": True,
                         },
                     },
                     "input_stable_id": stable_id,
                     "pending_id": pending_id,
                     "delivery_attempt_id": attempt_id,
-                    "undelivered_input": [{"type": "input_text", "text": text}],
+                    "input_content": [{"type": "input_text", "text": text}],
                 }
-                await orchestration._settle_input_only_failure(
-                    store, conv.id, event, "resp_input_only"
-                )
-                await orchestration._settle_input_only_failure(
-                    store, conv.id, event, "resp_input_only"
-                )
+                async with _stream_runner([dict(event), dict(event)]) as client:
+                    await orchestration._relay_runner_stream_once(conv.id, client, store)
 
         assert pending_inputs.runner_lease_remaining(conv.id, pending_id) is None
         errors = store.list_items(conv.id, type="error").data
@@ -1210,6 +1208,16 @@ async def test_runtime_notice_settlement_emits_no_unconfirmed_card_while_user_in
             call.args[1]
             for call in publish.call_args_list
             if call.args[1].get("type") == "response.error"
+            or (
+                call.args[1].get("type") == "response.failed"
+                and (
+                    call.args[1].get("error") is not None
+                    or (
+                        isinstance(call.args[1].get("response"), dict)
+                        and call.args[1]["response"].get("error") is not None
+                    )
+                )
+            )
         ]
         if is_user:
             assert [err.data.model_dump()["code"] for err in errors] == [
@@ -1412,3 +1420,175 @@ async def test_post_event_tags_only_trusted_internal_runtime_notices(
 
 async def _async_val(value: Any) -> Any:
     return value
+
+
+@pytest.mark.asyncio
+async def test_retired_runtime_notice_stable_id_does_not_suppress_new_user_attempt(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reusing a retired notice's stable_id on a new user attempt still warns on failure."""
+    from omnigent.server.routes._sessions import orchestration
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Native", harness_override="claude-native")
+    monkeypatch.setattr("omnigent.runtime.session_stream.publish", Mock())
+
+    notice_pid = pending_inputs.record(
+        conv.id,
+        [{"type": "input_text", "text": "[System: Clear accepted. Handover.]"}],
+        stable_id=_WEB_ID,
+        runner_managed=True,
+        runtime_notice=True,
+    )
+    assert await _settle_lost_runner_input(store, conv.id, notice_pid, "native_input_runner_lost")
+    assert store.list_items(conv.id, type="error").data == []
+
+    # A later real user send reusing the same stable_id creates a distinct delivery_attempt_id.
+    user_pid = pending_inputs.record(
+        conv.id,
+        [{"type": "input_text", "text": "real user message"}],
+        stable_id=_WEB_ID,
+    )
+    user_attempt = str(
+        pending_inputs.delivery_attributes_for(conv.id, user_pid)["delivery_attempt_id"]
+    )
+    event = {
+        "type": "response.failed",
+        "input_only": True,
+        "response": {
+            "id": "resp_" + "2" * 32,
+            "error": {
+                "code": "native_prompt_wait_expired",
+                "message": "The terminal prompt went unanswered.",
+                "undelivered": True,
+            },
+        },
+        "input_stable_id": _WEB_ID,
+        "pending_id": user_pid,
+        "delivery_attempt_id": user_attempt,
+        "input_content": [{"type": "input_text", "text": "real user message"}],
+    }
+    body = (
+        'data: {"type": "session.heartbeat"}\n\n'
+        + f"data: {json.dumps(event)}\n\n"
+        + "data: [DONE]\n\n"
+    )
+    try:
+        async with httpx.AsyncClient(
+            base_url="http://runner",
+            transport=httpx.MockTransport(
+                lambda _req: httpx.Response(
+                    200, text=body, headers={"content-type": "text/event-stream"}
+                )
+            ),
+        ) as client:
+            await orchestration._relay_runner_stream_once(conv.id, client, store)
+
+        errors = store.list_items(conv.id, type="error").data
+        assert [err.data.model_dump()["code"] for err in errors] == ["native_prompt_wait_expired"]
+    finally:
+        pending_inputs.resolve(conv.id, user_pid)
+
+
+@pytest.mark.asyncio
+async def test_mirror_hold_serializes_with_input_only_runtime_notice_failure(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An input-only failure arriving while a mirror holds a runtime notice emits no card."""
+    import asyncio
+
+    from omnigent.server.routes._sessions import orchestration
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Native", harness_override="claude-native")
+    monkeypatch.setattr("omnigent.runtime.session_stream.publish", Mock())
+    text = "[System: sub-agent finished]"
+    pending_id = pending_inputs.record(
+        conv.id, [{"type": "input_text", "text": text}], runtime_notice=True
+    )
+    attempt_id = str(
+        pending_inputs.delivery_attributes_for(conv.id, pending_id)["delivery_attempt_id"]
+    )
+    entered_append = asyncio.Event()
+    release_append = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    orig_append = store.append
+
+    def blocking_append(cid: str, items: Any) -> Any:
+        loop.call_soon_threadsafe(entered_append.set)
+        fut = asyncio.run_coroutine_threadsafe(release_append.wait(), loop)
+        fut.result(timeout=5.0)
+        return orig_append(cid, items)
+
+    monkeypatch.setattr(store, "append", blocking_append)
+    failure = {
+        "type": "response.failed",
+        "input_only": True,
+        "response": {
+            "id": "resp_" + "3" * 32,
+            "error": {
+                "code": "native_prompt_wait_expired",
+                "message": "The terminal prompt went unanswered.",
+                "undelivered": True,
+            },
+        },
+        "pending_id": pending_id,
+        "delivery_attempt_id": attempt_id,
+        "input_content": [{"type": "input_text", "text": text}],
+    }
+    try:
+        mirror_task = asyncio.create_task(
+            _persist_external_conversation_item(
+                conv.id, conv, _mirror(text, source_id="mirror-hold"), store
+            )
+        )
+        await entered_append.wait()
+        failure_task = asyncio.create_task(
+            orchestration._settle_input_only_failure(store, conv.id, failure, "resp_" + "3" * 32)
+        )
+        await asyncio.sleep(0.05)
+        release_append.set()
+        await asyncio.gather(mirror_task, failure_task)
+        assert store.list_items(conv.id, type="error").data == []
+    finally:
+        release_append.set()
+        pending_inputs.resolve(conv.id, pending_id)
+
+
+def test_scheduled_timer_wake_and_native_event_carry_runtime_notice_flag(db_uri: str) -> None:
+    """Timer wakes set ``_runtime_notice`` and forward ``runtime_notice`` to the native runner."""
+    from types import SimpleNamespace
+
+    from omnigent.server.routes._sessions.orchestration import _build_native_terminal_message_event
+    from omnigent.server.scheduled.fire import _task_event
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Native", harness_override="claude-native")
+
+    timer_event = _task_event(
+        cast(Any, SimpleNamespace(kind="timer", prompt="[System: timer t1 fired]"))
+    )
+    assert timer_event.data.get("_runtime_notice") is True
+    runner_timer = _build_native_terminal_message_event(conv, timer_event)
+    assert runner_timer.get("runtime_notice") is True
+
+    prompt_event = _task_event(
+        cast(
+            Any,
+            SimpleNamespace(kind="prompt", prompt="run nightly report", source_session_id=None),
+        )
+    )
+    assert "_runtime_notice" not in prompt_event.data
+    runner_prompt = _build_native_terminal_message_event(conv, prompt_event)
+    assert "runtime_notice" not in runner_prompt
+
+    peer_event = SessionEventInput(
+        type="message",
+        data={
+            "role": "user",
+            "peer_message_id": "peer_1",
+            "_runtime_notice": True,
+            "content": [{"type": "input_text", "text": "[Peer message] hello"}],
+        },
+    )
+    assert "runtime_notice" not in _build_native_terminal_message_event(conv, peer_event)

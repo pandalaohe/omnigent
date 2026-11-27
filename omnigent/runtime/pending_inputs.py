@@ -377,9 +377,13 @@ _unconfirmed_input_texts: WorkspaceScopedCache[tuple[str, str], frozenset[str]] 
     WorkspaceScopedCache(lambda: TTLCache(maxsize=4096, ttl=_TTL_S, timer=_now))
 )
 # Recently retired internal runtime notices, so late or replayed runner
-# failure events do not fall through into user-facing delivery error cards.
+# failure events (including 24h prompt-wait expiries from older runners)
+# do not fall through into user-facing delivery error cards.
+_RETIRED_RUNTIME_NOTICE_TTL_S = 48 * 60 * 60.0
 _retired_runtime_notices: WorkspaceScopedCache[tuple[str, str, str, str], bool] = (
-    WorkspaceScopedCache(lambda: TTLCache(maxsize=1024, ttl=_CLAIMED_INPUT_TIMEOUT_S, timer=_now))
+    WorkspaceScopedCache(
+        lambda: TTLCache(maxsize=8192, ttl=_RETIRED_RUNTIME_NOTICE_TTL_S, timer=_now)
+    )
 )
 _lock = threading.Lock()
 
@@ -1205,16 +1209,12 @@ def was_retired_runtime_notice(
 ) -> bool:
     """Whether this delivery identity belongs to an already-retired runtime notice."""
     with _lock:
-        if (
-            pending_id is not None
-            and attempt_id is not None
-            and _retired_runtime_notices.get((conversation_id, "attempt", pending_id, attempt_id))
-        ):
-            return True
-        if stable_id is not None and _retired_runtime_notices.get(
-            (conversation_id, "stable", stable_id, "")
-        ):
-            return True
+        if attempt_id is not None:
+            return pending_id is not None and bool(
+                _retired_runtime_notices.get((conversation_id, "attempt", pending_id, attempt_id))
+            )
+        if stable_id is not None:
+            return bool(_retired_runtime_notices.get((conversation_id, "stable", stable_id, "")))
         return False
 
 

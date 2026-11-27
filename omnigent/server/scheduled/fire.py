@@ -575,6 +575,7 @@ def _task_event(task: ScheduledTask) -> SessionEventInput:
         data={
             "role": "user",
             "is_meta": True,
+            "_runtime_notice": True,
             "content": [{"type": "input_text", "text": task.prompt}],
         },
     )

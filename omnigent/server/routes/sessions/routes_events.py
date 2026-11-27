@@ -2466,13 +2466,8 @@ def register_events_routes(
                 _has_runner_created_by_authority(request, conv)
                 and not workflow_answer
                 and retry_guard is None
-                and (
-                    not isinstance(request, Request)
-                    or (
-                        AGENT_SESSION_HEADER not in request.headers
-                        and ORCHESTRATION_SOURCE_HEADER not in request.headers
-                    )
-                )
+                and AGENT_SESSION_HEADER not in request.headers
+                and ORCHESTRATION_SOURCE_HEADER not in request.headers
                 and (
                     body.data.get("is_meta") is True
                     or (
