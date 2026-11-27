@@ -81,6 +81,7 @@ import {
 } from "@/components/ui/dialog";
 import {
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
@@ -607,6 +608,9 @@ function FileViewerBody({
   const [orphanIds, setOrphanIds] = useState<ReadonlySet<string>>(EMPTY_ORPHANS);
   // The HTML preview's annotate toggle, shown in the toolbar while it is set.
   const [annotateControl, setAnnotateControl] = useState<AnnotateControl | null>(null);
+  // An overflow toggle that hands focus elsewhere runs once the menu has
+  // stopped restoring focus to its trigger.
+  const overflowAfterCloseRef = useRef<(() => void) | null>(null);
   // Latest page for post settlement: by the time a request lands, an in-frame
   // navigation may already have pointed the viewer at another page.
   const commentPathRef = useRef(commentPath);
@@ -1575,11 +1579,9 @@ function FileViewerBody({
     icon: ReactNode;
     onSelect?: () => void;
     active?: boolean;
-    /** A toggle whose label does not name its state: sets aria-pressed and
-     * checks its overflow row, which shows the label instead of the tooltip. */
+    /** A toggle whose label does not name its state: sets aria-pressed, and its
+     * overflow row is a checkbox item labelled without the tooltip. */
     pressed?: boolean;
-    /** Leave focus where it was on click (e.g. inside the preview frame). */
-    keepFocus?: boolean;
     disabled?: boolean;
     disabledLabel?: string;
     /** When set, render a picker (dropdown/submenu) over these mutually
@@ -1744,7 +1746,6 @@ function FileViewerBody({
       icon: <MousePointerClickIcon className="size-4" />,
       active: annotateControl.on,
       pressed: annotateControl.on,
-      keepFocus: true,
       onSelect: annotateControl.toggle,
     });
   }
@@ -1934,7 +1935,6 @@ function FileViewerBody({
         aria-pressed={action.pressed}
         disabled={action.disabled}
         tabIndex={interactive ? undefined : -1}
-        onMouseDown={action.keepFocus ? (e) => e.preventDefault() : undefined}
         onClick={interactive ? action.onSelect : undefined}
       >
         {action.icon}
@@ -2197,7 +2197,17 @@ function FileViewerBody({
                       <MoreHorizontalIcon className="size-4" />
                     </Button>
                   </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end" className="w-auto min-w-40">
+                  <DropdownMenuContent
+                    align="end"
+                    className="w-auto min-w-40"
+                    onCloseAutoFocus={(e) => {
+                      const run = overflowAfterCloseRef.current;
+                      if (!run) return;
+                      overflowAfterCloseRef.current = null;
+                      e.preventDefault();
+                      run();
+                    }}
+                  >
                     {toolbarActions
                       .filter((action) => !action.splitMenu)
                       .map((action) =>
@@ -2268,6 +2278,18 @@ function FileViewerBody({
                               <TooltipContent>{action.tooltip ?? action.label}</TooltipContent>
                             </Tooltip>
                           </TooltipProvider>
+                        ) : action.pressed !== undefined ? (
+                          <DropdownMenuCheckboxItem
+                            key={action.key}
+                            className="whitespace-nowrap"
+                            checked={action.pressed}
+                            onSelect={() => {
+                              overflowAfterCloseRef.current = action.onSelect ?? null;
+                            }}
+                          >
+                            {action.icon}
+                            {action.label}
+                          </DropdownMenuCheckboxItem>
                         ) : (
                           <DropdownMenuItem
                             key={action.key}
@@ -2275,10 +2297,7 @@ function FileViewerBody({
                             onSelect={action.onSelect}
                           >
                             {action.icon}
-                            {action.pressed === undefined
-                              ? (action.tooltip ?? action.label)
-                              : action.label}
-                            {action.pressed && <CheckIcon className="ml-auto size-4" />}
+                            {action.tooltip ?? action.label}
                           </DropdownMenuItem>
                         ),
                       )}

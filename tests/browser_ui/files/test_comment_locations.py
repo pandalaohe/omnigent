@@ -94,6 +94,7 @@ def test_annotate_toggle_sits_in_the_toolbar_not_over_the_preview(
     )
     assert covering == "IFRAME"
     page_menu.click()
+    frame_focused = "document.activeElement?.tagName === 'IFRAME'"
     if toggle.is_visible():
         box = toggle.bounding_box()
         assert box and box["y"] + box["height"] <= frame_box["y"]
@@ -101,14 +102,23 @@ def test_annotate_toggle_sits_in_the_toolbar_not_over_the_preview(
         toggle.click()
         expect(toggle).to_have_attribute("aria-pressed", "true")
         page.screenshot(path=output / f"annotate-toolbar-{width}-on.png")
-        toggle.click()
+        # Keys went to the frame: Escape leaves the mode and keeps the file open.
+        page.keyboard.press("Escape")
         expect(toggle).to_have_attribute("aria-pressed", "false")
     else:
+        row = page.get_by_role("menuitemcheckbox", name="Annotate", exact=True)
         more.click()
-        row = page.get_by_role("menuitem", name="Annotate", exact=True)
-        expect(row).to_be_visible()
-        page.screenshot(path=output / f"annotate-toolbar-{width}-menu.png")
+        expect(row).to_have_attribute("aria-checked", "false")
+        row.click()
+        page.wait_for_function(frame_focused)
+        more.click()
+        expect(row).to_have_attribute("aria-checked", "true")
+        page.screenshot(path=output / f"annotate-toolbar-{width}-menu-on.png")
+        row.click()
+        page.wait_for_function(frame_focused)
         page.keyboard.press("Escape")
+        expect(row).to_have_count(0)
+    expect(viewer).to_be_visible()
     page.screenshot(path=output / f"annotate-toolbar-{width}.png")
 
 

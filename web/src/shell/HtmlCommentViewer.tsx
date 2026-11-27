@@ -884,13 +884,20 @@ export function HtmlCommentViewer({
     onAnnotationOrphansChangeRef.current?.(new Set([...annotate.orphanIds, ...renderedOrphans]));
   }, [annotate.orphanIds, renderedOrphans]);
 
-  // The toggle lives in the panel toolbar so nothing floats over the page.
+  // The toggle lives in the panel toolbar so nothing floats over the page. A
+  // toolbar click hands keys to the frame, so Escape reaches the picker.
   const annotateShown = annotate.available && canEdit;
+  const toggleAnnotate = annotate.toggle;
+  const toggleFromToolbar = useCallback(() => {
+    toggleAnnotate();
+    iframeRef.current?.focus();
+    iframeRef.current?.contentWindow?.focus();
+  }, [toggleAnnotate]);
   useEffect(() => {
     onAnnotateControlChangeRef.current?.(
-      annotateShown ? { on: annotate.on, toggle: annotate.toggle } : null,
+      annotateShown ? { on: annotate.on, toggle: toggleFromToolbar } : null,
     );
-  }, [annotateShown, annotate.on, annotate.toggle]);
+  }, [annotateShown, annotate.on, toggleFromToolbar]);
   useEffect(() => () => onAnnotateControlChangeRef.current?.(null), []);
 
   // When the composer closes (submit, cancel, mode off), focus returns to the

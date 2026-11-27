@@ -1138,6 +1138,16 @@ describe("HtmlCommentViewer annotation toggle", () => {
     ).toBeNull();
   });
 
+  it("hands focus to the frame when the toolbar toggles", async () => {
+    renderViewer();
+    const { postMessage, contentWindowFocus } = await openFrame();
+    observeAnnotatePort(postMessage);
+    await sendAnnotateFromFrame(postMessage, { type: "annotate:ready" });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Annotate" }));
+    expect(contentWindowFocus).toHaveBeenCalled();
+  });
+
   it("offers no toggle to a user who cannot edit", async () => {
     vi.mocked(useCanEdit).mockReturnValue(false);
     try {
@@ -1350,6 +1360,8 @@ describe("HtmlCommentViewer annotation path", () => {
     const toggle = await screen.findByRole("button", { name: "Annotate" });
     fireEvent.click(toggle);
     await waitFor(() => expect(toggle).toHaveAttribute("aria-pressed", "true"));
+    // The toolbar toggle focuses the frame itself; count only the composer's returns.
+    contentWindowFocus.mockClear();
 
     authenticatedFetchMock.mockResolvedValueOnce(
       new Response(JSON.stringify(elementComment("c-new", ENTRY_PATH, 300)), {
