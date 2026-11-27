@@ -494,6 +494,24 @@ describe("useSettingsRoute", () => {
     expect(routeHook("/settings/admin")).toEqual({ inSettings: true, section: "admin" });
   });
 
+  it("accepts the admin general route only when the server advertises editable attachment limits", async () => {
+    const { adminGeneralSettingsAvailable, FALLBACK_SERVER_INFO } =
+      await import("@/lib/capabilities");
+    expect(
+      adminGeneralSettingsAvailable({
+        ...FALLBACK_SERVER_INFO,
+        attachment_limits: { file_bytes: 500 * 1024 * 1024 },
+      }),
+    ).toBe(false);
+    expect(
+      adminGeneralSettingsAvailable({
+        ...FALLBACK_SERVER_INFO,
+        attachment_oversize_to_filesystem: true,
+        attachment_limits: { file_bytes: 500 * 1024 * 1024, oversize_to_filesystem: true },
+      }),
+    ).toBe(true);
+  });
+
   it("treats /settings/members and /settings/policies as in-settings sections on an accounts deploy", () => {
     // The core of the fix: Members / Policies now live UNDER /settings, so the
     // sidebar's `inSettings` gate stays true and the settings nav stays put —

@@ -1104,6 +1104,82 @@ async def test_admin_put_disables_public_and_gate_follows(db_uri: str, tmp_path:
         assert blocked.status_code == 403, blocked.text
 
 
+async def test_admin_put_attachment_limit_persists_and_updates_info_live(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Admin PUT updates attachment_max_file_bytes in <data_dir> and /v1/info without restart."""
+    from omnigent.server.sharing_settings import read_attachment_max_file_bytes_override
+
+    config = tmp_path / "config.yaml"
+    config.write_text("filesystem_attachment_max_bytes: 524288000\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+
+    permission_store = SqlAlchemyPermissionStore(db_uri)
+    permission_store.ensure_user(_ADMIN, is_admin=True)
+    permission_store.ensure_user(_GRANTEE, is_admin=False)
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        permission_store=permission_store,
+        auth_provider=UnifiedAuthProvider(source="header"),
+    )
+    async with _client(app, _ADMIN) as admin_client:
+        initial = await admin_client.get("/v1/sharing")
+        assert initial.status_code == 200
+        assert initial.json()["attachment_max_file_bytes"] == 500 * 1024**2
+        assert initial.json()["attachment_max_upload_bytes"] == 2 * 1024**3
+        assert initial.json()["attachment_max_file_bytes_editable"] is True
+        info_initial = (await admin_client.get("/v1/info")).json()
+        assert info_initial["attachment_oversize_to_filesystem"] is True
+
+        updated = await admin_client.put(
+            "/v1/sharing", json={"attachment_max_file_bytes": 250 * 1024**2}
+        )
+        assert updated.status_code == 200, updated.text
+        assert updated.json()["attachment_max_file_bytes"] == 250 * 1024**2
+        assert updated.json()["attachment_max_upload_bytes"] == 2 * 1024**3
+        assert read_attachment_max_file_bytes_override() == 250 * 1024**2
+        assert (await admin_client.get("/v1/info")).json()["attachment_limits"]["file_bytes"] == (
+            250 * 1024**2
+        )
+
+        # Raising above the 2 GiB request ceiling returns the expanded ceiling with 1 MiB headroom.
+        three_gb = 3 * 1024**3
+        expanded = await admin_client.put(
+            "/v1/sharing", json={"attachment_max_file_bytes": three_gb}
+        )
+        assert expanded.status_code == 200, expanded.text
+        assert expanded.json()["attachment_max_file_bytes"] == three_gb
+        assert expanded.json()["attachment_max_upload_bytes"] == three_gb + 1024**2
+
+        # Config rewrite (simulated release cutover) does not reset the admin override.
+        config.write_text("filesystem_attachment_max_bytes: 524288000\n")
+        assert (await admin_client.get("/v1/info")).json()["attachment_limits"]["file_bytes"] == (
+            three_gb
+        )
+
+        # 0 sets unlimited (None); negative is rejected 400.
+        unlimited = await admin_client.put("/v1/sharing", json={"attachment_max_file_bytes": 0})
+        assert unlimited.status_code == 200, unlimited.text
+        assert unlimited.json()["attachment_max_file_bytes"] is None
+        info_after = await admin_client.get("/v1/info")
+        assert info_after.json()["attachment_limits"]["file_bytes"] is None
+
+        negative = await admin_client.put("/v1/sharing", json={"attachment_max_file_bytes": -1})
+        assert negative.status_code == 400
+
+        too_large = await admin_client.put(
+            "/v1/sharing", json={"attachment_max_file_bytes": 101 * 1024**3}
+        )
+        assert too_large.status_code == 400
+
+    async with _client(app, _GRANTEE) as member_client:
+        forbidden = await member_client.put(
+            "/v1/sharing", json={"attachment_max_file_bytes": 100 * 1024**2}
+        )
+        assert forbidden.status_code == 403
+
+
 async def test_admin_put_public_rejected_when_not_writable(db_uri: str, tmp_path: Path) -> None:
     """A deployment-managed public setting reports not-editable and rejects writes."""
     app = _admin_app(db_uri, tmp_path, public_sharing=True)

@@ -35,7 +35,7 @@ import { ImageLightboxProvider } from "./components/ImageLightbox";
 import { RunnerHealthProvider } from "./hooks/RunnerHealthProvider";
 import { CapabilitiesContext } from "./lib/CapabilitiesContext";
 import { createBootServerInfo } from "./lib/bootCapabilities";
-import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
+import { resolveServerInfo, subscribeServerInfo, type ServerInfo } from "./lib/capabilities";
 import { EmbeddedProvider } from "./lib/embedded";
 import {
   type OmnigentHostConfig,
@@ -148,8 +148,12 @@ function EmbedCapabilitiesProvider({ children }: { children: ReactNode }) {
     void boot.settled.then((resolved) => {
       if (alive) setInfo(resolved);
     });
+    const unsubscribe = subscribeServerInfo((next) => {
+      if (alive) setInfo(next);
+    });
     return () => {
       alive = false;
+      unsubscribe();
     };
   }, []);
   return <CapabilitiesContext.Provider value={info}>{children}</CapabilitiesContext.Provider>;

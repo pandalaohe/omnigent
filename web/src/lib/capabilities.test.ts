@@ -553,6 +553,88 @@ describe("resolveServerInfo attachment_limits", () => {
     const parsed = await probe({ attachment_limits: value });
     expect(parsed.attachment_limits).toBeUndefined();
   });
+
+  it("refreshServerInfo re-fetches /v1/info and notifies subscribers", async () => {
+    const { refreshServerInfo, subscribeServerInfo } = await import("./capabilities");
+    const received: unknown[] = [];
+    const unsubscribe = subscribeServerInfo((next) => received.push(next.attachment_limits));
+    try {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue({
+          ok: true,
+          json: async () => ({
+            attachment_limits: { file_bytes: 250 * 1024 * 1024, upload_bytes: 2 * 1024 ** 3 },
+          }),
+        }),
+      );
+      const fresh = await refreshServerInfo();
+      expect(fresh?.attachment_limits).toEqual({
+        file_bytes: 250 * 1024 * 1024,
+        upload_bytes: 2 * 1024 ** 3,
+      });
+      expect(received).toEqual([{ file_bytes: 250 * 1024 * 1024, upload_bytes: 2 * 1024 ** 3 }]);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("discards a superseded out-of-order refreshServerInfo response", async () => {
+    const { getCachedServerInfo, refreshServerInfo, subscribeServerInfo } =
+      await import("./capabilities");
+    const received: unknown[] = [];
+    const unsubscribe = subscribeServerInfo((next) =>
+      received.push(next.attachment_limits?.file_bytes),
+    );
+    let resolveFirst!: (value: unknown) => void;
+    let resolveSecond!: (value: unknown) => void;
+    const firstResponse = new Promise((resolve) => {
+      resolveFirst = resolve;
+    });
+    const secondResponse = new Promise((resolve) => {
+      resolveSecond = resolve;
+    });
+    const raceFetchMock = vi
+      .fn()
+      .mockReturnValueOnce(firstResponse)
+      .mockReturnValueOnce(secondResponse);
+    vi.stubGlobal("fetch", raceFetchMock);
+    try {
+      const first = refreshServerInfo();
+      const second = refreshServerInfo();
+      resolveSecond({
+        ok: true,
+        json: async () => ({ attachment_limits: { file_bytes: 500 * 1024 * 1024 } }),
+      });
+      await second;
+      resolveFirst({
+        ok: true,
+        json: async () => ({ attachment_limits: { file_bytes: 250 * 1024 * 1024 } }),
+      });
+      expect(await first).toBeNull();
+      expect(received).toEqual([500 * 1024 * 1024]);
+      expect(getCachedServerInfo()?.attachment_limits?.file_bytes).toBe(500 * 1024 * 1024);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("propagates attachment_oversize_to_filesystem into attachment_limits when advertised", async () => {
+    const modern = await probe({
+      attachment_oversize_to_filesystem: true,
+      attachment_limits: { file_bytes: 500 * 1024 * 1024 },
+    });
+    expect(modern.attachment_oversize_to_filesystem).toBe(true);
+    expect(modern.attachment_limits?.oversize_to_filesystem).toBe(true);
+  });
+
+  it("keeps oversize_to_filesystem off when an older server omits attachment_oversize_to_filesystem", async () => {
+    const legacy = await probe({
+      attachment_limits: { file_bytes: 500 * 1024 * 1024 },
+    });
+    expect(legacy.attachment_oversize_to_filesystem).toBe(false);
+    expect(legacy.attachment_limits?.oversize_to_filesystem).toBeUndefined();
+  });
 });
 
 describe("resolveServerInfo branding", () => {

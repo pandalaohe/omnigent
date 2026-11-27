@@ -353,6 +353,44 @@ def test_inline_attachment_limits_load_yaml_and_fall_back(
     assert limits["text_bytes"] == 10 * 1024**2
 
 
+def test_attachment_max_file_bytes_override_beats_config_and_expands_request_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Admin override in <data_dir> outranks config.yaml and survives config changes."""
+    from omnigent.server.sharing_settings import write_attachment_max_file_bytes_override
+
+    _pin_data_dir(monkeypatch, tmp_path)
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "attachment_max_upload_bytes: 2147483648\nfilesystem_attachment_max_bytes: 524288000\n"
+    )
+    # Without override, config.yaml default (500 MiB) applies.
+    assert server_config_module.filesystem_attachment_upload_limit() == 500 * 1024**2
+    assert server_config_module.attachment_upload_request_limit() == 2 * 1024**3
+
+    # Admin raises limit to 3 GiB → overrides config and expands request body cap with headroom.
+    three_gib = 3 * 1024**3
+    write_attachment_max_file_bytes_override(three_gib)
+    assert server_config_module.filesystem_attachment_upload_limit() == three_gib
+    assert server_config_module.attachment_upload_request_limit() == three_gib + 1024**2
+
+    # Replacing config.yaml (release cutover) keeps the admin override intact.
+    config.write_text(
+        "attachment_max_upload_bytes: 2147483648\nfilesystem_attachment_max_bytes: 104857600\n"
+    )
+    assert server_config_module.filesystem_attachment_upload_limit() == three_gib
+
+    # Admin sets 0 (unlimited) → file_bytes becomes None, while the configured
+    # transport request cap (2 GiB) remains bounded.
+    write_attachment_max_file_bytes_override(None)
+    assert server_config_module.filesystem_attachment_upload_limit() is None
+    assert server_config_module.attachment_upload_request_limit() == 2 * 1024**3
+
+    # Corrupt override file falls back safely to config.yaml.
+    (tmp_path / "attachment_max_file_bytes").write_text("not-a-number\n")
+    assert server_config_module.filesystem_attachment_upload_limit() == 100 * 1024**2
+
+
 # ── archive cleanup settings ──────────────────────────────────────
 
 

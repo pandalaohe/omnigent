@@ -12594,6 +12594,11 @@
             "title": "Attachment Limits",
             "type": "object"
           },
+          "attachment_oversize_to_filesystem": {
+            "default": false,
+            "title": "Attachment Oversize To Filesystem",
+            "type": "boolean"
+          },
           "automation_trigger_poll_minutes": {
             "default": 10,
             "format": "int64",
@@ -18869,6 +18874,22 @@
             ],
             "title": "Permission Tier Revision"
           },
+          "permission_tier_source": {
+            "anyOf": [
+              {
+                "enum": [
+                  "explicit",
+                  "link",
+                  "host_default"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Permission Tier Source"
+          },
           "permission_tier_state": {
             "anyOf": [
               {
@@ -20978,6 +20999,18 @@
       "SetSharingRequest": {
         "description": "Body for `PUT /v1/sharing`.\n\nEvery field is optional so an admin can update each setting\nindependently; at least one must be present.",
         "properties": {
+          "attachment_max_file_bytes": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attachment Max File Bytes"
+          },
           "default_public_sessions": {
             "anyOf": [
               {

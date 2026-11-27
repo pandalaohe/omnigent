@@ -461,6 +461,8 @@ export interface ServerInfo {
    * fixed client ceilings.
    */
   attachment_limits?: AttachmentLimits;
+  /** True when the server routes oversized inline uploads to workspace files and allows editing the limit. */
+  attachment_oversize_to_filesystem?: boolean;
   /**
    * How the deployment curates the New Chat picker. Display only: it narrows
    * what the picker offers, never what exists, so a session already bound to
@@ -505,7 +507,10 @@ const ATTACHMENT_LIMIT_KEYS = [
  * or ``null`` (unlimited). Any malformed entry invalidates the whole payload
  * — a partially understood limit set is not safe to enforce.
  */
-function parseAttachmentLimits(raw: unknown): AttachmentLimits | undefined {
+function parseAttachmentLimits(
+  raw: unknown,
+  oversizeToFilesystem = false,
+): AttachmentLimits | undefined {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
   const source = raw as Record<string, unknown>;
   const limits: Record<string, number | null> = {};
@@ -517,7 +522,10 @@ function parseAttachmentLimits(raw: unknown): AttachmentLimits | undefined {
     if (!valid) return undefined;
     limits[key] = value;
   }
-  return Object.keys(limits).length > 0 ? (limits as AttachmentLimits) : undefined;
+  if (Object.keys(limits).length === 0) return undefined;
+  const parsed: AttachmentLimits = limits;
+  if (oversizeToFilesystem) parsed.oversize_to_filesystem = true;
+  return parsed;
 }
 
 /** The deployment's New Chat picker curation, as reported by ``/v1/info``. */
@@ -714,11 +722,13 @@ export function sandboxProfilesEnabled(info: ServerInfo | "loading"): boolean {
   );
 }
 
-/** Whether the Admin > General page has a setting to show: nested agents or Omni Advisor. */
+/** Whether the Admin > General page has a setting to show. */
 export function adminGeneralSettingsAvailable(info: ServerInfo | "loading"): boolean {
   return (
     info !== "loading" &&
-    (info.sibling_sessions === true || info.proactive_agent_available === true)
+    (info.sibling_sessions === true ||
+      info.proactive_agent_available === true ||
+      info.attachment_oversize_to_filesystem === true)
   );
 }
 
@@ -732,6 +742,31 @@ export function customAgentControlsAvailable(info: ServerInfo | "loading"): bool
 
 let cachedServerInfo: ServerInfo | null = null;
 let pendingServerInfo: Promise<ServerInfo> | null = null;
+let serverInfoGeneration = 0;
+const serverInfoListeners = new Set<(info: ServerInfo) => void>();
+
+/** Subscribe to live ``/v1/info`` refreshes (e.g. after an admin settings save). */
+export function subscribeServerInfo(listener: (info: ServerInfo) => void): () => void {
+  serverInfoListeners.add(listener);
+  return () => {
+    serverInfoListeners.delete(listener);
+  };
+}
+
+function notifyServerInfo(info: ServerInfo): void {
+  for (const listener of serverInfoListeners) {
+    listener(info);
+  }
+}
+
+/** Update the cached ServerInfo in place (e.g. from a PUT response) and notify subscribers. */
+export function patchCachedServerInfo(updater: (prev: ServerInfo) => ServerInfo): void {
+  if (cachedServerInfo === null) return;
+  serverInfoGeneration += 1;
+  const next = updater(cachedServerInfo);
+  cachedServerInfo = next;
+  notifyServerInfo(next);
+}
 
 function parseSandboxProviderCapabilities(
   value: unknown,
@@ -780,6 +815,147 @@ function parseProviderAutomationNotices(value: unknown): Record<string, string> 
   );
 }
 
+async function fetchServerInfo(): Promise<ServerInfo | null> {
+  try {
+    // Route through the host transport (`hostFetch`) so the embed hits the
+    // proxied omnigent API; standalone `hostFetch` falls back to plain
+    // `fetch("/v1/info")`, preserving the original behavior.
+    const res = await hostFetch("/v1/info", undefined, { hostless: true });
+    if (!res.ok) return null;
+    const data = (await res.json()) as Partial<ServerInfo>;
+    const smartRoutingEnabled = data.smart_routing_enabled === true;
+    const harnessInstallEnabled = data.harness_install_enabled === true;
+    return {
+      telemetry: parseTelemetryStatus(data.telemetry),
+      sibling_sessions: data.sibling_sessions === true,
+      session_nest_moves: data.session_nest_moves === true,
+      sibling_session_destinations: parseSiblingSessionDestinations(
+        data.sibling_session_destinations,
+      ),
+      session_bundle_workspaces: data.session_bundle_workspaces === true,
+      accounts_enabled: data.accounts_enabled === true,
+      browser_approval_available:
+        typeof data.browser_approval_available === "boolean"
+          ? data.browser_approval_available
+          : undefined,
+      push_credentials_required:
+        typeof data.push_credentials_required === "boolean"
+          ? data.push_credentials_required
+          : undefined,
+      browser_annotations_available: data.browser_annotations_available === true,
+      api_keys_available: data.api_keys_available === true,
+      connected_apps_available: data.connected_apps_available === true,
+      single_user: data.single_user === true,
+      login_url: typeof data.login_url === "string" ? data.login_url : null,
+      needs_setup: data.needs_setup === true,
+      databricks_features: data.databricks_features === true,
+      managed_sandboxes_enabled: data.managed_sandboxes_enabled === true,
+      durable_initial_input: data.durable_initial_input === true,
+      sandbox_provider: typeof data.sandbox_provider === "string" ? data.sandbox_provider : null,
+      sandbox_providers: Array.isArray(data.sandbox_providers)
+        ? data.sandbox_providers.filter((p): p is string => typeof p === "string")
+        : [],
+      sandbox_provider_capabilities: parseSandboxProviderCapabilities(
+        data.sandbox_provider_capabilities,
+      ),
+      sandbox_provider_automation_notices: parseProviderAutomationNotices(
+        data.sandbox_provider_automation_notices,
+      ),
+      enabled_connections: Array.isArray(data.enabled_connections)
+        ? data.enabled_connections.filter((p): p is string => typeof p === "string")
+        : [],
+      sharing_mode: SHARING_MODES.includes(data.sharing_mode as SharingMode)
+        ? (data.sharing_mode as SharingMode)
+        : "on",
+      // Fail open: only an explicit false disables the public toggle.
+      public_sharing_enabled: data.public_sharing_enabled !== false,
+      public_sharing_max_level: data.public_sharing_max_level === "edit" ? "edit" : "read",
+      server_version: typeof data.server_version === "string" ? data.server_version : null,
+      smart_routing_enabled: smartRoutingEnabled,
+      smart_routing_sources: parseSmartRoutingSources(
+        data.smart_routing_sources,
+        smartRoutingEnabled,
+      ),
+      features: parseFeatures(data.features, harnessInstallEnabled),
+      harness_install_enabled: harnessInstallEnabled,
+      installable_harnesses: Array.isArray(data.installable_harnesses)
+        ? data.installable_harnesses.filter((h): h is string => typeof h === "string")
+        : [],
+      dictation_available: data.dictation_available === true,
+      dictation_punctuation_available: data.dictation_punctuation_available === true,
+      scheduled_task_worktrees: data.scheduled_task_worktrees === true,
+      archive_worktree_cleanup: data.archive_worktree_cleanup === true,
+      worktree_status: data.worktree_status === true,
+      automations_enabled: data.automations_enabled !== false,
+      session_search_scope: data.session_search_scope === true,
+      usage_board_enabled: data.usage_board_enabled === true,
+      task_board_enabled: data.task_board_enabled === true,
+      session_mute: data.session_mute === true,
+      project_mute: data.project_mute === true,
+      scheduled_task_session_modes: data.scheduled_task_session_modes === true,
+      session_create_permission_modes: data.session_create_permission_modes === true,
+      session_create_workflow_id: data.session_create_workflow_id === true,
+      scheduled_task_mcp_services: data.scheduled_task_mcp_services === true,
+      scheduled_task_workflow_id: data.scheduled_task_workflow_id === true,
+      scheduled_task_source_sessions: data.scheduled_task_source_sessions === true,
+      scheduled_task_subhour: data.scheduled_task_subhour === true,
+      scheduled_task_trigger_headers: data.scheduled_task_trigger_headers === true,
+      session_message_max_chars:
+        typeof data.session_message_max_chars === "number" &&
+        Number.isInteger(data.session_message_max_chars) &&
+        data.session_message_max_chars > 0
+          ? data.session_message_max_chars
+          : undefined,
+      automation_trigger_poll_minutes:
+        typeof data.automation_trigger_poll_minutes === "number" &&
+        Number.isInteger(data.automation_trigger_poll_minutes) &&
+        data.automation_trigger_poll_minutes >= 10 &&
+        data.automation_trigger_poll_minutes <= 240
+          ? data.automation_trigger_poll_minutes
+          : 10,
+      scheduled_task_sandbox_workspaces: data.scheduled_task_sandbox_workspaces === true,
+      request_managed_sandbox_host_id: data.request_managed_sandbox_host_id === true,
+      session_fork_workspaces: data.session_fork_workspaces === true,
+      move_to_managed_sandbox: data.move_to_managed_sandbox === true,
+      agent_install: data.agent_install === true,
+      agent_detail: data.agent_detail === true,
+      agent_config_edit: data.agent_config_edit === true,
+      session_event_types: Array.isArray(data.session_event_types)
+        ? data.session_event_types.filter((t): t is string => typeof t === "string")
+        : [],
+      session_claude_sdk_clear: data.session_claude_sdk_clear === true,
+      session_rewind: data.session_rewind === true,
+      session_pull_requests: data.session_pull_requests === true,
+      session_journal: data.session_journal === true,
+      workflows: data.workflows === true,
+      workflow_sharing: data.workflow_sharing === true,
+      session_title_instructions: data.session_title_instructions === true,
+      admin_view: data.admin_view === true,
+      comment_anchor_metadata: data.comment_anchor_metadata === true,
+      filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
+      scheduled_task_projects: data.scheduled_task_projects === true,
+      scheduled_task_inbox: data.scheduled_task_inbox === true,
+      scheduled_task_sharing: data.scheduled_task_sharing === true,
+      inbox_items_available: data.inbox_items_available === true,
+      scheduled_task_shared_with_me: data.scheduled_task_shared_with_me === true,
+      scheduled_task_run_pull_requests: data.scheduled_task_run_pull_requests === true,
+      scheduled_task_clone: data.scheduled_task_clone === true,
+      proactive_agent_available: data.proactive_agent_available === true,
+      scheduled_task_harness_settings: data.scheduled_task_harness_settings === true,
+      scheduled_task_approval_skipping_modes: data.scheduled_task_approval_skipping_modes === true,
+      branding: parseBranding(data.branding),
+      attachment_oversize_to_filesystem: data.attachment_oversize_to_filesystem === true,
+      attachment_limits: parseAttachmentLimits(
+        data.attachment_limits,
+        data.attachment_oversize_to_filesystem === true,
+      ),
+      picker: parsePicker(data.picker),
+    };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Fetch ``/v1/info`` once and cache the result.
  *
@@ -791,149 +967,35 @@ function parseProviderAutomationNotices(value: unknown): Record<string, string> 
 export async function resolveServerInfo(): Promise<ServerInfo> {
   if (cachedServerInfo !== null) return cachedServerInfo;
   if (pendingServerInfo !== null) return pendingServerInfo;
+  const generation = serverInfoGeneration;
   pendingServerInfo = (async () => {
-    try {
-      // Route through the host transport (`hostFetch`) so the embed hits the
-      // proxied omnigent API; standalone `hostFetch` falls back to plain
-      // `fetch("/v1/info")`, preserving the original behavior.
-      const res = await hostFetch("/v1/info", undefined, { hostless: true });
-      if (res.ok) {
-        const data = (await res.json()) as Partial<ServerInfo>;
-        const smartRoutingEnabled = data.smart_routing_enabled === true;
-        const harnessInstallEnabled = data.harness_install_enabled === true;
-        cachedServerInfo = {
-          telemetry: parseTelemetryStatus(data.telemetry),
-          sibling_sessions: data.sibling_sessions === true,
-          session_nest_moves: data.session_nest_moves === true,
-          sibling_session_destinations: parseSiblingSessionDestinations(
-            data.sibling_session_destinations,
-          ),
-          session_bundle_workspaces: data.session_bundle_workspaces === true,
-          accounts_enabled: data.accounts_enabled === true,
-          browser_approval_available:
-            typeof data.browser_approval_available === "boolean"
-              ? data.browser_approval_available
-              : undefined,
-          push_credentials_required:
-            typeof data.push_credentials_required === "boolean"
-              ? data.push_credentials_required
-              : undefined,
-          browser_annotations_available: data.browser_annotations_available === true,
-          api_keys_available: data.api_keys_available === true,
-          connected_apps_available: data.connected_apps_available === true,
-          single_user: data.single_user === true,
-          login_url: typeof data.login_url === "string" ? data.login_url : null,
-          needs_setup: data.needs_setup === true,
-          databricks_features: data.databricks_features === true,
-          managed_sandboxes_enabled: data.managed_sandboxes_enabled === true,
-          durable_initial_input: data.durable_initial_input === true,
-          sandbox_provider:
-            typeof data.sandbox_provider === "string" ? data.sandbox_provider : null,
-          sandbox_providers: Array.isArray(data.sandbox_providers)
-            ? data.sandbox_providers.filter((p): p is string => typeof p === "string")
-            : [],
-          sandbox_provider_capabilities: parseSandboxProviderCapabilities(
-            data.sandbox_provider_capabilities,
-          ),
-          sandbox_provider_automation_notices: parseProviderAutomationNotices(
-            data.sandbox_provider_automation_notices,
-          ),
-          enabled_connections: Array.isArray(data.enabled_connections)
-            ? data.enabled_connections.filter((p): p is string => typeof p === "string")
-            : [],
-          sharing_mode: SHARING_MODES.includes(data.sharing_mode as SharingMode)
-            ? (data.sharing_mode as SharingMode)
-            : "on",
-          // Fail open: only an explicit false disables the public toggle.
-          public_sharing_enabled: data.public_sharing_enabled !== false,
-          public_sharing_max_level: data.public_sharing_max_level === "edit" ? "edit" : "read",
-          server_version: typeof data.server_version === "string" ? data.server_version : null,
-          smart_routing_enabled: smartRoutingEnabled,
-          smart_routing_sources: parseSmartRoutingSources(
-            data.smart_routing_sources,
-            smartRoutingEnabled,
-          ),
-          features: parseFeatures(data.features, harnessInstallEnabled),
-          harness_install_enabled: harnessInstallEnabled,
-          installable_harnesses: Array.isArray(data.installable_harnesses)
-            ? data.installable_harnesses.filter((h): h is string => typeof h === "string")
-            : [],
-          dictation_available: data.dictation_available === true,
-          dictation_punctuation_available: data.dictation_punctuation_available === true,
-          scheduled_task_worktrees: data.scheduled_task_worktrees === true,
-          archive_worktree_cleanup: data.archive_worktree_cleanup === true,
-          worktree_status: data.worktree_status === true,
-          automations_enabled: data.automations_enabled !== false,
-          session_search_scope: data.session_search_scope === true,
-          usage_board_enabled: data.usage_board_enabled === true,
-          task_board_enabled: data.task_board_enabled === true,
-          session_mute: data.session_mute === true,
-          project_mute: data.project_mute === true,
-          scheduled_task_session_modes: data.scheduled_task_session_modes === true,
-          session_create_permission_modes: data.session_create_permission_modes === true,
-          session_create_workflow_id: data.session_create_workflow_id === true,
-          scheduled_task_mcp_services: data.scheduled_task_mcp_services === true,
-          scheduled_task_workflow_id: data.scheduled_task_workflow_id === true,
-          scheduled_task_source_sessions: data.scheduled_task_source_sessions === true,
-          scheduled_task_subhour: data.scheduled_task_subhour === true,
-          scheduled_task_trigger_headers: data.scheduled_task_trigger_headers === true,
-          session_message_max_chars:
-            typeof data.session_message_max_chars === "number" &&
-            Number.isInteger(data.session_message_max_chars) &&
-            data.session_message_max_chars > 0
-              ? data.session_message_max_chars
-              : undefined,
-          automation_trigger_poll_minutes:
-            typeof data.automation_trigger_poll_minutes === "number" &&
-            Number.isInteger(data.automation_trigger_poll_minutes) &&
-            data.automation_trigger_poll_minutes >= 10 &&
-            data.automation_trigger_poll_minutes <= 240
-              ? data.automation_trigger_poll_minutes
-              : 10,
-          scheduled_task_sandbox_workspaces: data.scheduled_task_sandbox_workspaces === true,
-          request_managed_sandbox_host_id: data.request_managed_sandbox_host_id === true,
-          session_fork_workspaces: data.session_fork_workspaces === true,
-          move_to_managed_sandbox: data.move_to_managed_sandbox === true,
-          agent_install: data.agent_install === true,
-          agent_detail: data.agent_detail === true,
-          agent_config_edit: data.agent_config_edit === true,
-          session_event_types: Array.isArray(data.session_event_types)
-            ? data.session_event_types.filter((t): t is string => typeof t === "string")
-            : [],
-          session_claude_sdk_clear: data.session_claude_sdk_clear === true,
-          session_rewind: data.session_rewind === true,
-          session_pull_requests: data.session_pull_requests === true,
-          session_journal: data.session_journal === true,
-          workflows: data.workflows === true,
-          workflow_sharing: data.workflow_sharing === true,
-          session_title_instructions: data.session_title_instructions === true,
-          admin_view: data.admin_view === true,
-          comment_anchor_metadata: data.comment_anchor_metadata === true,
-          filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
-          scheduled_task_projects: data.scheduled_task_projects === true,
-          scheduled_task_inbox: data.scheduled_task_inbox === true,
-          scheduled_task_sharing: data.scheduled_task_sharing === true,
-          inbox_items_available: data.inbox_items_available === true,
-          scheduled_task_shared_with_me: data.scheduled_task_shared_with_me === true,
-          scheduled_task_run_pull_requests: data.scheduled_task_run_pull_requests === true,
-          scheduled_task_clone: data.scheduled_task_clone === true,
-          proactive_agent_available: data.proactive_agent_available === true,
-          scheduled_task_harness_settings: data.scheduled_task_harness_settings === true,
-          scheduled_task_approval_skipping_modes:
-            data.scheduled_task_approval_skipping_modes === true,
-          branding: parseBranding(data.branding),
-          attachment_limits: parseAttachmentLimits(data.attachment_limits),
-          picker: parsePicker(data.picker),
-        };
-        return cachedServerInfo;
-      }
-    } catch {
-      // Network failure — fall through to the off sentinel.
+    const fresh = await fetchServerInfo();
+    if (generation !== serverInfoGeneration && cachedServerInfo !== null) {
+      return cachedServerInfo;
     }
-    cachedServerInfo = FALLBACK_SERVER_INFO;
+    cachedServerInfo = fresh ?? FALLBACK_SERVER_INFO;
     return cachedServerInfo;
   })();
   return pendingServerInfo;
+}
+
+/**
+ * Re-fetch ``/v1/info`` bypassing the startup memo and push the fresh payload
+ * to subscribers (e.g. ``CapabilitiesProvider``) so settings changes apply in
+ * the active tab without a reload or server restart. Concurrent refreshes are
+ * serialized by generation so an older slower response never overwrites a
+ * newer one, and a failed refresh keeps the last known cached info intact.
+ */
+export async function refreshServerInfo(): Promise<ServerInfo | null> {
+  const generation = ++serverInfoGeneration;
+  const fresh = await fetchServerInfo();
+  if (fresh === null || generation !== serverInfoGeneration) {
+    return null;
+  }
+  cachedServerInfo = fresh;
+  pendingServerInfo = Promise.resolve(fresh);
+  notifyServerInfo(fresh);
+  return fresh;
 }
 
 /**

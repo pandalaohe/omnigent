@@ -19,7 +19,7 @@ import asyncio
 from typing import Any
 
 from fastapi import APIRouter, Request
-from pydantic import BaseModel, StrictBool
+from pydantic import BaseModel, StrictBool, StrictInt
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import (
@@ -29,12 +29,18 @@ from omnigent.server.auth import (
     local_single_user_enabled,
 )
 from omnigent.server.routes._auth_helpers import get_user_id
+from omnigent.server.server_config import (
+    MAX_ADMIN_ATTACHMENT_FILE_BYTES,
+    attachment_upload_request_limit,
+    filesystem_attachment_upload_limit,
+)
 from omnigent.server.sharing_settings import (
     DefaultPublicSessions,
     PublicSharingMaxLevel,
     SiblingSessionDestinations,
     peer_session_messaging_available,
     peer_session_messaging_enabled,
+    write_attachment_max_file_bytes_override,
     write_default_public_sessions_override,
     write_peer_session_messaging_override,
     write_public_sharing_max_level_override,
@@ -66,6 +72,7 @@ class SetSharingRequest(BaseModel):
     default_public_sessions: str | None = None
     peer_session_messaging: StrictBool | None = None
     sibling_session_destinations: str | None = None
+    attachment_max_file_bytes: StrictInt | None = None
 
 
 def _state_response(request: Request) -> dict[str, Any]:
@@ -101,6 +108,9 @@ def _state_response(request: Request) -> dict[str, Any]:
         "sibling_session_destinations": state.sibling_session_destinations().value,
         "sibling_session_destinations_editable": True,
         "sibling_session_destinations_options": [p.value for p in SiblingSessionDestinations],
+        "attachment_max_file_bytes": filesystem_attachment_upload_limit(),
+        "attachment_max_upload_bytes": attachment_upload_request_limit(),
+        "attachment_max_file_bytes_editable": True,
     }
 
 
@@ -151,6 +161,7 @@ def create_sharing_router(
         """
         await _require_admin(request, auth_provider, permission_store)
         state = request.app.state
+        attachment_limit_supplied = "attachment_max_file_bytes" in body.model_fields_set
         if (
             body.sharing_mode is None
             and body.public_sharing is None
@@ -158,6 +169,7 @@ def create_sharing_router(
             and body.default_public_sessions is None
             and body.peer_session_messaging is None
             and body.sibling_session_destinations is None
+            and not attachment_limit_supplied
         ):
             raise OmnigentError(
                 "No sharing settings to update.",
@@ -249,6 +261,18 @@ def create_sharing_router(
                     + ".",
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
+        attachment_limit_target: int | None = None
+        if attachment_limit_supplied:
+            raw_limit = body.attachment_max_file_bytes
+            if raw_limit is not None and (
+                raw_limit < 0 or raw_limit > MAX_ADMIN_ATTACHMENT_FILE_BYTES
+            ):
+                raise OmnigentError(
+                    "Attachment size limit must be zero (unlimited) or at most "
+                    f"{MAX_ADMIN_ATTACHMENT_FILE_BYTES // (1024 * 1024)} MB.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            attachment_limit_target = None if raw_limit in (None, 0) else raw_limit
         # All checks passed — apply the writes.
         if mode is not None:
             await asyncio.to_thread(write_sharing_mode_override, mode)
@@ -265,6 +289,10 @@ def create_sharing_router(
         if sibling_destinations is not None:
             await asyncio.to_thread(
                 write_sibling_session_destinations_override, sibling_destinations
+            )
+        if attachment_limit_supplied:
+            await asyncio.to_thread(
+                write_attachment_max_file_bytes_override, attachment_limit_target
             )
         return _state_response(request)
 

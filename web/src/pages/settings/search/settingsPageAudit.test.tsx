@@ -70,6 +70,7 @@ const SERVER_INFO: ServerInfo = {
   session_title_instructions: true,
   agent_install: true,
   agent_detail: true,
+  attachment_limits: { file_bytes: 500 * 1024 * 1024, upload_bytes: 2 * 1024 ** 3 },
   features: { custom_agents_settings_ui: true },
 } as ServerInfo;
 
@@ -158,6 +159,8 @@ const SHARING_BODY = {
   sibling_session_destinations: "any_host",
   sibling_session_destinations_editable: true,
   sibling_session_destinations_options: ["current_host", "current_host_or_new_sandbox", "any_host"],
+  attachment_max_file_bytes: 500 * 1024 * 1024,
+  attachment_max_file_bytes_editable: true,
 };
 
 const ROUTES: readonly SettingsRoute[] = [

@@ -1,6 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   parseSiblingSessionDestinations,
+  patchCachedServerInfo,
+  refreshServerInfo,
   type SharingMode,
   type SiblingSessionDestinations,
 } from "@/lib/capabilities";
@@ -31,6 +33,11 @@ export interface SharingState {
   sibling_session_destinations: SiblingSessionDestinations;
   sibling_session_destinations_editable: boolean;
   sibling_session_destinations_options: SiblingSessionDestinations[];
+  /** Per-file attachment size cap in bytes (``null`` = unlimited). */
+  attachment_max_file_bytes?: number | null;
+  /** Effective per-request upload ceiling in bytes (``null`` = unlimited). */
+  attachment_max_upload_bytes?: number | null;
+  attachment_max_file_bytes_editable?: boolean;
 }
 
 /** ``off`` = all private, ``sandbox`` = cloud sandbox sessions public, ``all`` = every session. */
@@ -44,6 +51,7 @@ export interface SharingUpdate {
   default_public_sessions?: DefaultPublicSessions;
   peer_session_messaging?: boolean;
   sibling_session_destinations?: SiblingSessionDestinations;
+  attachment_max_file_bytes?: number | null;
 }
 
 const QUERY_KEY = ["sharing"];
@@ -122,6 +130,24 @@ export function useSetSharing() {
       );
       queryClient.setQueryData(PUBLIC_MAX_LEVEL_QUERY_KEY, data.public_sharing_max_level ?? "read");
       void queryClient.invalidateQueries({ queryKey: QUERY_KEY });
+      if (
+        data.attachment_max_file_bytes !== undefined ||
+        data.attachment_max_upload_bytes !== undefined
+      ) {
+        patchCachedServerInfo((prev) => ({
+          ...prev,
+          attachment_limits: {
+            ...prev.attachment_limits,
+            ...(data.attachment_max_file_bytes !== undefined
+              ? { file_bytes: data.attachment_max_file_bytes }
+              : {}),
+            ...(data.attachment_max_upload_bytes !== undefined
+              ? { upload_bytes: data.attachment_max_upload_bytes }
+              : {}),
+          },
+        }));
+      }
+      void refreshServerInfo();
     },
   });
 }

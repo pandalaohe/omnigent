@@ -526,6 +526,9 @@ class ServerInfoResponse(BaseModel):
     # ``None`` = unlimited). Deployment settings plus the fixed inline caps;
     # see :func:`omnigent.server.server_config.attachment_limits`.
     attachment_limits: dict[str, int | None]
+    # Server routes oversized inline attachments to filesystem delivery and
+    # exposes the admin attachment-limit setting on ``/v1/sharing``.
+    attachment_oversize_to_filesystem: bool = False
     picker: PickerInfo = PickerInfo()
 
 
@@ -5160,6 +5163,7 @@ def create_app(
                 "automation_trigger_poll_minutes": trigger_poll_minutes,
                 "branding": branding_snapshot.config(),
                 "attachment_limits": attachment_limits(),
+                "attachment_oversize_to_filesystem": True,
                 "picker": picker_curation.config(),
             }
         )

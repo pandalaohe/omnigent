@@ -52,6 +52,14 @@ _PUBLIC_SHARING_MAX_LEVEL_FILE = "public_sharing_max_level"
 _DEFAULT_PUBLIC_SESSIONS_FILE = "default_public_sessions"
 _PEER_SESSION_MESSAGING_FILE = "peer_session_messaging"
 _SIBLING_SESSION_DESTINATIONS_FILE = "sibling_session_destinations"
+_ATTACHMENT_MAX_FILE_BYTES_FILE = "attachment_max_file_bytes"
+
+
+class _UnsetType:
+    """Sentinel distinguishing an absent override file from an explicit ``None`` (unlimited)."""
+
+
+ATTACHMENT_LIMIT_UNSET = _UnsetType()
 # Public sharing is enabled unless a value explicitly says otherwise, so a typo
 # or a stray value fails OPEN (never silently disables a working feature).
 _PUBLIC_FALSY = ("0", "false", "no", "off")
@@ -403,6 +411,48 @@ def read_sibling_session_destinations_override() -> SiblingSessionDestinations |
 
 def write_sibling_session_destinations_override(policy: SiblingSessionDestinations) -> None:
     _write_override_text(resolve_data_dir() / _SIBLING_SESSION_DESTINATIONS_FILE, policy.value)
+
+
+def read_attachment_max_file_bytes_override() -> int | _UnsetType | None:
+    """Return the admin-set per-file attachment byte limit override.
+
+    Returns :data:`ATTACHMENT_LIMIT_UNSET` when no override file is present or
+    its contents are empty/invalid (caller falls back to ``config.yaml``),
+    ``None`` for an explicit ``0`` (unlimited), or a positive byte count.
+    """
+    try:
+        raw = _read_override_text(
+            resolve_data_dir() / _ATTACHMENT_MAX_FILE_BYTES_FILE,
+            use_cache=False,
+        )
+    except UnicodeError:
+        logger.warning("Ignoring non-UTF-8 attachment_max_file_bytes override")
+        return ATTACHMENT_LIMIT_UNSET
+    if not raw:
+        return ATTACHMENT_LIMIT_UNSET
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid attachment_max_file_bytes override %r", raw)
+        return ATTACHMENT_LIMIT_UNSET
+    if value < 0:
+        logger.warning("Ignoring negative attachment_max_file_bytes override %r", raw)
+        return ATTACHMENT_LIMIT_UNSET
+    return None if value == 0 else value
+
+
+def write_attachment_max_file_bytes_override(max_bytes: int | None) -> None:
+    """Persist the admin per-file attachment byte limit atomically.
+
+    ``None`` or ``0`` records ``0`` (unlimited); positive integers record the
+    exact byte cap.
+    """
+    if max_bytes is not None and (
+        isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0
+    ):
+        raise ValueError("attachment_max_file_bytes must be a non-negative integer or None")
+    stored = 0 if max_bytes is None else max_bytes
+    _write_override_text(resolve_data_dir() / _ATTACHMENT_MAX_FILE_BYTES_FILE, str(stored))
 
 
 def default_public_policy(state: Any) -> DefaultPublicSessions:

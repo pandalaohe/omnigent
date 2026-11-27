@@ -42,7 +42,20 @@ export const NESTED_AGENT_DESTINATIONS_ENTRY = settingsEntry({
   overlays: { "": {} },
 });
 
+export const ATTACHMENT_SIZE_LIMIT_ENTRY = settingsEntry({
+  id: "attachment-size-limit",
+  section: "admin",
+  label: "Attachment size limit",
+  description:
+    "Maximum size per uploaded file in MB (0 for unlimited). Files above the inline budget are delivered to the agent as workspace files when supported.",
+  keywords: ["attachment", "upload", "file size", "limit", "mb", "pdf", "image", "server"],
+  parts: {
+    save: "Save",
+  },
+});
+
 export const ADMIN_SETTINGS = [
   PROACTIVE_AGENT_WORKSPACE_ENTRY,
   NESTED_AGENT_DESTINATIONS_ENTRY,
+  ATTACHMENT_SIZE_LIMIT_ENTRY,
 ] as const;

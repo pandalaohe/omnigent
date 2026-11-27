@@ -15,10 +15,17 @@ const mocks = vi.hoisted(() => ({
   nestedAgents: true,
   advisorAvailable: false,
   advisor: undefined as { can_manage_workspace: boolean } | undefined,
+  attachmentLimits: undefined as { file_bytes?: number | null } | undefined,
+  attachmentOversizeToFilesystem: false,
 }));
 vi.mock("@/hooks/useIsAdmin", () => ({ useIsAdmin: () => mocks.isAdmin }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
-  useServerInfo: () => ({ single_user: mocks.singleUser, sibling_sessions: mocks.nestedAgents }),
+  useServerInfo: () => ({
+    single_user: mocks.singleUser,
+    sibling_sessions: mocks.nestedAgents,
+    attachment_limits: mocks.attachmentLimits,
+    attachment_oversize_to_filesystem: mocks.attachmentOversizeToFilesystem,
+  }),
 }));
 vi.mock("@/hooks/useSharing", () => ({ useSharing: vi.fn(), useSetSharing: vi.fn() }));
 vi.mock("@/hooks/useProactiveAgentSettings", () => ({
@@ -54,6 +61,8 @@ beforeEach(() => {
   mocks.nestedAgents = true;
   mocks.advisorAvailable = false;
   mocks.advisor = undefined;
+  mocks.attachmentLimits = undefined;
+  mocks.attachmentOversizeToFilesystem = false;
   vi.mocked(useSharing).mockReturnValue({
     data: {
       sibling_session_destinations: "any_host",
@@ -63,6 +72,8 @@ beforeEach(() => {
         "current_host_or_new_sandbox",
         "any_host",
       ],
+      attachment_max_file_bytes: 500 * 1024 * 1024,
+      attachment_max_file_bytes_editable: true,
     },
   } as never);
   vi.mocked(useSetSharing).mockReturnValue({ mutate, isPending: false } as never);
@@ -153,5 +164,74 @@ describe("AdminGeneralPage", () => {
     expect(screen.queryByRole("option", { name: /Current host or new sandbox/ })).toBeNull();
     fireEvent.click(await screen.findByRole("option", { name: /Current host only/ }));
     expect(screen.getByRole("alert")).toHaveTextContent("Save failed");
+  });
+
+  it("shows and saves the attachment size limit even when nested agents and advisor are off", () => {
+    mocks.nestedAgents = false;
+    mocks.attachmentLimits = { file_bytes: 500 * 1024 * 1024 };
+    mocks.attachmentOversizeToFilesystem = true;
+    mutate.mockImplementationOnce((_value, { onSuccess }) => onSuccess());
+    renderPage();
+
+    const input = screen.getByRole("spinbutton", { name: "Attachment size limit" });
+    expect(input).toHaveValue(500);
+    const save = screen.getByRole("button", { name: "Save" });
+    expect(save).toBeDisabled();
+
+    fireEvent.change(input, { target: { value: "250" } });
+    expect(save).toBeEnabled();
+    fireEvent.click(save);
+    expect(mutate).toHaveBeenCalledWith(
+      { attachment_max_file_bytes: 250 * 1024 * 1024 },
+      expect.anything(),
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("Saved");
+  });
+
+  it("accepts 0 for unlimited and rejects invalid attachment limit values", () => {
+    mocks.attachmentLimits = { file_bytes: 500 * 1024 * 1024 };
+    mocks.attachmentOversizeToFilesystem = true;
+    renderPage();
+
+    const input = screen.getByRole("spinbutton", { name: "Attachment size limit" });
+    const save = screen.getByRole("button", { name: "Save" });
+
+    fireEvent.change(input, { target: { value: "-5" } });
+    fireEvent.click(save);
+    expect(mutate).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert")).toHaveTextContent("whole number of MB");
+
+    fireEvent.change(input, { target: { value: "0" } });
+    fireEvent.click(save);
+    expect(mutate).toHaveBeenCalledWith({ attachment_max_file_bytes: 0 }, expect.anything());
+  });
+
+  it("hides attachment limit when the server omits editability and guards unmodified Enter on sub-MB caps", () => {
+    mocks.attachmentLimits = { file_bytes: 256 * 1024 };
+    mocks.attachmentOversizeToFilesystem = true;
+    const state = vi.mocked(useSharing)().data!;
+    vi.mocked(useSharing).mockReturnValueOnce({
+      data: {
+        ...state,
+        attachment_max_file_bytes: undefined,
+        attachment_max_file_bytes_editable: undefined,
+      },
+    } as never);
+    renderPage();
+    expect(screen.queryByRole("spinbutton", { name: "Attachment size limit" })).toBeNull();
+    cleanup();
+
+    vi.mocked(useSharing).mockReturnValue({
+      data: {
+        ...state,
+        attachment_max_file_bytes: 256 * 1024,
+        attachment_max_file_bytes_editable: true,
+      },
+    } as never);
+    renderPage();
+    const input = screen.getByRole("spinbutton", { name: "Attachment size limit" });
+    expect(input).toHaveValue(1);
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(mutate).not.toHaveBeenCalled();
   });
 });
