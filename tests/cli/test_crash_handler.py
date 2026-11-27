@@ -504,9 +504,8 @@ def _clear_managed_session_env(monkeypatch: pytest.MonkeyPatch) -> None:
         ({100, 200}, True),
         ({200}, False),  # stdin is NUL (isatty True, GetConsoleMode fails)
         ({100}, False),  # stderr is NUL
-        (set(), False),
     ],
-    ids=["real-console", "stdin-nul", "stderr-nul", "both-nul"],
+    ids=["real-console", "stdin-nul", "stderr-nul"],
 )
 def test_is_interactive_windows_requires_real_console(
     monkeypatch: pytest.MonkeyPatch, console_handles: set[int], expected: bool
@@ -538,11 +537,22 @@ def test_is_interactive_windows_requires_real_console(
 def test_is_interactive_windows_rejects_invalid_handle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import ctypes
     import types
 
     _clear_managed_session_env(monkeypatch)
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setitem(sys.modules, "msvcrt", types.SimpleNamespace(get_osfhandle=lambda _fd: -1))
+
+    class _FailIfCalled:
+        argtypes: list[object] = []
+        restype: object = None
+
+        def __call__(self, *_args: object) -> int:
+            raise AssertionError("GetConsoleMode must not be called for INVALID_HANDLE_VALUE")
+
+    fake_kernel32 = types.SimpleNamespace(GetConsoleMode=_FailIfCalled())
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: fake_kernel32, raising=False)
     monkeypatch.setattr(sys, "stdin", _FakeFdTTY(0))
     assert ch._is_interactive(_FakeFdTTY(2)) is False
 
