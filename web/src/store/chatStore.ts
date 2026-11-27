@@ -10071,6 +10071,7 @@ function committedUserBlock(
   createdAtS?: number,
   webStableId?: string,
   deliveryUnconfirmed = false,
+  runtimeNotice = false,
 ): UserMessageBlock {
   return {
     type: "user_message",
@@ -10093,6 +10094,7 @@ function committedUserBlock(
     },
     content,
     stableKey,
+    ...(runtimeNotice ? { runtimeNotice: true as const } : {}),
   };
 }
 
@@ -10389,7 +10391,10 @@ function recoveredPendingInputPatch(
       at = state.pendingUserMessages.findIndex(
         (p) => eligible(p) && messageContentText(p.content) === text,
       );
-    } else if (block.type === "user_message" && !isSystemUserContent(block.content)) {
+    } else if (
+      block.type === "user_message" &&
+      !isSystemUserContent(block.content, block.runtimeNotice)
+    ) {
       at = state.pendingUserMessages.findIndex(
         (p) => eligible(p) && block.ctx.itemId && (p.stableId ?? p.tempId) === block.ctx.itemId,
       );
@@ -11401,6 +11406,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       //      client).
       applyToConversation((s) => {
         const eventContent = userContentFromEvent(event);
+        const runtimeNotice = event.data.runtime_notice === true;
         const pendingHead = s.pendingUserMessages.find((p) => !p.standaloneSkill);
         // Bare envelopes typed in the terminal must not consume unrelated web input.
         const unmatchedEnvelope =
@@ -11447,7 +11453,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // by user]` record) is synthesized by the CLI, owns no pending entry,
           // and arrives with clearedPendingId unset; dropping the head would
           // steal a real queued message's bubble. Hold the head back for a marker.
-          if (unmatchedEnvelope || (eventContent !== null && isSystemUserContent(eventContent))) {
+          if (
+            unmatchedEnvelope ||
+            (eventContent !== null && isSystemUserContent(eventContent, runtimeNotice))
+          ) {
             return {};
           }
           if (!pendingHead || pendingHead.initialDraft || pendingHead.beforePost) return {};
@@ -11484,6 +11493,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                   matched.createdAtS,
                   alias,
                   deliveryUnconfirmed,
+                  runtimeNotice,
                 ),
               ),
             };
@@ -11502,7 +11512,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           settledShell ||
           alias ||
           unmatchedEnvelope ||
-          (eventContent !== null && isSystemUserContent(eventContent)) ||
+          (eventContent !== null && isSystemUserContent(eventContent, runtimeNotice)) ||
           pendingHead?.initialDraft ||
           pendingHead?.beforePost
             ? undefined
@@ -11525,6 +11535,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                 matchedHead.createdAtS,
                 alias,
                 deliveryUnconfirmed,
+                runtimeNotice,
               ),
             ),
           };
@@ -11544,6 +11555,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
               undefined,
               alias,
               deliveryUnconfirmed,
+              runtimeNotice,
             ),
           ),
         };

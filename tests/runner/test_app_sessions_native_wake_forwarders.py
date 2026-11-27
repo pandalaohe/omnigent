@@ -33,11 +33,13 @@ class _WakePost:
         ``"/v1/sessions/0349c7f62dcaa06b868e9c088c39f062/events"``.
     :param notice: The injected notice text pulled out of the request body.
     :param created_by: Optional attribution actor sent with the wake notice.
+    :param runtime_notice: Whether the body marked the message as a runtime notice.
     """
 
     url: str
     notice: str
     created_by: str | None = None
+    runtime_notice: bool = False
 
 
 class _QueuedResponseServerClient:
@@ -81,6 +83,7 @@ class _QueuedResponseServerClient:
                 url=url,
                 notice=notice,
                 created_by=created_by if isinstance(created_by, str) else None,
+                runtime_notice=json["data"].get("runtime_notice") is True,
             )
         )
         assert self._responses, (
@@ -168,6 +171,7 @@ async def test_wake_post_carries_dispatch_actor() -> None:
     assert delivered is True
     assert len(client.calls) == 1
     assert client.calls[0].created_by == "bob@example.com"
+    assert client.calls[0].runtime_notice is True
 
 
 async def test_wake_post_retries_without_actor_when_attribution_is_rejected() -> None:

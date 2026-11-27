@@ -2171,7 +2171,11 @@ async def _deliver_subagent_wake_post(
         failed (transport error, timeout, or non-2xx response).
     """
     attribution_created_by = created_by
-    message = {"role": "user", "content": [{"type": "input_text", "text": notice}]}
+    message = {
+        "role": "user",
+        "content": [{"type": "input_text", "text": notice}],
+        "runtime_notice": True,
+    }
     if workflow_answer_id is not None:
         from omnigent.entities.workflow_questions import workflow_answer_input_id
 

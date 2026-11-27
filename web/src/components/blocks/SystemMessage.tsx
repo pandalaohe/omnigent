@@ -6,6 +6,7 @@ import {
   ChevronRightIcon,
   InfoIcon,
   MessageCircleIcon,
+  ShieldQuestionIcon,
   TerminalIcon,
   type LucideIcon,
 } from "lucide-react";
@@ -24,6 +25,7 @@ const KIND_ICON: Record<
   terminal_idle: TerminalIcon,
   interrupted: BanIcon,
   peer_outcome: MessageCircleIcon,
+  approval_offered: ShieldQuestionIcon,
   generic: InfoIcon,
 };
 
@@ -81,7 +83,7 @@ export function SystemMessageView({ message }: SystemMessageViewProps) {
           aria-expanded={open}
         >
           <Icon className="size-3.5 shrink-0" />
-          <span className="min-w-0">
+          <span className="min-w-0 truncate" title={message.label}>
             <strong className="font-semibold">System:</strong> {message.label}
           </span>
           <ChevronRightIcon
@@ -91,6 +93,7 @@ export function SystemMessageView({ message }: SystemMessageViewProps) {
       ) : (
         <div className="flex min-w-0 max-w-full items-center gap-1.5 px-1.5 py-0.5">
           <Icon className="size-3.5 shrink-0" />
+          {/* Nothing to expand, so the whole label wraps instead of truncating. */}
           <span className="min-w-0">
             <strong className="font-semibold">System:</strong> {message.label}
           </span>

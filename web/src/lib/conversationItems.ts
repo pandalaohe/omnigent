@@ -35,6 +35,8 @@ export interface MessageItem extends BaseItem {
   /** Explicit user action, possibly server-expanded skill instructions.
    * Independent of is_meta; client-settable by convention, not a trust signal. */
   user_authored?: boolean;
+  /** A notice the runtime posted on its own (approval offer, wake); renders as a compact row. */
+  runtime_notice?: boolean;
   /** Hidden durable context such as injected skill instructions. */
   is_meta?: boolean;
   /** Server-authored session handover note. */

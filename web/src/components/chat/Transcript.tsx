@@ -286,7 +286,8 @@ function TranscriptImpl({
     const ids = new Set<string>();
     for (const block of blocks) {
       if (
-        ((block.type === "user_message" && !isSystemUserContent(block.content)) ||
+        ((block.type === "user_message" &&
+          !isSystemUserContent(block.content, block.runtimeNotice)) ||
           isTerminalCommandInput(block)) &&
         block.ctx.itemId !== null
       ) {

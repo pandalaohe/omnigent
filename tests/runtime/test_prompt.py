@@ -109,6 +109,24 @@ def test_framework_notice_is_system_context_not_user_text() -> None:
     ]
 
 
+def test_runtime_notice_mark_stays_out_of_model_input() -> None:
+    text = "[System: approval offered. Pass it on.\n{}]"
+    data = MessageData(role="user", content=[{"type": "input_text", "text": text}])
+    item = ConversationItem(
+        id="i1",
+        status="completed",
+        response_id="r1",
+        created_at=1,
+        type="message",
+        data=data.model_copy(update={"runtime_notice": True}),
+    )
+    assert item.data.model_dump(mode="json")["runtime_notice"] is True
+    assert "runtime_notice" not in data.model_dump(mode="json")
+    assert history_to_input_items([item]) == [
+        {"role": "user", "content": [{"type": "input_text", "text": text}]}
+    ]
+
+
 def test_authored_notice_cannot_be_loaded_as_message_data() -> None:
     from pydantic import ValidationError
 

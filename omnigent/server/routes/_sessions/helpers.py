@@ -5256,11 +5256,11 @@ def _parse_external_conversation_item(
             code=ErrorCode.INVALID_INPUT,
         )
     if item_type == "message":
-        # Admission receipts and the handover route own these markers.
+        # Admission receipts, the handover route and pending notices own these markers.
         item_data = {
             key: value
             for key, value in item_data.items()
-            if key not in {"auto_retry", "is_handover_note"}
+            if key not in {"auto_retry", "is_handover_note", "runtime_notice"}
         }
     response_id = body.data.get("response_id")
     if response_id is None:
@@ -10610,8 +10610,11 @@ def _stable_id_reuse_is_exact_retry(
             f"stable_id {item.stable_id!r} already names another author's item in this session",
             code=ErrorCode.CONFLICT,
         )
+    # The display-only notice mark does not change a retry's identity.
     persisted_payload = persisted.data.model_dump(mode="json", by_alias=True)
     request_payload = item.data.model_dump(mode="json", by_alias=True)
+    persisted_payload.pop("runtime_notice", None)
+    request_payload.pop("runtime_notice", None)
     return persisted.type == item.type and persisted_payload == request_payload
 
 

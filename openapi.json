@@ -8693,6 +8693,12 @@
             "title": "Role",
             "type": "string"
           },
+          "runtime_notice": {
+            "default": false,
+            "description": "`True` for a user-role notice the runtime posted on its own (approval offer, wake or status notice), not text a person typed. Display-only: clients render it as a compact row; the model sees the text.",
+            "title": "Runtime Notice",
+            "type": "boolean"
+          },
           "startup_options": {
             "anyOf": [
               {
@@ -17095,6 +17101,12 @@
             ],
             "title": "Role",
             "type": "string"
+          },
+          "runtime_notice": {
+            "default": false,
+            "description": "`True` for a notice the runtime posted on its own, rendered as a compact row; omitted when `False`.",
+            "title": "Runtime Notice",
+            "type": "boolean"
           },
           "startup_options": {
             "anyOf": [

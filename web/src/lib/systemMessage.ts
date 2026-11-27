@@ -59,6 +59,7 @@ export type SystemMessageKind =
   | "interrupted"
   | "peer_outcome"
   | "question_answer"
+  | "approval_offered"
   | "generic";
 
 export interface QuestionAnswer {
@@ -149,7 +150,7 @@ export function parseSystemMessage(text: string): ParsedSystemMessage | null {
   }
 
   const headerMatch = HEADER_RE.exec(firstLine);
-  if (!headerMatch) return null;
+  if (!headerMatch) return parseNoticeEnvelope(text);
   const inner = headerMatch[1];
 
   if (inner === "Question answered" || /^answers to your question card #q[\da-f]+$/.test(inner)) {
@@ -251,6 +252,63 @@ export function parseSystemMessage(text: string): ParsedSystemMessage | null {
   // Known prefix, unknown pattern — still treat as a system marker so new
   // producers get the muted styling without an web change.
   return { kind: "generic", label: inner, body };
+}
+
+const NOTICE_OPEN = "[System: ";
+const APPROVAL_OFFERED_PREFIX = "approval offered.";
+const NOTICE_LABEL_MAX = 80;
+
+function noticeLabel(line: string): string {
+  return line.length > NOTICE_LABEL_MAX ? `${line.slice(0, NOTICE_LABEL_MAX)}…` : line;
+}
+
+/**
+ * A notice whose header spans several lines, e.g. an approval offer:
+ * `[System: approval offered. <sentence>\n<json>]`. Only the runtime's whole
+ * envelope counts — open with `[System: ` and close with `]` — so an unclosed
+ * hand-typed `[System: …` stays an ordinary message. The body is the full text.
+ */
+function parseNoticeEnvelope(text: string): ParsedSystemMessage | null {
+  const trimmed = text.trimEnd();
+  if (!trimmed.startsWith(NOTICE_OPEN) || !trimmed.endsWith("]")) return null;
+  const inner = trimmed.slice(NOTICE_OPEN.length, -1);
+  const firstLine = inner.split("\n", 1)[0]!.trim();
+  if (!firstLine) return null;
+  if (firstLine.startsWith(APPROVAL_OFFERED_PREFIX)) {
+    return { kind: "approval_offered", label: approvalOfferLabel(inner), body: text };
+  }
+  return { kind: "generic", label: noticeLabel(firstLine), body: text };
+}
+
+/** "Approval request · <session title> · <tool>" from an offer's JSON line. */
+function approvalOfferLabel(inner: string): string {
+  const parts = ["Approval request"];
+  try {
+    const data: unknown = JSON.parse(inner.slice(inner.lastIndexOf("\n") + 1));
+    if (data && typeof data === "object" && !Array.isArray(data)) {
+      const { session_title: title, tool } = data as Record<string, unknown>;
+      if (typeof title === "string" && title) parts.push(noticeLabel(title));
+      if (typeof tool === "string" && tool) parts.push(tool);
+    }
+  } catch {
+    // An offer without readable data keeps the kind label alone.
+  }
+  return parts.join(" · ");
+}
+
+/**
+ * Row content for an item the server marked as a runtime notice
+ * (`runtime_notice`). Falls back to the first line when the text matches no
+ * known notice shape, so a new producer still renders compactly.
+ *
+ * :param text: The notice's text.
+ * :returns: The parsed notice.
+ */
+export function runtimeNoticeMessage(text: string): ParsedSystemMessage {
+  const parsed = parseSystemMessage(text);
+  if (parsed) return parsed;
+  const firstLine = text.trim().split("\n", 1)[0] ?? "";
+  return { kind: "generic", label: noticeLabel(firstLine) || "Notice", body: text };
 }
 
 function parseQuestionAnswers(
@@ -386,9 +444,14 @@ export function withoutAttachedMarkers(text: string): string {
  * (loader counting markers the rail drops) can wedge the rail hidden.
  *
  * :param content: A user message block's content array.
+ * :param runtimeNotice: The server marked the message as a runtime notice.
  * :returns: ``true`` for a system marker, ``false`` for a real user message.
  */
-export function isSystemUserContent(content: MessageContentBlock[]): boolean {
+export function isSystemUserContent(
+  content: MessageContentBlock[],
+  runtimeNotice = false,
+): boolean {
+  if (runtimeNotice) return true;
   const hasAttachments = content.some((c) => c.type === "input_image" || c.type === "input_file");
   if (hasAttachments) return false;
   const text = withoutAttachedMarkers(

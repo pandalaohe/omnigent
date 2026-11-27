@@ -14040,6 +14040,36 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(state.blocks[0]).toBe(committedMarker);
     });
 
+    it("keeps the pending head when a marked runtime notice is consumed", () => {
+      // A server notice whose text has no `[System: …]` shape still owns no
+      // queued web send; its mark must stop the FIFO fallback taking one.
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [
+          { tempId: "pend_real", content: [{ type: "input_text", text: "still sending" }] },
+        ],
+      });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_notice",
+        itemType: "message",
+        data: {
+          role: "user",
+          content: [{ type: "input_text", text: "Host load is high; new work may queue." }],
+          runtime_notice: true,
+        },
+      });
+
+      const state = useChatStore.getState();
+      expect(state.pendingUserMessages).toEqual([
+        { tempId: "pend_real", content: [{ type: "input_text", text: "still sending" }] },
+      ]);
+      expect(state.blocks).toMatchObject([
+        { type: "user_message", ctx: { itemId: "msg_notice" }, runtimeNotice: true },
+      ]);
+    });
+
     it("threads the event's createdBy onto the promoted committed block", () => {
       // Multi-user attribution: the consumed event carries the human
       // author; the promoted block's ctx.createdBy must reflect it so

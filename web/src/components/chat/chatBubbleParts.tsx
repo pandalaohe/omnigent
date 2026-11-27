@@ -70,6 +70,7 @@ import { ActivityNotice } from "@/components/blocks/TaskActivityMessage";
 import {
   isSystemUserContent,
   parseSystemMessage,
+  runtimeNoticeMessage,
   stripAutomationContext,
 } from "@/lib/systemMessage";
 import { parsePeerMessage } from "@/lib/peerMessage";
@@ -913,7 +914,7 @@ export function shouldShowWorkingIndicator(showsWorking: boolean, bubbles: Bubbl
  */
 export function isSystemBubble(bubble: Bubble): boolean {
   if (bubble.kind !== "user") return false;
-  return isSystemUserContent(bubble.content);
+  return isSystemUserContent(bubble.content, bubble.runtimeNotice);
 }
 
 function CompactionLoadingIndicator({ createdAtS }: { createdAtS?: number }) {
@@ -1331,6 +1332,8 @@ function UserBubble({
   }
   // Render intact peer envelopes and pure runtime notifications in their existing rows.
   if (annotation === null && images.length === 0 && fileChips.length === 0) {
+    // The server's runtime-notice mark wins over text shape.
+    if (bubble.runtimeNotice) return <SystemMessageView message={runtimeNoticeMessage(text)} />;
     const peerMessage = parsePeerMessage(text);
     if (peerMessage) {
       return (
