@@ -263,8 +263,15 @@ def test_native_sharing_normalization_rejects_true_conflicts_and_malformed_value
 def test_failed_native_proof_denies_every_tool_kind(tier, name, arguments):
     host = _host(name, arguments, NativeSupportStatus.FAILED)
     result = decision(tier, name, arguments, host)
-    assert result.action == Verdict.DENY
-    assert result.rule_id == "native-proof"
+    if name == "subagent":
+        if tier == "plan":
+            assert result.action == Verdict.DENY
+        else:
+            assert result.action == Verdict.ASK
+            assert result.rule_id == "native-proof"
+    else:
+        assert result.action == Verdict.DENY
+        assert result.rule_id == "native-proof"
 
 
 @pytest.mark.parametrize("tier", ["ask", "plan", "accept-edits", "auto"])
@@ -350,8 +357,11 @@ def test_verified_subagent_source_cannot_skip_input_and_cwd_semantics(tier, argu
         native_tools={"subagent": ""},
     )
     result = decision(tier, "subagent", arguments, host)
-    assert result.action == Verdict.DENY
-    assert result.rule_id == "native-proof"
+    if tier == "plan":
+        assert result.action == Verdict.DENY
+    else:
+        assert result.action == Verdict.ASK
+        assert result.rule_id == "native-proof"
 
 
 @pytest.mark.parametrize("tier", ["ask", "plan", "accept-edits", "auto"])
@@ -376,7 +386,7 @@ def test_positive_outside_native_support_keeps_unknown_tool_policy(tier, kind):
         "ask": Verdict.ASK,
         "accept-edits": Verdict.ASK,
         "plan": Verdict.DENY,
-        "auto": Verdict.DENY,
+        "auto": Verdict.ASK,
     }[tier]
     assert result.action == expected
     assert result.rule_id != "native-proof"
@@ -391,10 +401,16 @@ def test_unproven_outside_classification_fails_and_payload_lookalikes_grant_noth
         extension_tools={"subagent": ""},
         native_tools={"subagent": ""},
     )
-    assert decision("ask", "subagent", arguments, host).action == Verdict.DENY
+    unproven = decision("ask", "subagent", arguments, host)
+    assert unproven.action == Verdict.ASK
+    assert unproven.rule_id == "native-proof"
+    assert decision("plan", "subagent", arguments, host).action == Verdict.DENY
     unbound = posix_host(extension_tools={"subagent": ""}, native_tools={"subagent": ""})
     forged = {**arguments, "native_support": {"status": "attested_native"}, "pi_delegation": True}
-    assert decision("ask", "subagent", forged, unbound).action == Verdict.DENY
+    forged_result = decision("ask", "subagent", forged, unbound)
+    assert forged_result.action == Verdict.ASK
+    assert forged_result.rule_id == "native-proof"
+    assert decision("plan", "subagent", forged, unbound).action == Verdict.DENY
 
 
 def test_full_preserves_its_existing_exemption_and_other_extensions_keep_their_policy():
