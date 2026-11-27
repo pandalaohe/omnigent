@@ -21,7 +21,7 @@ from urllib.parse import quote
 import httpx
 import pytest
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.types import Message, Receive, Scope, Send
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
@@ -5470,6 +5470,311 @@ async def test_filesystem_download_wake_false_does_not_reconnect_asleep_runner(
     assert resp.status_code == 503
     assert resp.json()["error"]["code"] == "runner_unavailable"
     wake.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_filesystem_etag_304_json_and_download_through_server(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+) -> None:
+    """Server proxies ``If-None-Match`` and ``304`` cleanly on both JSON and raw routes."""
+    from omnigent.util.http_etag import if_none_match_matches, workspace_file_etag
+
+    target = tmp_path / "report.md"
+    target.write_text("# Report v1\n" * 200)
+    runner = FastAPI()
+
+    @runner.get(_FS_ROUTE, response_model=None)
+    async def _serve(
+        request: Request,
+        session_id: str,
+        environment_id: str,
+        relative_path: str,
+        download: bool = False,
+    ) -> Response:
+        del session_id, environment_id
+        etag = workspace_file_etag(target.stat())
+        inm = request.headers.get("if-none-match")
+        if download:
+            if if_none_match_matches(inm, etag):
+                return Response(
+                    status_code=304,
+                    headers={"ETag": etag, "Cache-Control": "no-store"},
+                )
+            return FileResponse(
+                target,
+                filename="report.md",
+                headers={"ETag": etag, "Cache-Control": "no-store"},
+            )
+        if if_none_match_matches(inm, etag):
+            return Response(
+                status_code=304,
+                headers={"ETag": etag, "Cache-Control": "private, no-cache"},
+            )
+        body = target.read_text()
+        return JSONResponse(
+            content={
+                "object": "session.environment.filesystem.file_content",
+                "path": relative_path,
+                "content_type": "text/markdown",
+                "encoding": "utf-8",
+                "content": body,
+                "bytes": len(body.encode()),
+                "truncated": False,
+            },
+            headers={"ETag": etag, "Cache-Control": "private, no-cache"},
+        )
+
+    json_url = (
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+        "/filesystem/report.md"
+    )
+    raw_url = f"{json_url}?download=true&wake=false"
+
+    async with _runner_app_client(runner):
+        # JSON route with gzip accepted: 200 -> 304 (no body, no gzip) -> 200 on edit.
+        r1 = await client.get(json_url, headers={"Accept-Encoding": "gzip, deflate, br"})
+        assert r1.status_code == 200
+        etag1 = r1.headers["etag"]
+        assert etag1.startswith('W/"')
+        assert r1.headers["cache-control"] == "private, no-cache"
+        assert r1.headers["access-control-expose-headers"] == "ETag"
+
+        r2 = await client.get(
+            json_url,
+            headers={"If-None-Match": etag1, "Accept-Encoding": "gzip, deflate, br"},
+        )
+        assert r2.status_code == 304
+        assert r2.content == b""
+        assert r2.headers["etag"] == etag1
+        assert "content-encoding" not in r2.headers
+
+        # Raw download route: 200 -> 304 -> 200 after edit.
+        d1 = await client.get(raw_url)
+        assert d1.status_code == 200
+        assert d1.headers["etag"] == etag1
+        assert d1.headers["access-control-expose-headers"] == "ETag"
+
+        d2 = await client.get(raw_url, headers={"If-None-Match": etag1})
+        assert d2.status_code == 304
+        assert d2.content == b""
+        assert d2.headers["etag"] == etag1
+        assert d2.headers["cache-control"] == "no-store"
+
+        target.write_text("# Report v2\n" * 200)
+        r3 = await client.get(json_url, headers={"If-None-Match": etag1})
+        assert r3.status_code == 200
+        assert r3.json()["content"].startswith("# Report v2")
+        assert r3.headers["etag"] != etag1
+
+
+@pytest.mark.asyncio
+async def test_filesystem_etag_304_over_ws_tunnel(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+) -> None:
+    """Conditional 304 works end-to-end over a remote ``WSTunnelTransport``."""
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.os_env import create_os_environment
+    from omnigent.runner import create_runner_app
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+    from omnigent.runner.transports.ws_tunnel.frames import (
+        HelloFrame,
+        RequestFrame,
+        decode_frame,
+    )
+    from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.runner.transports.ws_tunnel.serve import dispatch_via_asgi
+    from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
+    from tests.runner.helpers import NullServerClient
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "notes.md").write_text("tunnel content v1")
+
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert os_env is not None
+    reg = SessionResourceRegistry()
+    reg._primary_envs["79b22ebd2309e48fdeb450c65611d51b"] = os_env
+    runner_app = create_runner_app(
+        resource_registry=reg,
+        runner_workspace=ws,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    # Wire a real in-process WebSocket runner tunnel (WSTunnelTransport <-> dispatch_via_asgi).
+    tunnel_registry = TunnelRegistry()
+    dispatch_tasks: set[asyncio.Task[None]] = set()
+
+    class _LoopbackRunnerWS:
+        async def send_text(self, text: str) -> None:
+            frame = decode_frame(text)
+            if isinstance(frame, RequestFrame):
+                task = asyncio.create_task(
+                    dispatch_via_asgi(
+                        runner_app,
+                        frame,
+                        lambda out: _deliver_to_server(out),
+                    )
+                )
+                dispatch_tasks.add(task)
+                task.add_done_callback(dispatch_tasks.discard)
+
+        async def close(self, code: int = 1000, reason: str = "") -> None:
+            del code, reason
+
+    async def _deliver_to_server(raw_frame: str) -> None:
+        tunnel_registry.route_response_frame("runner_t1", decode_frame(raw_frame))
+
+    tunnel_session = tunnel_registry.register(
+        "runner_t1",
+        _LoopbackRunnerWS(),  # type: ignore[arg-type]
+        HelloFrame(runner_version="1.0.0", frame_protocol_version=1, connection_id="c1"),
+    )
+
+    async def _drain_outbound() -> None:
+        while True:
+            item = await tunnel_session.outbound_queue.get()
+            if item is None:
+                return
+            await tunnel_session.ws.send_text(item.data)
+
+    drain_task = asyncio.create_task(_drain_outbound())
+
+    json_url = (
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+        "/filesystem/notes.md"
+    )
+    raw_url = f"{json_url}?download=true&wake=false"
+
+    try:
+        async with httpx.AsyncClient(
+            transport=WSTunnelTransport(tunnel_registry, "runner_t1"),
+            base_url="http://runner",
+        ) as tunneled_client:
+            set_runner_router(_FakeRunnerRouter(tunneled_client))  # type: ignore[arg-type]
+
+            t1 = await client.get(json_url)
+            assert t1.status_code == 200
+            etag = t1.headers["etag"]
+            assert etag.startswith('W/"')
+
+            t2 = await client.get(json_url, headers={"If-None-Match": etag})
+            assert t2.status_code == 304
+            assert t2.content == b""
+            assert t2.headers["etag"] == etag
+
+            tr = await client.get(raw_url, headers={"If-None-Match": etag})
+            assert tr.status_code == 304
+            assert tr.content == b""
+            assert tr.headers["etag"] == etag
+
+            (ws / "notes.md").write_text("tunnel content v2")
+            t3 = await client.get(json_url, headers={"If-None-Match": etag})
+            assert t3.status_code == 200
+            assert t3.json()["content"] == "tunnel content v2"
+            assert t3.headers["etag"] != etag
+
+            # Binary file update over the runner tunnel refreshes on ?download=true&wake=false.
+            bin_path = ws / "pic.png"
+            bin_path.write_bytes(b"\x89PNG\r\n\x1a\n\x00v1")
+            bin_url = (
+                "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+                "/filesystem/pic.png?download=true&wake=false"
+            )
+            b1 = await client.get(bin_url)
+            assert b1.status_code == 200
+            assert b1.content == b"\x89PNG\r\n\x1a\n\x00v1"
+            bin_etag1 = b1.headers["etag"]
+
+            b2 = await client.get(bin_url, headers={"If-None-Match": bin_etag1})
+            assert b2.status_code == 304
+            assert b2.content == b""
+
+            bin_path.write_bytes(b"\x89PNG\r\n\x1a\n\x00v2-updated")
+            b3 = await client.get(bin_url, headers={"If-None-Match": bin_etag1})
+            assert b3.status_code == 200
+            assert b3.content == b"\x89PNG\r\n\x1a\n\x00v2-updated"
+            assert b3.headers["etag"] != bin_etag1
+    finally:
+        drain_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await drain_task
+
+
+@pytest.mark.asyncio
+async def test_filesystem_etag_304_asleep_host_fallback(
+    offline_env_client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Asleep-runner host fallback emits weak ETags, strips ``_etag``, and serves 304."""
+    from omnigent.server.routes import _host_filesystem
+    from omnigent.workspace_fs import WorkspaceReader
+
+    ws = tmp_path / "offline_ws"
+    ws.mkdir()
+    (ws / "notes.md").write_text("host fallback v1")
+    reader = WorkspaceReader(ws)
+
+    async def _fake_host_read(
+        *,
+        host_registry: Any,
+        host_conn: Any,
+        op: str,
+        workspace: str,
+        session_id: str,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        del host_registry, host_conn, workspace, session_id
+        assert op == "list_or_read"
+        return reader.list_or_read(
+            str(params.get("path", "")),
+            include_etag=bool(params.get("include_etag", False)),
+            if_none_match=params.get("if_none_match"),
+        )
+
+    monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", _fake_host_read)
+    url = f"/v1/sessions/{_OFFLINE_SESSION}/resources/environments/default/filesystem/notes.md"
+
+    h1 = await offline_env_client.get(url)
+    assert h1.status_code == 200
+    assert h1.json()["content"] == "host fallback v1"
+    assert "_etag" not in h1.json()
+    etag = h1.headers["etag"]
+    assert etag.startswith('W/"')
+
+    h2 = await offline_env_client.get(url, headers={"If-None-Match": etag})
+    assert h2.status_code == 304
+    assert h2.content == b""
+    assert h2.headers["etag"] == etag
+
+    (ws / "notes.md").write_text("host fallback v2")
+    h3 = await offline_env_client.get(url, headers={"If-None-Match": etag})
+    assert h3.status_code == 200
+    assert h3.json()["content"] == "host fallback v2"
+    assert h3.headers["etag"] != etag
+
+    # Mixed-version legacy host ignores include_etag/if_none_match and still serves 200.
+    async def _legacy_host_read(
+        *,
+        host_registry: Any,
+        host_conn: Any,
+        op: str,
+        workspace: str,
+        session_id: str,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        del host_registry, host_conn, op, workspace, session_id
+        return reader.list_or_read(str(params.get("path", "")))
+
+    monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", _legacy_host_read)
+    legacy = await offline_env_client.get(url, headers={"If-None-Match": h3.headers["etag"]})
+    assert legacy.status_code == 200
+    assert legacy.json()["content"] == "host fallback v2"
+    assert "etag" not in legacy.headers
 
 
 @pytest.mark.asyncio
@@ -11393,8 +11698,15 @@ _OFFLINE_WORKSPACE = "/opt/work/project"
 class _OfflineRunnerClient:
     """Runner client whose tunnel is gone, as a sleeping agent's is."""
 
-    async def get(self, url: str, *, params: Any = None, timeout: float | None = None) -> Any:
-        del params, timeout
+    async def get(
+        self,
+        url: str,
+        *,
+        params: Any = None,
+        headers: Any = None,
+        timeout: float | None = None,
+    ) -> Any:
+        del params, headers, timeout
         raise OmnigentError(f"runner is not connected ({url})", code=ErrorCode.RUNNER_UNAVAILABLE)
 
     async def post(self, url: str, **_kwargs: Any) -> Any:

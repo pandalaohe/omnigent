@@ -979,13 +979,9 @@ def _if_none_match_matches(header: str | None, etag: str) -> bool:
     :param etag: The current entity tag, quoted.
     :returns: ``True`` when the client's cached copy is still current.
     """
-    if not header:
-        return False
-    candidates = [candidate.strip() for candidate in header.split(",")]
-    if "*" in candidates:
-        return True
-    # Comparison is weak per RFC 9110: strip the ``W/`` prefix before matching.
-    return any(candidate.removeprefix("W/") == etag for candidate in candidates)
+    from omnigent.util.http_etag import if_none_match_matches
+
+    return if_none_match_matches(header, etag)
 
 
 def _stored_file_to_resource(

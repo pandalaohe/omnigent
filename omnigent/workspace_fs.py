@@ -365,6 +365,8 @@ class WorkspaceReader:
         raw: bool = False,
         max_bytes: int | None = None,
         within: str | None = None,
+        include_etag: bool = False,
+        if_none_match: str | None = None,
     ) -> _WorkspacePayload:
         """List a directory or read a file, mirroring ``_fs_list_or_read``.
 
@@ -382,6 +384,11 @@ class WorkspaceReader:
             workspace root) the file must resolve strictly inside, passing
             the bundle name rules; anything else is a 404. A directory
             cannot be confined and is refused.
+        :param include_etag: Include ``_etag`` (weak validator) on file
+            payloads for the server to forward as an HTTP ``ETag`` header.
+        :param if_none_match: Optional ``If-None-Match`` header value; when it
+            matches the file's weak ETag, returns a lightweight
+            ``not_modified`` payload without reading file bytes.
         :returns: A directory-listing dict or a file-content dict.
         :raises WorkspaceReaderError: On invalid path or missing file.
         """
@@ -402,7 +409,12 @@ class WorkspaceReader:
             if not resolved_within(resolved, root):
                 raise WorkspaceReaderError(404, "not_found", f"Path {path!r} not found")
         payload = self._read_file(
-            path, resolved, byte_cap, force_base64=raw and max_bytes is not None
+            path,
+            resolved,
+            byte_cap,
+            force_base64=raw and max_bytes is not None,
+            include_etag=include_etag,
+            if_none_match=if_none_match,
         )
         if within is not None:
             payload["within_enforced"] = True
@@ -586,6 +598,8 @@ class WorkspaceReader:
         max_bytes: int,
         *,
         force_base64: bool = False,
+        include_etag: bool = False,
+        if_none_match: str | None = None,
     ) -> _WorkspacePayload:
         """Build the file-content payload for a resolved file.
 
@@ -597,12 +611,23 @@ class WorkspaceReader:
         Reads at most ``max_bytes + 1`` from disk, bounding memory
         use before decoding oversized files.
         """
-        return self._file_content_payload(
+        capped, etag, not_modified = self._read_capped_conditional(
             rel,
-            self._read_capped(rel, resolved, max_bytes),
+            resolved,
             max_bytes,
-            force_base64=force_base64,
+            include_etag=include_etag,
+            if_none_match=if_none_match,
         )
+        if not_modified and etag is not None:
+            return {
+                "object": "session.environment.filesystem.not_modified",
+                "path": rel,
+                "etag": etag,
+            }
+        payload = self._file_content_payload(rel, capped, max_bytes, force_base64=force_base64)
+        if include_etag and etag is not None:
+            payload["_etag"] = etag
+        return payload
 
     def _read_capped(self, rel: str, resolved: Path, max_bytes: int) -> bytes:
         """Read up to the cap plus one byte of a regular file.
@@ -610,6 +635,21 @@ class WorkspaceReader:
         Opens without blocking and refuses anything but a regular file, so a
         FIFO or device in the workspace answers "not found" instead of hanging.
         """
+        capped, _, _ = self._read_capped_conditional(rel, resolved, max_bytes)
+        return capped
+
+    def _read_capped_conditional(
+        self,
+        rel: str,
+        resolved: Path,
+        max_bytes: int,
+        *,
+        include_etag: bool = False,
+        if_none_match: str | None = None,
+    ) -> tuple[bytes, str | None, bool]:
+        """Read up to the cap plus one byte of a regular file, with optional ETag/304."""
+        from omnigent.util.http_etag import if_none_match_matches, workspace_file_etag
+
         flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
         flags |= getattr(os, "O_CLOEXEC", 0)
         try:
@@ -617,12 +657,16 @@ class WorkspaceReader:
         except OSError as exc:
             raise WorkspaceReaderError(404, "not_found", f"Path {rel!r} not found") from exc
         try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
                 raise WorkspaceReaderError(404, "not_found", f"Path {rel!r} not found")
+            etag = workspace_file_etag(st) if (include_etag or if_none_match is not None) else None
+            if etag is not None and if_none_match_matches(if_none_match, etag):
+                return b"", etag, True
             with os.fdopen(fd, "rb", closefd=False) as fh:
                 # One extra byte lets us detect (and flag) truncation
                 # without loading the rest of a large file into memory.
-                return fh.read(max_bytes + 1)
+                return fh.read(max_bytes + 1), etag, False
         except OSError as exc:
             raise WorkspaceReaderError(404, "not_found", f"Path {rel!r} not found") from exc
         finally:

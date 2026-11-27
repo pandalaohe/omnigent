@@ -1033,6 +1033,167 @@ async def test_download_returns_complete_file_past_read_cap(
     assert resp.headers["content-disposition"] == 'attachment; filename="big.bin"'
     assert resp.headers["x-content-type-options"] == "nosniff"
     assert resp.headers["cache-control"] == "no-store"
+    assert resp.headers["etag"].startswith('W/"')
+
+
+@pytest.mark.asyncio
+async def test_filesystem_read_and_download_weak_etag_304_lifecycle(
+    client: httpx.AsyncClient,
+    workspace: Path,
+) -> None:
+    """Both JSON and ``?download=true`` file reads emit weak ETags and honor 304."""
+    target = workspace / "hello.txt"
+    url = (
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/hello.txt"
+    )
+
+    # JSON read: 200 with ETag -> 304 with empty body -> 200 after edit.
+    first_json = await client.get(url)
+    assert first_json.status_code == 200
+    assert first_json.json()["content"] == "hello world"
+    etag = first_json.headers["etag"]
+    assert etag.startswith('W/"')
+    assert first_json.headers["cache-control"] == "private, no-cache"
+
+    unchanged_json = await client.get(url, headers={"If-None-Match": etag})
+    assert unchanged_json.status_code == 304
+    assert unchanged_json.content == b""
+    assert unchanged_json.headers["etag"] == etag
+
+    # Raw download uses the exact same weak validator and short-circuits to 304.
+    unchanged_raw = await client.get(
+        url, params={"download": "true"}, headers={"If-None-Match": etag}
+    )
+    assert unchanged_raw.status_code == 304
+    assert unchanged_raw.content == b""
+    assert unchanged_raw.headers["etag"] == etag
+    assert unchanged_raw.headers["cache-control"] == "no-store"
+
+    # Modifying the file invalidates the ETag on both routes.
+    target.write_text("hello world v2")
+    updated_raw = await client.get(
+        url, params={"download": "true"}, headers={"If-None-Match": etag}
+    )
+    assert updated_raw.status_code == 200
+    assert updated_raw.content == b"hello world v2"
+    new_etag = updated_raw.headers["etag"]
+    assert new_etag != etag
+
+    updated_json = await client.get(url, headers={"If-None-Match": etag})
+    assert updated_json.status_code == 200
+    assert updated_json.json()["content"] == "hello world v2"
+    assert updated_json.headers["etag"] == new_etag
+
+    # Directory listings carry no file ETag.
+    dir_resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem/src",
+        headers={"If-None-Match": new_etag},
+    )
+    assert dir_resp.status_code == 200
+    assert "etag" not in dir_resp.headers
+
+    # Deleting the file returns 404 even when the client sends the previous ETag.
+    target.unlink()
+    deleted_json = await client.get(url, headers={"If-None-Match": new_etag})
+    assert deleted_json.status_code == 404
+    deleted_raw = await client.get(
+        url, params={"download": "true"}, headers={"If-None-Match": new_etag}
+    )
+    assert deleted_raw.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_download_etag_matches_post_probe_size_under_concurrent_append(
+    client: httpx.AsyncClient,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A concurrent append during the sandbox probe streams the full post-probe size."""
+    target = workspace / "grow.bin"
+    target.write_bytes(b"abc")
+    orig_helper_stat = CallerProcessFilesystem._helper_stat
+
+    async def _append_during_probe(
+        self: CallerProcessFilesystem, rel: str, *, probe_read: bool = False
+    ) -> dict[str, Any] | None:
+        res = await orig_helper_stat(self, rel, probe_read=probe_read)
+        with target.open("ab") as fh:
+            fh.write(b"def")
+        return res
+
+    monkeypatch.setattr(CallerProcessFilesystem, "_helper_stat", _append_during_probe)
+    url = (
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/grow.bin"
+    )
+    first = await client.get(url, params={"download": "true"})
+    assert first.status_code == 200
+    assert first.content == b"abcdef"
+    assert first.headers["content-length"] == "6"
+
+    monkeypatch.setattr(CallerProcessFilesystem, "_helper_stat", orig_helper_stat)
+    second = await client.get(
+        url,
+        params={"download": "true"},
+        headers={"If-None-Match": first.headers["etag"]},
+    )
+    assert second.status_code == 304
+    assert second.content == b""
+
+
+@pytest.mark.asyncio
+async def test_conditional_read_never_returns_304_for_masked_or_denied_file(
+    client: httpx.AsyncClient,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A file hidden by the sandbox returns 404 even with a matching host ETag."""
+    from omnigent.util.http_etag import workspace_file_etag
+
+    secret = workspace / "masked.txt"
+    secret.write_text("top-secret")
+    host_etag = workspace_file_etag(secret.stat())
+    url = (
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/masked.txt"
+    )
+
+    async def _deny_helper_stat(
+        self: CallerProcessFilesystem, rel: str, *, probe_read: bool = False
+    ) -> dict[str, Any]:
+        del self, rel, probe_read
+        return {"s": 0, "m": 0, "d": False, "l": False, "r": False, "dev": 0, "ino": 0}
+
+    async def _deny_os_env(*args: object, **kwargs: object) -> dict[str, object]:
+        del args, kwargs
+        return {"error": "Permission denied by sandbox"}
+
+    monkeypatch.setattr(CallerProcessFilesystem, "_helper_stat", _deny_helper_stat)
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._run_os_env_async", _deny_os_env)
+
+    raw_resp = await client.get(
+        url, params={"download": "true"}, headers={"If-None-Match": host_etag}
+    )
+    assert raw_resp.status_code == 404
+
+    json_resp = await client.get(url, headers={"If-None-Match": host_etag})
+    assert json_resp.status_code == 404
+
+    # bwrap masks hidden files by bind-mounting /dev/null (a character device);
+    # the conditional reader must reject non-regular descriptors rather than
+    # serving an empty 200, and keep the full 8 KiB binary sniff under small caps.
+    from omnigent.inner.os_env import _read_conditional_impl
+
+    dev_null_res = _read_conditional_impl(Path("/dev/null"), 1024, host_etag)
+    assert "error" in dev_null_res
+    assert dev_null_res.get("not_modified") is not True
+
+    mixed = workspace / "tiny-bin.dat"
+    mixed.write_bytes(b"abc\x00def")
+    small_cap = _read_conditional_impl(mixed, max_bytes=3)
+    assert small_cap["encoding"] == "base64"
+    assert small_cap["truncated"] is True
 
 
 @pytest.mark.asyncio

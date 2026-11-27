@@ -721,6 +721,7 @@ def register_resources_routes(
         honor_range: bool = True,
         *,
         wake: bool = True,
+        if_none_match: str | None = None,
     ) -> Response:
         """Resume an idle runner if needed and stream a file without buffering it.
 
@@ -736,9 +737,12 @@ def register_resources_routes(
         :param honor_range: Forward the client's range for consumers serving raw bytes.
         :param wake: When ``False`` (passive preview reads), fail fast with
             ``runner_unavailable`` instead of waking an asleep runner.
-        :returns: The attachment, streamed as the runner sends it, or the
-            runner's own error body and status for a missing file, a
-            directory, or an out-of-grant path.
+        :param if_none_match: Optional ``If-None-Match`` validator to forward
+            for conditional raw reads; omitted by artifact routes.
+        :returns: The attachment, streamed as the runner sends it, ``304 Not
+            Modified`` when the validator matches, or the runner's own error
+            body and status for a missing file, a directory, or an out-of-grant
+            path.
         :raises OmnigentError: ``runner_unavailable`` when the runner is
             offline with ``wake=False`` or predates downloads.
         :raises HTTPException: 502 when no runner can be reached.
@@ -773,24 +777,39 @@ def register_resources_routes(
                 detail="no runner available for resource access",
             )
         try:
-            resp = await runner_client.send(
-                runner_client.build_request(
-                    "GET",
-                    runner_path,
-                    headers={
-                        name: request.headers[name]
-                        for name in ("range", "if-range")
-                        if honor_range and name in request.headers
-                    },
-                    timeout=_download_timeout,
-                ),
-                stream=True,
+            req_headers = {
+                name: request.headers[name]
+                for name in ("range", "if-range")
+                if honor_range and name in request.headers
+            }
+            if if_none_match:
+                req_headers["If-None-Match"] = if_none_match
+            req = runner_client.build_request(
+                "GET",
+                runner_path,
+                headers=req_headers or None,
+                timeout=_download_timeout,
             )
+            resp = await runner_client.send(req, stream=True)
         except (httpx.HTTPError, ConnectionError) as exc:
             raise HTTPException(
                 status_code=502,
                 detail="runner download endpoint unavailable",
             ) from exc
+        if resp.status_code == 304:
+            try:
+                await resp.aread()
+            finally:
+                await resp.aclose()
+            skip_gzip(request)
+            not_modified_headers = {
+                name: resp.headers[name]
+                for name in ("etag", "cache-control", "x-omnigent-within")
+                if name in resp.headers
+            }
+            if "etag" in not_modified_headers:
+                not_modified_headers["access-control-expose-headers"] = "ETag"
+            return Response(status_code=304, headers=not_modified_headers)
         if (resp.status_code in (200, 206) and "content-disposition" in resp.headers) or (
             resp.status_code == 416 and "content-range" in resp.headers
         ):
@@ -805,6 +824,7 @@ def register_resources_routes(
                     "accept-ranges",
                     "content-range",
                     "cache-control",
+                    "etag",
                     "x-content-type-options",
                     # Present only when the caller sent ``within``; the artifact
                     # serve route reads it back to confirm bundle containment.
@@ -812,6 +832,8 @@ def register_resources_routes(
                 )
                 if name in resp.headers
             }
+            if "etag" in forwarded:
+                forwarded["access-control-expose-headers"] = "ETag"
             return _RunnerStreamResponse(resp, headers=forwarded)
         try:
             await resp.aread()
@@ -836,7 +858,7 @@ def register_resources_routes(
         _raise_if_session_agent_missing_payload(payload)
         return JSONResponse(status_code=resp.status_code, content=payload)
 
-    async def _proxy_get_to_runner(
+    async def _proxy_get_runner_response(
         session_id: str,
         path: str,
         conversation: Conversation,
@@ -845,23 +867,11 @@ def register_resources_routes(
         unsupported_endpoint_message: str | None = None,
         *,
         for_control: bool = False,
-    ) -> dict[str, Any]:
-        """Proxy a GET request to the runner and return parsed JSON.
+        if_none_match: str | None = None,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Proxy a GET request to the runner, returning ``(payload | None, etag | None)``.
 
-        :param session_id: Session/conversation identifier.
-        :param path: Runner-relative URL path.
-        :param conversation: Conversation loaded during authorization.
-        :param params: Optional query params forwarded to the runner,
-            e.g. ``{"order": "asc"}``. ``None`` sends no query string.
-        :param timeout: Seconds to wait for the runner response.
-        :param unsupported_endpoint_message: Upgrade guidance for an unregistered runner route.
-        :param for_control: Read registry metadata without admitting execution.
-        :returns: Parsed JSON response body.
-        :raises OmnigentError: ``runner_unavailable`` (503) for an unsupported endpoint;
-            typed ``not_found`` (404) or
-            ``session_agent_missing`` (410) re-derived from the runner body.
-        :raises HTTPException: The runner's 400 with its detail when it rejects the request;
-            502 on any other runner failure.
+        Returns ``(None, etag)`` when the runner answers ``304 Not Modified``.
         """
         if for_control:
             runner_client = await _get_runner_client_for_resource_access(
@@ -877,12 +887,23 @@ def register_resources_routes(
                 detail="no runner available for resource access",
             )
         try:
-            resp = await runner_client.get(path, params=params, timeout=timeout)
+            if if_none_match:
+                get_kwargs: dict[str, Any] = {
+                    "headers": {"If-None-Match": if_none_match},
+                    "timeout": timeout,
+                }
+                if params is not None:
+                    get_kwargs["params"] = params
+                resp = await runner_client.get(path, **get_kwargs)
+            else:
+                resp = await runner_client.get(path, params=params, timeout=timeout)
         except (httpx.HTTPError, ConnectionError) as exc:
             raise HTTPException(
                 status_code=502,
                 detail="runner resource endpoint unavailable",
             ) from exc
+        if resp.status_code == 304:
+            return None, resp.headers.get("etag")
         try:
             response_payload = resp.json()
         except ValueError as exc:
@@ -925,7 +946,89 @@ def register_resources_routes(
             raise HTTPException(
                 status_code=502, detail="runner resource endpoint returned non-object JSON"
             )
-        return cast(dict[str, Any], response_payload)
+        return cast(dict[str, Any], response_payload), resp.headers.get("etag")
+
+    async def _proxy_get_to_runner(
+        session_id: str,
+        path: str,
+        conversation: Conversation,
+        params: dict[str, str] | None = None,
+        timeout: float = 10.0,
+        unsupported_endpoint_message: str | None = None,
+        *,
+        for_control: bool = False,
+    ) -> dict[str, Any]:
+        """Proxy a GET request to the runner and return parsed JSON."""
+        payload, _ = await _proxy_get_runner_response(
+            session_id,
+            path,
+            conversation,
+            params=params,
+            timeout=timeout,
+            unsupported_endpoint_message=unsupported_endpoint_message,
+            for_control=for_control,
+        )
+        if payload is None:
+            raise HTTPException(
+                status_code=502, detail="runner resource endpoint returned unexpected 304"
+            )
+        return payload
+
+    async def _fs_get_response_with_host_fallback(
+        session_id: str,
+        conversation: Conversation,
+        *,
+        op: str,
+        host_params: dict[str, Any],
+        runner_path: str,
+        runner_params: dict[str, str] | None = None,
+        host_workspace_resolver: Callable[[], Awaitable[str]] | None = None,
+        runner_timeout: float = 10.0,
+        include_etag: bool = False,
+        if_none_match: str | None = None,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Serve a filesystem read with runner-to-host fallback and optional weak ETag."""
+        try:
+            return await _proxy_get_runner_response(
+                session_id,
+                runner_path,
+                conversation,
+                params=runner_params,
+                timeout=runner_timeout,
+                if_none_match=if_none_match,
+            )
+        except OmnigentError as exc:
+            # Only the runner-offline case is a candidate for the host
+            # fallback; a real 404 / git error from a live runner must
+            # surface unchanged.
+            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                raise
+            runner_offline = exc
+
+        host_workspace = await host_workspace_resolver() if host_workspace_resolver else None
+        effective_host_params = host_params
+        if include_etag or if_none_match:
+            effective_host_params = {**host_params}
+            if include_etag:
+                effective_host_params["include_etag"] = True
+            if if_none_match:
+                effective_host_params["if_none_match"] = if_none_match
+        payload = await _read_workspace_via_host(
+            session_id,
+            conversation,
+            op,
+            effective_host_params,
+            workspace_override=host_workspace,
+        )
+        if payload is None:
+            # No reachable host either — surface the original offline
+            # error (503) so the client shows its reconnect affordance.
+            raise runner_offline
+        if payload.get("object") == "session.environment.filesystem.not_modified":
+            etag = payload.get("etag")
+            return None, etag if isinstance(etag, str) and etag else None
+        host_etag = payload.pop("_etag", None) if include_etag else None
+        return payload, host_etag if isinstance(host_etag, str) and host_etag else None
 
     async def _fs_get_with_host_fallback(
         session_id: str,
@@ -938,70 +1041,19 @@ def register_resources_routes(
         host_workspace_resolver: Callable[[], Awaitable[str]] | None = None,
         runner_timeout: float = 10.0,
     ) -> dict[str, Any]:
-        """Serve a filesystem read, falling back to the host when offline.
-
-        Proxies the read to the session's runner as usual. When the
-        runner is offline (``RUNNER_UNAVAILABLE``) but the session's host
-        is still connected, the read is served from the workspace over
-        the host tunnel instead — the file panel stays live without
-        waking the agent. The host runs
-        :class:`omnigent.workspace_fs.WorkspaceReader` and returns the
-        same JSON the runner would, so the response shape is identical.
-
-        :param session_id: Session/conversation identifier.
-        :param conversation: Conversation loaded during authorization.
-        :param op: Host-side op name — ``"list_or_read"`` / ``"changes"``
-            / ``"diff"`` / ``"search"`` / ``"github_info"`` /
-            ``"github_changes"`` / ``"github_diff"`` / ``"github_pr_diff"`` /
-            ``"github_labels"`` / ``"github_merge_options"`` / ``"github_reviewers"`` /
-        ``"github_review_threads"`` / ``"github_review_thread_comments"``.
-            The ``github_*`` ops serve every git provider; their names are
-            stable wire ids.
-        :param host_params: Op-specific args for the host reader.
-        :param runner_path: Runner-relative URL for the live path.
-        :param runner_params: Optional query params for the runner path.
-        :param host_workspace_resolver: Resolves the absolute root the host
-            reader should be rooted at, for an absolute browse target.
-            Awaited ONLY when the fallback is actually taken: a live runner
-            authorizes the path itself against its own resolved policy, and
-            a runner-only session (no host, so no recorded ``workspace``)
-            has nothing for this to resolve against. Resolving it eagerly
-            would refuse absolute browsing on exactly those sessions even
-            though the online runner can serve them.
-        :param runner_timeout: Seconds to wait for the runner's response.
-        :returns: The runner-shaped filesystem result.
-        :raises OmnigentError: Re-raised runner-offline error when the
-            host cannot serve the read either.
-        :raises HTTPException: On host-reported filesystem failures.
-        """
-        try:
-            return await _proxy_get_to_runner(
-                session_id,
-                runner_path,
-                conversation,
-                params=runner_params,
-                timeout=runner_timeout,
-            )
-        except OmnigentError as exc:
-            # Only the runner-offline case is a candidate for the host
-            # fallback; a real 404 / git error from a live runner must
-            # surface unchanged.
-            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
-                raise
-            runner_offline = exc
-
-        host_workspace = await host_workspace_resolver() if host_workspace_resolver else None
-        payload = await _read_workspace_via_host(
+        """Serve a filesystem read, falling back to the host when offline."""
+        payload, _ = await _fs_get_response_with_host_fallback(
             session_id,
             conversation,
-            op,
-            host_params,
-            workspace_override=host_workspace,
+            op=op,
+            host_params=host_params,
+            runner_path=runner_path,
+            runner_params=runner_params,
+            host_workspace_resolver=host_workspace_resolver,
+            runner_timeout=runner_timeout,
         )
         if payload is None:
-            # No reachable host either — surface the original offline
-            # error (503) so the client shows its reconnect affordance.
-            raise runner_offline
+            raise HTTPException(status_code=502, detail="filesystem read returned unexpected 304")
         return payload
 
     async def _session_host(
@@ -1029,6 +1081,13 @@ def register_resources_routes(
             if isinstance(absent, WrongReplicaError):
                 raise absent
         return host_id, host, conv.workspace or owner.workspace
+
+    def _workspace_etag_headers(tag: str) -> dict[str, str]:
+        return {
+            "ETag": tag,
+            "Cache-Control": "private, no-cache",
+            "Access-Control-Expose-Headers": "ETag",
+        }
 
     async def _environment_reach_for_session(
         conversation: Conversation, workspace: str | None = None
@@ -4107,6 +4166,7 @@ def register_resources_routes(
             scope_params["scope"] = "reach"
         qs = urllib.parse.urlencode({**params, **scope_params})
         runner_rel = _runner_path_segment(relative_path, absolute=absolute)
+        if_none_match = request.headers.get("if-none-match")
         if download:
             download_response = await _stream_download_from_runner(
                 request,
@@ -4116,8 +4176,9 @@ def register_resources_routes(
                 f"/{_runner_environment_segment(environment_id)}/filesystem/{runner_rel}?"
                 + urllib.parse.urlencode({"download": "true", **scope_params}),
                 wake=wake,
+                if_none_match=if_none_match,
             )
-            if scope == "workspace" and download_response.status_code in (200, 206):
+            if scope == "workspace" and download_response.status_code in (200, 206, 304):
                 download_response.headers.update(_WORKSPACE_FILE_SCOPE_HEADERS)
             return download_response
         path = (
@@ -4137,23 +4198,41 @@ def register_resources_routes(
             response.headers.update(_WORKSPACE_FILE_SCOPE_HEADERS)
         # The session is already validated above at the browse level, which is
         # stricter than main's plain LEVEL_READ for an absolute path.
-        return _skip_gzip_for_binary(
-            request,
-            await _fs_get_with_host_fallback(
-                session_id,
-                conv,
-                op="list_or_read",
-                host_params={
-                    "path": "" if absolute else relative_path,
-                    "limit": limit,
-                    "after": after,
-                    "before": before,
-                    "order": order,
-                },
-                runner_path=path,
-                host_workspace_resolver=resolver,
-            ),
+        payload, etag = await _fs_get_response_with_host_fallback(
+            session_id,
+            conv,
+            op="list_or_read",
+            host_params={
+                "path": "" if absolute else relative_path,
+                "limit": limit,
+                "after": after,
+                "before": before,
+                "order": order,
+            },
+            runner_path=path,
+            host_workspace_resolver=resolver,
+            include_etag=True,
+            if_none_match=if_none_match,
         )
+        if payload is None:
+            skip_gzip(request)
+            headers = (
+                _workspace_etag_headers(etag) if etag else {"Cache-Control": "private, no-cache"}
+            )
+            if scope == "workspace":
+                headers = {**headers, **_WORKSPACE_FILE_SCOPE_HEADERS}
+            return Response(status_code=304, headers=headers)
+        payload = _skip_gzip_for_binary(request, payload)
+        if etag:
+            headers = _workspace_etag_headers(etag)
+            if scope == "workspace":
+                headers = {**headers, **_WORKSPACE_FILE_SCOPE_HEADERS}
+            return JSONResponse(
+                status_code=200,
+                content=payload,
+                headers=headers,
+            )
+        return payload
 
     @router.put(
         "/sessions/{session_id}/resources/environments"

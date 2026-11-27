@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import io
 import json
 import logging
 import mimetypes
@@ -1527,7 +1528,7 @@ def register_resource_routes(
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
-    ) -> JSONResponse:
+    ) -> Response:
         await _require_os_env(session_id)
         return await _fs_list_or_read(
             session_id,
@@ -2330,6 +2331,7 @@ def register_resource_routes(
     ) -> Response:
         await _require_os_env(session_id)
         follow_outward_links = scope == "reach"
+        if_none_match = request.headers.get("if-none-match")
         if download:
             return await _fs_download(
                 session_id,
@@ -2340,6 +2342,7 @@ def register_resource_routes(
                 if "if-range" not in request.headers
                 else None,
                 follow_outward_links=follow_outward_links,
+                if_none_match=if_none_match,
             )
         return await _fs_list_or_read(
             session_id,
@@ -2350,6 +2353,7 @@ def register_resource_routes(
             before=before,
             order=order,
             follow_outward_links=follow_outward_links,
+            if_none_match=if_none_match,
         )
 
     async def _read_editor_text(fs: CallerProcessFilesystem, relative_path: str) -> str | None:
@@ -2519,6 +2523,7 @@ def register_resource_routes(
         within: str | None = None,
         range_header: str | None = None,
         follow_outward_links: bool = False,
+        if_none_match: str | None = None,
     ) -> Response:
         """Serve complete or ranged file bytes from the authorized descriptor.
 
@@ -2535,13 +2540,17 @@ def register_resource_routes(
         :param range_header: An optional HTTP byte range for media seeking.
         :param follow_outward_links: Admit a workspace symlink whose target
             lies outside the workspace but within the environment's reach.
+        :param if_none_match: Optional ``If-None-Match`` validator; returns
+            ``304 Not Modified`` without reading file bytes when current.
         :returns: The file streamed with ``Content-Disposition: attachment``
-            and, when *within* was enforced, ``X-Omnigent-Within: enforced``.
+            and, when *within* was enforced, ``X-Omnigent-Within: enforced``,
+            or ``304 Not Modified``.
         :raises InvalidPath: If the path names a directory.
         :raises FilesystemPathNotFound: If nothing the caller may see exists
             at the path.
         """
         from omnigent.runner.environment_filesystem import CallerProcessFilesystem
+        from omnigent.util.http_etag import if_none_match_matches, workspace_file_etag
 
         await _ensure_session_registered(session_id)
         agent_spec = await _resolve_session_agent_spec(session_id)
@@ -2549,6 +2558,27 @@ def register_resource_routes(
         fs = CallerProcessFilesystem(env, follow_outward_links=follow_outward_links)
         fobj, resolved, size = await fs.open_download(path, within=within)
         media_type = mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
+
+        etag: str | None = None
+        try:
+            st = os.fstat(fobj.fileno())
+        except (AttributeError, OSError, io.UnsupportedOperation):
+            st = None
+        if st is not None:
+            # Take stream length and weak ETag from one post-probe fstat so a
+            # concurrent append cannot pair a newer ETag with an older size.
+            size = st.st_size
+            etag = workspace_file_etag(st)
+        if etag is not None and if_none_match_matches(if_none_match, etag):
+            fobj.close()
+            not_modified_headers = {
+                "ETag": etag,
+                "Cache-Control": "no-store",
+            }
+            if within is not None:
+                not_modified_headers["X-Omnigent-Within"] = "enforced"
+            return Response(status_code=304, headers=not_modified_headers)
+
         headers = {"Accept-Ranges": "bytes"}
         if within is not None:
             # The server rejects responses from runners that ignore confinement.
@@ -2606,6 +2636,8 @@ def register_resource_routes(
                 "X-Content-Type-Options": "nosniff",
             }
         )
+        if etag is not None:
+            headers["ETag"] = etag
         return StreamingResponse(
             _chunks(),
             status_code=206 if byte_range is not None else 200,
@@ -2623,7 +2655,8 @@ def register_resource_routes(
         before: str | None = None,
         order: str = "desc",
         follow_outward_links: bool = False,
-    ) -> JSONResponse:
+        if_none_match: str | None = None,
+    ) -> Response:
         from omnigent.runner.environment_filesystem import _MAX_READ_BYTES, CallerProcessFilesystem
 
         await _ensure_session_registered(session_id)
@@ -2661,7 +2694,14 @@ def register_resource_routes(
             )
 
         # File previews need every line within the byte cap.
-        content = await fs.read(path, max_bytes=_MAX_READ_BYTES)
+        content, etag = await fs.read_conditional(
+            path, max_bytes=_MAX_READ_BYTES, if_none_match=if_none_match
+        )
+        if content is None:
+            not_modified_headers = {"Cache-Control": "private, no-cache"}
+            if etag is not None:
+                not_modified_headers["ETag"] = etag
+            return Response(status_code=304, headers=not_modified_headers)
         content_type_guess, _ = mimetypes.guess_type(path)
         payload: dict[str, object] = {
             "object": "session.environment.filesystem.file_content",
@@ -2678,7 +2718,8 @@ def register_resource_routes(
 
             payload["encoding"] = "base64"
             payload["content"] = base64.b64encode(content.data).decode()
-        return JSONResponse(status_code=200, content=payload)
+        response_headers = {"ETag": etag, "Cache-Control": "private, no-cache"} if etag else None
+        return JSONResponse(status_code=200, content=payload, headers=response_headers)
 
     def _fs_entry_to_dict(entry: FilesystemEntry) -> dict[str, object]:
         from omnigent.runner.environment_filesystem import entry_payload

@@ -5284,6 +5284,7 @@ class HostProcess:
         r = cast("WorkspaceReader", reader)
         if op == "list_or_read":
             within = params.get("within")
+            if_none_match = params.get("if_none_match")
             return r.list_or_read(
                 str(params.get("path", "")),
                 limit=_coerce_int(params.get("limit", 20)),
@@ -5293,6 +5294,8 @@ class HostProcess:
                 raw=bool(params.get("raw", False)),
                 max_bytes=cast("int | None", params.get("max_bytes")),
                 within=within if isinstance(within, str) else None,
+                include_etag=bool(params.get("include_etag", False)),
+                if_none_match=if_none_match if isinstance(if_none_match, str) else None,
             )
         if op == "changes":
             return r.changes(session_id)

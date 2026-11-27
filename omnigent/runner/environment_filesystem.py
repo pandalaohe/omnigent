@@ -39,6 +39,7 @@ from omnigent.inner._cwd_scan import _DEFAULT_DEPRIORITIZED_DIRS
 from omnigent.inner.async_utils import run_sync_on_thread
 from omnigent.inner.os_env import (
     _edit_impl,
+    _read_conditional_impl,
     _read_impl,
     _write_impl,
 )
@@ -1281,6 +1282,62 @@ print(json.dumps({'r': results, 't': truncated}))
             max_bytes=byte_cap,
         )
         return self._file_content(path, result, byte_cap)
+
+    async def read_conditional(
+        self,
+        path: str,
+        *,
+        max_bytes: int | None = None,
+        if_none_match: str | None = None,
+    ) -> tuple[FileContent | None, str | None]:
+        """Read a file with weak ETag validation, short-circuiting on 304.
+
+        Returns ``(None, etag)`` when *if_none_match* matches the file's
+        current weak ETag without reading file bytes, or ``(content, etag)``
+        otherwise.
+
+        :param path: Relative file path, or an absolute path elsewhere on
+            the filesystem.
+        :param max_bytes: Maximum bytes to read. Defaults to
+            ``_MAX_READ_BYTES`` (10 MiB).
+        :param if_none_match: Optional ``If-None-Match`` header value.
+        :returns: ``(FileContent | None, etag | None)``.
+        :raises FilesystemPathNotFound: If the file does not exist.
+        """
+        byte_cap = max_bytes or _MAX_READ_BYTES
+
+        absolute = self._absolute(path)
+        validated = "" if absolute else _validate_path(path)
+        if not absolute and not validated:
+            raise InvalidPath("Cannot read the environment root")
+        target = validated
+        if absolute or self._follow_outward_links:
+            resolved = self._resolve(path)
+            if not self._within_grants(resolved):
+                direct = await _run_impl_direct(
+                    _read_conditional_impl, resolved, byte_cap, if_none_match
+                )
+                etag_raw = direct.get("etag")
+                etag = etag_raw if isinstance(etag_raw, str) else None
+                if direct.get("not_modified") is True:
+                    return None, etag
+                return self._file_content(path, direct, byte_cap), etag
+            if absolute:
+                target = str(resolved)
+
+        result = await _run_os_env_async(
+            self._os_env.read,
+            target,
+            limit=None,
+            max_bytes=byte_cap,
+            include_etag=True,
+            if_none_match=if_none_match,
+        )
+        etag_raw = result.get("etag")
+        etag = etag_raw if isinstance(etag_raw, str) else None
+        if result.get("not_modified") is True:
+            return None, etag
+        return self._file_content(path, result, byte_cap), etag
 
     def _file_content(self, path: str, result: OpResult, byte_cap: int) -> FileContent:
         """Convert a read result into typed content.

@@ -349,6 +349,8 @@ class OSEnvironment(ABC):
         max_bytes: int | None = None,
         *,
         regular_only: bool = False,
+        include_etag: bool = False,
+        if_none_match: str | None = None,
     ) -> OpResult:
         raise NotImplementedError
 
@@ -1143,22 +1145,26 @@ class CallerProcessOSEnvironment(OSEnvironment):
         max_bytes: int | None = None,
         *,
         regular_only: bool = False,
+        include_etag: bool = False,
+        if_none_match: str | None = None,
     ) -> OpResult:
         if offset < 1:
             return {"error": "offset must be >= 1"}
         if limit is not None and limit < 1:
             return {"error": "limit must be >= 1"}
-        result = await run_sync_on_thread(
-            self._helper.request,
-            {
-                "op": "read",
-                "path": path,
-                "offset": offset,
-                "limit": limit,
-                "max_bytes": max_bytes,
-                "regular_only": regular_only,
-            },
-        )
+        req: dict[str, JsonValue] = {
+            "op": "read",
+            "path": path,
+            "offset": offset,
+            "limit": limit,
+            "max_bytes": max_bytes,
+            "regular_only": regular_only,
+        }
+        if include_etag:
+            req["include_etag"] = True
+        if if_none_match is not None:
+            req["if_none_match"] = if_none_match
+        result = await run_sync_on_thread(self._helper.request, req)
         return cast(OpResult, result)
 
     async def write(self, path: str, content: str) -> OpResult:
@@ -1443,6 +1449,16 @@ def _handle_helper_request(
                 return {"content": content.decode("utf-8"), "encoding": "utf-8"}
             except (OSError, UnicodeError) as exc:
                 return {"error": str(exc)}
+        include_etag = bool(request.get("include_etag"))
+        if_none_match_raw = request.get("if_none_match")
+        if_none_match = if_none_match_raw if isinstance(if_none_match_raw, str) else None
+        if (
+            (include_etag or if_none_match is not None)
+            and offset == 1
+            and request.get("limit") is None
+            and max_bytes is not None
+        ):
+            return _read_conditional_impl(path, max_bytes, if_none_match)
         return _read_impl(
             path,
             offset,
@@ -1914,6 +1930,78 @@ def _read_binary_impl(path: Path, max_bytes: int | None) -> OpResult:
         "returned_bytes": len(payload),
         "truncated": len(payload) < total,
     }
+
+
+def _read_conditional_impl(
+    path: Path,
+    max_bytes: int,
+    if_none_match: str | None = None,
+) -> OpResult:
+    """Single-descriptor conditional read: fstat, ETag match, and bounded read on one fd.
+
+    Derives the weak ETag and reads bytes from the same open descriptor so a
+    concurrent path replacement cannot pair one inode's validator with another
+    file's bytes.
+    """
+    from omnigent.util.http_etag import if_none_match_matches, workspace_file_etag
+
+    if max_bytes < 1:
+        return {"error": "max_bytes must be >= 1"}
+    try:
+        with path.open("rb") as fh:
+            fst = os.fstat(fh.fileno())
+            if not stat.S_ISREG(fst.st_mode):
+                return {"error": f"Path {path} is not a regular file"}
+            etag = workspace_file_etag(fst)
+            if if_none_match_matches(if_none_match, etag):
+                return {"path": str(path), "not_modified": True, "etag": etag}
+            raw = fh.read(max(max_bytes + 1, _BINARY_SNIFF_BYTES))
+    except OSError as exc:
+        return {"error": str(exc)}
+
+    truncated = len(raw) > max_bytes
+    capped = raw[:max_bytes]
+    prefix = raw[:_BINARY_SNIFF_BYTES]
+    is_binary = b"\x00" in prefix
+    if not is_binary:
+        try:
+            codecs.getincrementaldecoder("utf-8")("strict").decode(prefix, final=False)
+        except UnicodeDecodeError:
+            is_binary = True
+    text: str | None = None
+    if not is_binary:
+        try:
+            text = codecs.getincrementaldecoder("utf-8")("strict").decode(
+                capped, final=not truncated
+            )
+        except UnicodeDecodeError:
+            is_binary = True
+
+    if is_binary:
+        result: OpResult = {
+            "path": str(path),
+            "content": base64.b64encode(capped).decode("ascii"),
+            "encoding": "base64",
+            "total_bytes": fst.st_size,
+            "returned_bytes": len(capped),
+            "truncated": truncated,
+        }
+    else:
+        assert text is not None
+        lines = text.splitlines(keepends=True)
+        result = {
+            "path": str(path),
+            "content": text,
+            "encoding": "utf-8",
+            "offset": 1,
+            "limit": len(lines),
+            "returned_lines": len(lines),
+            "total_lines": None if truncated else len(lines),
+            "truncated": truncated,
+        }
+    if etag is not None:
+        result["etag"] = etag
+    return result
 
 
 def _read_impl(

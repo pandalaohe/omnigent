@@ -6,7 +6,7 @@
 // The query is disabled when either `conversationId` or `path` is null/undefined.
 
 import { useEffect, useRef } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { replaceEqualDeep, useQuery, useQueryClient } from "@tanstack/react-query";
 import { withBasePath } from "@/lib/basePath";
 import { isDatabricksWorkspace, isHostRoutingEnabled, resolveMediaUrl } from "@/lib/host";
 import { authenticatedFetch } from "@/lib/identity";
@@ -285,6 +285,38 @@ async function isRunnerUnavailableResponse(res: Response): Promise<boolean> {
   }
 }
 
+// Weak ETag validators associated with the exact cached response objects in
+// TanStack Query's cache. Using a WeakMap keeps validators scoped per cached
+// object (no cross-QueryClient test bleed, GC-collected on eviction) and clears
+// them automatically whenever optimistic saves replace the cached object.
+const responseEtag = new WeakMap<object, string>();
+
+function recordResponseEtag(target: object, res: Response): void {
+  const etag = res.headers?.get("etag")?.trim();
+  if (etag) responseEtag.set(target, etag);
+}
+
+function conditionalHeadersFor(cached: object | undefined): HeadersInit | undefined {
+  const etag = cached ? responseEtag.get(cached) : undefined;
+  return etag ? { "If-None-Match": etag } : undefined;
+}
+
+function propagateResponseEtag(oldData: unknown, newData: unknown, shared: unknown): void {
+  if (!shared || typeof shared !== "object") return;
+  if (newData && typeof newData === "object") {
+    const nextEtag = responseEtag.get(newData);
+    if (nextEtag) {
+      responseEtag.set(shared, nextEtag);
+      return;
+    }
+  }
+  // If a newer 200 arrived without an ETag (e.g. legacy runner/host), drop any
+  // stale validator carried by a structurally-reused object.
+  if (oldData !== newData) {
+    responseEtag.delete(shared);
+  }
+}
+
 /**
  * Fetch raw binary bytes for an inline image, PDF, or 3D preview via the
  * existing `?download=true&wake=false` route, avoiding JSON+base64 expansion
@@ -293,12 +325,22 @@ async function isRunnerUnavailableResponse(res: Response): Promise<boolean> {
 export async function fetchWorkspaceBinaryPreview(
   conversationId: string,
   path: string,
-  { signal, maxBytes = BINARY_PREVIEW_MAX_BYTES }: { signal?: AbortSignal; maxBytes?: number } = {},
+  {
+    signal,
+    maxBytes = BINARY_PREVIEW_MAX_BYTES,
+    cached,
+  }: { signal?: AbortSignal; maxBytes?: number; cached?: BinaryPreviewResponse } = {},
 ): Promise<BinaryPreviewResponse> {
+  const headers = conditionalHeadersFor(cached);
   const res = await authenticatedFetch(
     workspaceFileUrl(conversationId, path, { download: "true", wake: "false" }),
-    { signal },
+    headers ? { signal, headers } : { signal },
   );
+  if (res.status === 304 && cached !== undefined) {
+    cancelResponseBody(res);
+    recordResponseEtag(cached, res);
+    return cached;
+  }
   if (!res.ok) {
     if (await isRunnerUnavailableResponse(res)) {
       throw new RawDownloadUnavailableError(`${res.status} ${res.statusText}`);
@@ -306,7 +348,9 @@ export async function fetchWorkspaceBinaryPreview(
     cancelResponseBody(res);
     throw new Error(`${res.status} ${res.statusText}`);
   }
-  return readBoundedBinaryPreviewResponse(res, path, { signal, maxBytes });
+  const result = await readBoundedBinaryPreviewResponse(res, path, { signal, maxBytes });
+  recordResponseEtag(result, res);
+  return result;
 }
 
 /**
@@ -327,6 +371,37 @@ export async function fetchWorkspaceVideoBlob(
     throw new Error(`${res.status} ${res.statusText}`);
   }
   return readVideoResponse(res, path, { signal });
+}
+
+async function fetchFileContentConditional(
+  conversationId: string,
+  path: string,
+  {
+    signal,
+    cached,
+    query = {},
+  }: { signal?: AbortSignal; cached?: FileContentResponse; query?: { scope?: "workspace" } } = {},
+): Promise<FileContentResponse> {
+  const headers = conditionalHeadersFor(cached);
+  const res = await authenticatedFetch(
+    workspaceFileUrl(conversationId, path, query),
+    headers ? { signal, headers } : { signal },
+  );
+  if (res.status === 304 && cached !== undefined) {
+    if (query.scope && res.headers.get("X-Omnigent-File-Scope") !== query.scope) {
+      throw new Error("Workspace-constrained file reads are unavailable");
+    }
+    recordResponseEtag(cached, res);
+    return cached;
+  }
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  // Older servers ignore scope; automatic previews must fail closed there.
+  if (query.scope && res.headers.get("X-Omnigent-File-Scope") !== query.scope) {
+    throw new Error("Workspace-constrained file reads are unavailable");
+  }
+  const data = (await res.json()) as FileContentResponse;
+  recordResponseEtag(data, res);
+  return data;
 }
 
 export async function fetchFileContent(
@@ -351,13 +426,7 @@ export async function fetchFileContentViaRest(
   signal?: AbortSignal,
   query: { scope?: "workspace" } = {},
 ): Promise<FileContentResponse> {
-  const res = await authenticatedFetch(workspaceFileUrl(conversationId, path, query), { signal });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  // Older servers ignore scope; automatic previews must fail closed there.
-  if (query.scope && res.headers.get("X-Omnigent-File-Scope") !== query.scope) {
-    throw new Error("Workspace-constrained file reads are unavailable");
-  }
-  return (await res.json()) as FileContentResponse;
+  return fetchFileContentConditional(conversationId, path, { signal, query });
 }
 
 /**
@@ -667,12 +736,33 @@ export function useFileContent(
 
   return useQuery({
     ...fileContentQuery(serverId ?? "", path ?? "", options.sshTarget),
+    queryFn: async ({ signal }) => {
+      await fileWritesSettled(serverId!, path!);
+      // Cancelled while waiting (a newer write started): don't send the read.
+      signal.throwIfAborted();
+      if (!browseLocationBase(path!)) {
+        const viaApi = await readFileViaWorkspaceApi(serverId!, path!, signal, options.sshTarget);
+        if (viaApi) return viaApi;
+      }
+      const state = queryClient.getQueryState<FileContentResponse>([
+        "file-content",
+        serverId,
+        path,
+      ]);
+      const cached = state?.status === "success" ? state.data : undefined;
+      return fetchFileContentConditional(serverId!, path!, { signal, cached });
+    },
     enabled: !!serverId && !!path && serveable !== false,
     refetchInterval: visible
       ? (query) => fileContentPollInterval(query.state.data, query.state.status === "error")
       : false,
     // Catch up as soon as the browser tab returns, even within staleTime.
     refetchOnWindowFocus: visible ? "always" : false,
+    structuralSharing: (oldData, newData) => {
+      const shared = replaceEqualDeep(oldData, newData);
+      propagateResponseEtag(oldData, newData, shared);
+      return shared;
+    },
     ...(options.retry === undefined ? {} : { retry: options.retry }),
   });
 }
@@ -733,8 +823,21 @@ export function useBinaryFilePreview(
           return failureCount < maxRetries;
         };
 
-  const fetchJsonFallback = async (signal?: AbortSignal): Promise<BinaryPreviewResponse> => {
-    const data = await fetchFileContent(serverId!, path!, signal);
+  const fetchJsonFallback = async (
+    signal: AbortSignal | undefined,
+    cached: BinaryPreviewResponse | undefined,
+  ): Promise<BinaryPreviewResponse> => {
+    const headers = conditionalHeadersFor(cached);
+    const res = await authenticatedFetch(
+      workspaceFileUrl(serverId!, path!),
+      headers ? { signal, headers } : { signal },
+    );
+    if (res.status === 304 && cached !== undefined) {
+      recordResponseEtag(cached, res);
+      return cached;
+    }
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    const data = (await res.json()) as FileContentResponse;
     if (data.truncated) {
       throw new FilePreviewTooLargeError(JSON_FALLBACK_MAX_BYTES);
     }
@@ -742,13 +845,15 @@ export function useBinaryFilePreview(
     const contentType = previewMimeTypeForPath(path!, data.content_type);
     const typedBlob = blob.type === contentType ? blob : blob.slice(0, blob.size, contentType);
     const bytes = new Uint8Array(await typedBlob.arrayBuffer());
-    return {
+    const result: BinaryPreviewResponse = {
       blob: typedBlob,
       contentType,
       bytes: typedBlob.size,
       fingerprint: fingerprintChunks([bytes], typedBlob.size, contentType),
       pollable: data.encoding === "utf-8" && typedBlob.size <= FILE_CONTENT_POLL_MAX_BYTES,
     };
+    recordResponseEtag(result, res);
+    return result;
   };
 
   return useQuery({
@@ -756,17 +861,23 @@ export function useBinaryFilePreview(
     queryFn: async ({ signal }): Promise<BinaryPreviewResponse> => {
       await fileWritesSettled(serverId!, path!);
       signal.throwIfAborted();
+      const state = queryClient.getQueryState<BinaryPreviewResponse>([
+        "file-binary-preview",
+        serverId,
+        path,
+      ]);
+      const cached = state?.status === "success" ? state.data : undefined;
       if (runnerOnline === false) {
         // Runner is asleep; use host-backed JSON fallback without waking it.
-        return fetchJsonFallback(signal);
+        return fetchJsonFallback(signal, cached);
       }
       try {
-        return await fetchWorkspaceBinaryPreview(serverId!, path!, { signal, maxBytes });
+        return await fetchWorkspaceBinaryPreview(serverId!, path!, { signal, maxBytes, cached });
       } catch (error) {
         // Cold open, stale health, or legacy runner without download support:
         // fall back once to host-backed JSON without waking the runner.
         if (error instanceof RawDownloadUnavailableError) {
-          return fetchJsonFallback(signal);
+          return fetchJsonFallback(signal, cached);
         }
         throw error;
       }
@@ -790,6 +901,7 @@ export function useBinaryFilePreview(
         prev.fingerprint === next.fingerprint &&
         prev.pollable === next.pollable
       ) {
+        propagateResponseEtag(prev, next, prev);
         return prev;
       }
       return newData;
