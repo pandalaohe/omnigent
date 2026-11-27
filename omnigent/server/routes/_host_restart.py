@@ -110,7 +110,7 @@ def register_host_restart_routes(
                 + (f" Reason: {record.reason}." if record.reason else "")
             )
             result = await post_event(
-                PeerSweeper._synthetic_request(requester, request.app),
+                PeerSweeper._synthetic_request(requester, request.app, runtime_notice=True),
                 requester,
                 SessionEventInput(
                     type="message",

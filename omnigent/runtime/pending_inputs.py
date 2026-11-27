@@ -272,6 +272,7 @@ class DrainedInput:
     runner_claim_id: str | None = None
     sending_since_ms: int | None = None
     peer_message_id: str | None = None
+    runtime_notice: bool = False
 
 
 @dataclass
@@ -374,6 +375,15 @@ _pending: WorkspaceScopedCache[str, dict[str, _Entry]] = WorkspaceScopedCache()
 # matching. An empty set blocks text-only attribution for every successor.
 _unconfirmed_input_texts: WorkspaceScopedCache[tuple[str, str], frozenset[str]] = (
     WorkspaceScopedCache(lambda: TTLCache(maxsize=4096, ttl=_TTL_S, timer=_now))
+)
+# Recently retired internal runtime notices, so late or replayed runner
+# failure events (including 24h prompt-wait expiries from older runners)
+# do not fall through into user-facing delivery error cards.
+_RETIRED_RUNTIME_NOTICE_TTL_S = 48 * 60 * 60.0
+_retired_runtime_notices: WorkspaceScopedCache[tuple[str, str, str, str], bool] = (
+    WorkspaceScopedCache(
+        lambda: TTLCache(maxsize=8192, ttl=_RETIRED_RUNTIME_NOTICE_TTL_S, timer=_now)
+    )
 )
 _lock = threading.Lock()
 
@@ -1168,6 +1178,7 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         runner_claim_id=drained.runner_claim_id,
         sending_since_ms=drained.sending_since_ms,
         peer_message_id=drained.peer_message_id,
+        runtime_notice=drained.runtime_notice,
     )
     with _lock:
         entries = _pending.get(conversation_id, {})
@@ -1176,6 +1187,35 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
             current.held = False
             return
         _pending[conversation_id] = {drained.pending_id: entry, **entries}
+
+
+def _record_retired_runtime_notice_locked(conversation_id: str, entry: _Entry) -> None:
+    if not entry.runtime_notice or entry.peer_message_id is not None:
+        return
+    if entry.delivery_attempt_id is not None:
+        _retired_runtime_notices[
+            (conversation_id, "attempt", entry.pending_id, entry.delivery_attempt_id)
+        ] = True
+    if entry.stable_id is not None:
+        _retired_runtime_notices[(conversation_id, "stable", entry.stable_id, "")] = True
+
+
+def was_retired_runtime_notice(
+    conversation_id: str,
+    *,
+    pending_id: str | None = None,
+    attempt_id: str | None = None,
+    stable_id: str | None = None,
+) -> bool:
+    """Whether this delivery identity belongs to an already-retired runtime notice."""
+    with _lock:
+        if attempt_id is not None:
+            return pending_id is not None and bool(
+                _retired_runtime_notices.get((conversation_id, "attempt", pending_id, attempt_id))
+            )
+        if stable_id is not None:
+            return bool(_retired_runtime_notices.get((conversation_id, "stable", stable_id, "")))
+        return False
 
 
 def _settle_locked(
@@ -1187,8 +1227,10 @@ def _settle_locked(
     source_less_successors: frozenset[str] = frozenset(),
 ) -> None:
     entry = entries.pop(pending_id, None)
-    if entry is not None and not delivery_confirmed:
-        _record_unconfirmed_locked(conversation_id, entry.content, source_less_successors)
+    if entry is not None:
+        _record_retired_runtime_notice_locked(conversation_id, entry)
+        if not delivery_confirmed:
+            _record_unconfirmed_locked(conversation_id, entry.content, source_less_successors)
     if not entries:
         _pending.pop(conversation_id, None)
 
@@ -1487,6 +1529,7 @@ def resolve_matching_text(
             if (
                 entry.uncertain
                 or entry.interrupted
+                or (entry.runtime_notice and entry.peer_message_id is None)
                 or _is_command_entry(entry, claude_commands=claude_commands)
             ):
                 uncertain.append(_drained_input(entry))
@@ -1604,6 +1647,7 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         injected_prefix=entry.injected_prefix,
         auto_retry=entry.auto_retry,
         peer_message_id=entry.peer_message_id,
+        runtime_notice=entry.runtime_notice,
     )
 
 
@@ -1818,3 +1862,4 @@ def reset_for_tests() -> None:
     with _lock:
         _pending.clear()
         _unconfirmed_input_texts.clear()
+        _retired_runtime_notices.clear()

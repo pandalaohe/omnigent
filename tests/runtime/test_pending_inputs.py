@@ -1515,3 +1515,57 @@ def test_queued_plain_prompt_recorded_after_a_later_one_is_still_lost(
     [skipped] = match.skipped
     assert skipped.content == [_text_block(older)]
     assert match.uncertain == []
+
+
+def test_skipped_runtime_notice_is_drained_as_uncertain_and_tracked_retired() -> None:
+    """Skipped internal notices drain quietly and remember their retired identity."""
+    notice_id = pending_inputs.record(
+        "conv",
+        [_text_block("[System: sub-agent worker finished (completed) — 1 result waiting.]")],
+        stable_id="a" * 32,
+        runtime_notice=True,
+    )
+    notice_attempt = str(
+        pending_inputs.delivery_attributes_for("conv", notice_id)["delivery_attempt_id"]
+    )
+    # Reconstructing an evicted/removed runtime notice via restore preserves its flag.
+    removed = pending_inputs.resolve("conv", notice_id, hold=False)
+    assert removed is not None and removed.runtime_notice is True
+    pending_inputs.reset_for_tests()
+    pending_inputs.restore("conv", removed)
+    assert pending_inputs.snapshot_for("conv")[0]["pending_id"] == notice_id
+
+    peer_id = pending_inputs.record(
+        "conv",
+        [_text_block("[Peer message from session s1] check build")],
+        peer_message_id="peer_1",
+        runtime_notice=True,
+    )
+    peer_attempt = str(
+        pending_inputs.delivery_attributes_for("conv", peer_id)["delivery_attempt_id"]
+    )
+    user_id = pending_inputs.record("conv", [_text_block("plain user prompt")])
+    user_attempt = str(
+        pending_inputs.delivery_attributes_for("conv", user_id)["delivery_attempt_id"]
+    )
+    pending_inputs.record("conv", [_text_block("later prompt")], stable_id="b" * 32)
+
+    match = pending_inputs.resolve_matching_text("conv", "later prompt", claude_commands=True)
+
+    assert match.matched is not None
+    assert [entry.pending_id for entry in match.uncertain] == [notice_id]
+    assert [entry.pending_id for entry in match.skipped] == [peer_id, user_id]
+    assert pending_inputs.was_retired_runtime_notice(
+        "conv", pending_id=notice_id, attempt_id=notice_attempt
+    )
+    assert pending_inputs.was_retired_runtime_notice("conv", stable_id="a" * 32)
+    # A different attempt reusing the same stable_id must not inherit retirement.
+    assert not pending_inputs.was_retired_runtime_notice(
+        "conv", pending_id=notice_id, attempt_id="f" * 32, stable_id="a" * 32
+    )
+    assert not pending_inputs.was_retired_runtime_notice(
+        "conv", pending_id=peer_id, attempt_id=peer_attempt
+    )
+    assert not pending_inputs.was_retired_runtime_notice(
+        "conv", pending_id=user_id, attempt_id=user_attempt
+    )
