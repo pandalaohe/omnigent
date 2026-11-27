@@ -47,6 +47,55 @@ test("tool exceptions and nested public values do not copy private authority",as
  assert.equal(JSON.stringify(result).includes(receipt),false);
  assert.equal(JSON.stringify(publicValue({result:{text:receipt,pi_origin_receipt:receipt}})).includes(receipt),false);
 });
+test("thrown tool errors preserve redacted messages instead of claiming scoped execution is unavailable",async()=>{
+ const secondBody="b".repeat(43), secondReceipt="pi_receipt_"+secondBody;
+ const aligned=`prefix${receipt}${"x".repeat(256-43-11)}${secondReceipt}`;
+ const bindingEnvelope=JSON.stringify({permission_tier_binding:{call_id:"pi:1",arguments_digest:"0".repeat(64),pi_origin_receipt:receipt}});
+ assert.equal(JSON.parse(publicValue(bindingEnvelope)).permission_tier_binding.pi_origin_receipt,"[private Pi authority]");
+ for(const [name,fail,expected] of [
+  ["sync error",()=>{throw new Error("Command timed out after 30 seconds");},"Command timed out after 30 seconds"],
+  ["async rejection",()=>Promise.reject(new Error("ENOENT: no such file or directory")),"ENOENT: no such file or directory"],
+  ["adjacent and concatenated token redaction",()=>{throw new Error(`${aligned} pi_origin_receipt=secret_token`);},"prefix[private Pi authority] pi_origin_receipt=[private Pi authority]"],
+  ["flat serialized binding",()=>{throw new Error(bindingEnvelope);},"Tool execution failed"],
+  ["escaped serialized binding",()=>{throw new Error(JSON.stringify({error:bindingEnvelope}));},"Tool execution failed"],
+  ["nested serialized binding",()=>{throw new Error(JSON.stringify({permission_tier_binding:{call_id:"pi:1",detail:{nested:true}}}));},"Tool execution failed"],
+  ["plain string rejection",()=>Promise.reject("Operation aborted"),"Operation aborted"],
+  ["empty error",()=>{throw new Error("");},"Tool execution failed"],
+  ["unstringifiable throw",()=>{throw Object.create(null);},"Tool execution failed"],
+  ["throwing message getter",()=>{throw {get message(){throw new Error("boom");}};},"Tool execution failed"],
+ ]) {
+  let finishes=0,ran=0;
+  const f=fixture({override:{finish:async()=>{finishes++;return {finished:true};}}});
+  await f.client.evaluate(event,{},support);
+  const result=await f.client.execute(event,{},()=>{ran++;return fail();});
+  assert.equal(ran,1,name);
+  assert.equal(result.isError,true,name);
+  assert.deepEqual(result.content,[{type:"text",text:expected}],name);
+  assert.deepEqual(result.details,{},name);
+  assert.equal(JSON.stringify(result).includes(receipt),false,name);
+  assert.equal(JSON.stringify(result).includes(secondBody),false,name);
+  assert.equal(JSON.stringify(result).includes("secret_token"),false,name);
+  assert.equal(JSON.stringify(result).includes("pi:1"),false,name);
+  assert.equal(await f.client.finish(event),true,name);
+  assert.equal(finishes,1,name);
+ }
+ // A thrown tool error leaves the scoped client unsealed for subsequent calls.
+ const f=fixture();
+ await f.client.evaluate(event,{},support);
+ await f.client.execute(event,{},()=>{throw new Error("Command timed out after 30 seconds");});
+ assert.equal(await f.client.finish(event),true);
+ const next={...event,toolCallId:"next"};
+ assert.deepEqual(await f.client.evaluate(next,{},support),{block:false});
+ assert.deepEqual(await f.client.execute(next,{},()=>f.start()),{content:[{type:"text",text:"read"}]});
+ assert.equal(f.starts(),1);
+ // Pre-start authority/ACK refusal still reports unavailable scoped execution.
+ const refused=fixture({override:{execute:async(_body,ack)=>ack({executed:false})}});
+ await refused.client.evaluate(event,{},support);
+ const refusedResult=await refused.client.execute(event,{},()=>refused.start());
+ assert.equal(refused.starts(),0);
+ assert.equal(refusedResult.isError,true);
+ assert.deepEqual(refusedResult.content,[{type:"text",text:"Scoped Pi execution is unavailable"}]);
+});
 test("untrusted endpoint postures fail before connection",async()=>{
  for(const endpoint of ["http://0.0.0.0:9000","http://example.test:9000","https://127.0.0.1:9000","http://127.0.0.1:9000/?next=remote"])
   await assert.rejects(connectAttestor({endpoint,credential:"fixture",brokerIncarnation:"epoch",launchEpoch:"launch"}));
