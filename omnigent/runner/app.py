@@ -15147,6 +15147,22 @@ def create_runner_app(
                 )
             return Response(status_code=204)
 
+        if body_type == "codex_permission_readback":
+            from omnigent.runner.native_controls import _read_codex_native_permission_observation
+
+            if _session_harness_name(conversation_id) != "codex-native":
+                return Response(status_code=204)
+            state = await _codex_native_bridge_state_for_session(
+                conversation_id,
+                action="permission readback",
+                missing_state_log_level=logging.DEBUG,
+            )
+            if state is not None:
+                observed = await _read_codex_native_permission_observation(state)
+                if observed is not None:
+                    return JSONResponse(content={"permission_observation": observed.to_payload()})
+            return Response(status_code=204)
+
         codex_goal_response = await codex_goal_runner.handle_event(
             conversation_id,
             body_type,

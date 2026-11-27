@@ -31,6 +31,7 @@ from collections.abc import (
 )
 from dataclasses import dataclass
 from datetime import UTC
+from functools import partial
 from pathlib import PurePath
 from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple, cast
 
@@ -365,6 +366,7 @@ from omnigent.server.schemas import (
 )
 from omnigent.server.session_metadata_logging import harness_attributes
 from omnigent.server.startup_inputs import ManagedStartupInputs, StartupInputContext
+from omnigent.session_default_modes import CODEX_NATIVE_PERMISSION_DEFAULT_ARGS
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
@@ -4303,19 +4305,105 @@ def _codex_permission_observation_labels(
     }, decode_codex_permission_observation(encoded)
 
 
+_CODEX_PERMISSION_RECONCILE_TIMEOUT_S = 5.0
+
+
+async def _read_current_codex_permission_observation(
+    current: Conversation, runner_router: RunnerRouter | None
+) -> CodexPermissionObservation | None:
+    """Read the bound native thread after competing reports have reached the server."""
+    try:
+        client = await _get_runner_client(
+            current.id, runner_router, conversation=current, for_control=True
+        )
+        if client is None:
+            return None
+    except OmnigentError:
+        return None
+    for _ in range(2):
+        try:
+            async with asyncio.timeout(_CODEX_PERMISSION_RECONCILE_TIMEOUT_S):
+                result = await client.post(
+                    f"/v1/sessions/{current.id}/events", json={"type": "codex_permission_readback"}
+                )
+            if result.status_code == 200:
+                observed = codex_permission_observation_from_payload(
+                    result.json()["permission_observation"]
+                )
+                return observed if observed.origin == "resume" else None
+            if result.status_code != 204 and result.status_code < 500:
+                return None
+        except (ConnectionError, TimeoutError, httpx.TransportError):
+            continue
+        except (KeyError, TypeError, ValueError):
+            return None
+    return None
+
+
+async def _save_codex_permission_observation(
+    current: Conversation,
+    observed: CodexPermissionObservation,
+    fallback: CodexPermissionObservation,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+    *,
+    update_launch_args: Callable[[list[str] | None], list[str]] | None = None,
+) -> bool:
+    for attempt in range(2):
+        try:
+            labels, observed = _codex_permission_observation_labels(observed, current)
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        result = await asyncio.to_thread(
+            conversation_store.save_runner_permission_readback,
+            current,
+            labels,
+            update_launch_args=update_launch_args,
+        )
+        if result == "saved":
+            # A prior attempt may have persisted before its publish failed.
+            return await asyncio.to_thread(
+                conversation_store.publish_runner_permission_readback,
+                current,
+                labels[CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY],
+                partial(_publish_codex_approval_mode, current.id, observed.mode, observed),
+            )
+        if result == "binding-changed":
+            return False
+        if attempt == 0:
+            latest = await asyncio.to_thread(conversation_store.get_conversation, current.id)
+            if latest is None or (latest.host_id, latest.runner_id) != (
+                current.host_id,
+                current.runner_id,
+            ):
+                return False
+            current = latest
+            observed = (
+                await _read_current_codex_permission_observation(current, runner_router)
+                or fallback
+            )
+    raise OmnigentError("Concurrent Codex permission updates; try again", code=ErrorCode.CONFLICT)
+
+
 async def _persist_web_codex_permission_observation(
     session_id: str,
     before: Conversation,
     requested_mode: str,
     observed: CodexPermissionObservation,
     conversation_store: ConversationStore,
-) -> None:
+    runner_router: RunnerRouter | None,
+    *,
+    save_launch_args: bool = False,
+) -> bool:
     """Reconcile a runner response with reports received during the web switch."""
     change = _live_settings_change(session_id)
     async with change.write_lock:
         current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-        if current is None or current.runner_id != before.runner_id:
-            return
+        if current is None or (current.host_id, current.runner_id) != (
+            before.host_id,
+            before.runner_id,
+        ):
+            return False
         key = CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY
         previous = current.labels.get(key)
         if previous and previous != before.labels.get(key):
@@ -4329,12 +4417,29 @@ async def _persist_web_codex_permission_observation(
                     and competing.source == "native-settings"
                 ):
                     if competing.mode != requested_mode:
-                        observed = codex_permission_application_receipt(requested_mode)
+                        observed = await _read_current_codex_permission_observation(
+                            current, runner_router
+                        ) or codex_permission_application_receipt(requested_mode)
                     elif observed.source == "application-receipt":
-                        return
-        labels, observed = _codex_permission_observation_labels(observed, current)
-        await asyncio.to_thread(conversation_store.set_labels, session_id, labels)
-        _publish_codex_approval_mode(session_id, observed.mode, observed)
+                        if not save_launch_args:
+                            return True
+                        observed = competing
+        update_launch_args = (
+            partial(
+                _merge_codex_permission_launch_args,
+                permission_args=CODEX_NATIVE_PERMISSION_DEFAULT_ARGS[requested_mode],
+            )
+            if save_launch_args
+            else None
+        )
+        return await _save_codex_permission_observation(
+            current,
+            observed,
+            codex_permission_application_receipt(requested_mode),
+            conversation_store,
+            runner_router,
+            update_launch_args=update_launch_args,
+        )
 
 
 async def _persist_external_codex_approval_mode_change(
@@ -4342,6 +4447,7 @@ async def _persist_external_codex_approval_mode_change(
     conv: Conversation,
     body: SessionEventInput,
     conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
 ) -> None:
     """Keep producer readback separate from legacy explicit control fields."""
     if "permission_observation" in body.data:
@@ -4358,19 +4464,23 @@ async def _persist_external_codex_approval_mode_change(
         change = _live_settings_change(session_id)
         async with change.write_lock:
             current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if current is None or current.runner_id != conv.runner_id:
+            if current is None or (current.host_id, current.runner_id) != (
+                conv.host_id,
+                conv.runner_id,
+            ):
                 return
             key = CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY
+            fallback = CodexPermissionObservation()
             if conv.labels.get(key) != current.labels.get(key):
-                return
-            try:
-                labels, observed = _codex_permission_observation_labels(observed, current)
-            except ValueError as exc:
-                raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
-            if any(current.labels.get(key) != value for key, value in labels.items()):
-                await asyncio.to_thread(conversation_store.set_labels, session_id, labels)
-            # A prior attempt may have persisted before its publish failed.
-            _publish_codex_approval_mode(session_id, observed.mode, observed)
+                # The two Codex signals carry no common sequence. Re-read the
+                # thread before acknowledging a report that crossed a web write.
+                observed = (
+                    await _read_current_codex_permission_observation(current, runner_router)
+                    or fallback
+                )
+            await _save_codex_permission_observation(
+                current, observed, fallback, conversation_store, runner_router
+            )
         return
     raw_args = body.data.get("terminal_launch_args")
     raw_mode = body.data.get("approval_mode")

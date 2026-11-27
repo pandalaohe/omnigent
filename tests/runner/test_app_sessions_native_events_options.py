@@ -1120,6 +1120,31 @@ async def test_events_codex_native_approval_mode_change_types_only_when_idle(
             json={"type": "codex_approval_mode_change", "approval_mode": "full-access"},
         )
 
+        readback_request = ("thread/resume", {"threadId": "thread_codex", "excludeTurns": True})
+        if active_turn_id is None:
+            app_client.request.assert_awaited_once_with(*readback_request)
+            app_client.close.assert_awaited_once()
+        else:
+            app_client.connect.assert_not_awaited()
+        app_client.reset_mock()
+        switch_tmux_calls = list(tmux_calls)
+        readback = await client.post(
+            f"/v1/sessions/{conv_id}/events", json={"type": "codex_permission_readback"}
+        )
+        if readback_thread == "thread_codex":
+            assert readback.status_code == 200, readback.text
+            observed = readback.json()["permission_observation"]
+            assert (observed["source"], observed["origin"], observed["mode"]) == (
+                "native-settings",
+                "resume",
+                "full-access",
+            )
+        else:
+            assert readback.status_code == 204, readback.text
+        app_client.request.assert_awaited_once_with(*readback_request)
+        app_client.close.assert_awaited_once()
+        assert tmux_calls == switch_tmux_calls
+
     if active_turn_id is None:
         assert resp.status_code == 200, resp.text
         assert resp.json()["approval_mode"] == "full-access"
@@ -1132,10 +1157,6 @@ async def test_events_codex_native_approval_mode_change_types_only_when_idle(
             )
         else:
             assert observed is None
-        app_client.request.assert_awaited_once_with(
-            "thread/resume", {"threadId": "thread_codex", "excludeTurns": True}
-        )
-        app_client.close.assert_awaited_once()
         target = instance.tmux_target
         assert tmux_calls == [
             ("send-keys", "-t", target, "C-u"),
@@ -1153,7 +1174,6 @@ async def test_events_codex_native_approval_mode_change_types_only_when_idle(
         "or stop the turn first."
     )
     assert tmux_calls == []
-    app_client.connect.assert_not_awaited()
 
 
 @pytest.mark.asyncio
