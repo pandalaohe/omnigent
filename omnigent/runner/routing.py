@@ -342,6 +342,12 @@ class RunnerRouter:
         """
         return self._registry.get(runner_id) is not None
 
+    def host_is_online(self, host_id: str) -> bool:
+        """Return whether *host_id* is connected locally or fresh in the host store."""
+        if self._host_registry is not None and self._host_registry.get(host_id) is not None:
+            return True
+        return self._host_store is not None and self._host_store.is_online(host_id)
+
     def runner_has_capability(self, runner_id: str, capability: str) -> bool:
         """
         Return whether connected runner *runner_id* advertised *capability*.
