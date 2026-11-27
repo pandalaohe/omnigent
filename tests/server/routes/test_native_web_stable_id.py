@@ -3,13 +3,16 @@
 import json
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from omnigent._wrapper_labels import CLAUDE_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
 from omnigent.entities import ConversationItem, MessageData
+from omnigent.errors import OmnigentError, WrongReplicaError
 from omnigent.harnesses.claude_native.bridge import (
     _claim_message_delivery,
     read_transcript_items_from_offset,
@@ -21,19 +24,146 @@ from omnigent.native.input_diagnostics import input_delivery_scope
 from omnigent.runner.app_support import _resolve_forwarded_message_content
 from omnigent.runtime import pending_inputs
 from omnigent.runtime.harnesses._executor_adapter import _normalize_message_content
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, UnifiedAuthProvider
 from omnigent.server.routes._sessions.helpers import _publish_session_superseded
 from omnigent.server.routes._sessions.orchestration import (
     _persist_external_conversation_item,
+    _record_native_input_lifecycle,
     _settle_lost_runner_input,
     _settle_undelivered_native_input,
 )
-from omnigent.server.schemas import SessionEventInput
+from omnigent.server.routes.sessions import create_sessions_router, routes_events
+from omnigent.server.schemas import (
+    SessionEventInput,
+    SessionInputDismissedEvent,
+    SessionInputSendingEvent,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from tests.server.routes.test_shell_permission_gate import _StubPermissionStore
 
 _WEB_ID = "a" * 32
 _OTHER_WEB_ID = "b" * 32
 _FORGED_ID = "c" * 32
 _LITERAL_ATTACHMENT_MARKER = "[Attached: /opt/work/status.txt]"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["claude-native", "codex-native", "pi-native"])
+async def test_pending_input_dismissal_is_display_only_after_native_handoff(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, harness: str
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Native")
+    permissions = _StubPermissionStore()
+    editor, viewer = "editor@example.com", "viewer@example.com"
+    permissions.add_grant(editor, conv.id, LEVEL_EDIT)
+    permissions.add_grant(viewer, conv.id, LEVEL_READ)
+    app = FastAPI()
+    app.include_router(
+        create_sessions_router(
+            conversation_store=store,
+            agent_store=Mock(),
+            permission_store=permissions,  # type: ignore[arg-type]
+            auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+        ),
+        prefix="/v1",
+    )
+
+    @app.exception_handler(OmnigentError)
+    async def handle_error(_request: Request, error: OmnigentError) -> JSONResponse:
+        return JSONResponse(status_code=error.http_status, content={"error": error.message})
+
+    publish = Mock()
+    monkeypatch.setattr("omnigent.runtime.session_stream.publish", publish)
+    content = [{"type": "input_text", "text": "queued prompt"}]
+    pending_id = pending_inputs.record(
+        conv.id,
+        content,
+        created_by=editor,
+        stable_id=_WEB_ID,
+        native_harness=harness,
+        runner_managed=harness == "claude-native",
+    )
+    other_id = pending_inputs.record(
+        conv.id, [{"type": "input_text", "text": "another prompt"}], stable_id=_OTHER_WEB_ID
+    )
+    path = f"/v1/sessions/{conv.id}/pending-inputs/{pending_id}"
+    attrs = pending_inputs.delivery_attributes_for(conv.id, pending_id)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            pending_inputs.mark_delivery_stage(conv.id, pending_id, "forward_accepted")
+            if harness == "claude-native":
+                assert pending_inputs.claim_runner_input(conv.id, pending_id, "a" * 32)
+            _record_native_input_lifecycle(conv.id, {"type": "response.completed", **attrs})
+            response = await client.delete(path, headers={"X-Forwarded-Email": editor})
+            assert response.status_code == 409, response.text
+            assert "can_dismiss" not in pending_inputs.snapshot_for(conv.id)[0]
+            if harness == "pi-native":
+                # Its inbox enqueue can complete before the agent accepts the input.
+                return
+
+            _record_native_input_lifecycle(
+                conv.id,
+                {"type": "response.completed", "input_received": True, **attrs},
+            )
+            eligible = SessionInputSendingEvent.model_validate(publish.call_args.args[1])
+            assert eligible.can_dismiss and eligible.pending_id == pending_id
+            assert pending_inputs.snapshot_for(conv.id)[0]["can_dismiss"] is True
+            response = await client.delete(path, headers={"X-Forwarded-Email": viewer})
+            assert response.status_code == 403, response.text
+            assert pending_inputs.snapshot_for(conv.id)[0]["pending_id"] == pending_id
+
+            if harness == "codex-native":
+                wrong_replica = WrongReplicaError(
+                    "session is on another replica", host_id="c" * 32
+                )
+                with monkeypatch.context() as replica:
+                    replica.setattr(
+                        routes_events,
+                        "_raise_if_runner_on_another_replica",
+                        AsyncMock(side_effect=wrong_replica),
+                    )
+                    response = await client.delete(path, headers={"X-Forwarded-Email": editor})
+                assert response.status_code == wrong_replica.http_status, response.text
+                assert pending_inputs.snapshot_for(conv.id)[0]["pending_id"] == pending_id
+
+            publish.reset_mock()
+            for _ in range(2):
+                response = await client.delete(path, headers={"X-Forwarded-Email": editor})
+                assert response.status_code == 204, response.text
+            assert publish.call_count == 1
+            dismissed = SessionInputDismissedEvent.model_validate(publish.call_args.args[1])
+            assert dismissed.pending_id == pending_id
+            assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(conv.id)] == [
+                other_id
+            ]
+
+        # Other mirrors can arrive before this message's own exact mirror.
+        await _persist_external_conversation_item(
+            conv.id, conv, _mirror("another prompt", source_id="other-send"), store
+        )
+        await _persist_external_conversation_item(
+            conv.id,
+            conv,
+            _mirror("typed in the terminal", source_id="other-terminal-prompt"),
+            store,
+        )
+        assert pending_inputs.pending_ids(conv.id) == [pending_id]
+
+        item_id, _ = await _persist_external_conversation_item(
+            conv.id, conv, _mirror("queued prompt"), store
+        )
+        assert item_id is not None
+        saved = store.get_item(conv.id, item_id)
+        assert saved is not None
+        assert saved.created_by == editor
+        assert isinstance(saved.data, MessageData) and saved.data.content == content
+        assert pending_inputs.pending_ids(conv.id) == []
+    finally:
+        pending_inputs.resolve(conv.id, pending_id)
+        pending_inputs.resolve(conv.id, other_id)
 
 
 def _mirror(

@@ -278,6 +278,25 @@ describe("parseEvent — session.input.sending", () => {
       ...extra,
     });
   });
+
+  it("carries the display action and the dismissal by pending id", () => {
+    expect(
+      parseEvent("session.input.sending", {
+        pending_id: "pending_steer",
+        since_ms: null,
+        can_dismiss: true,
+      }),
+    ).toEqual({
+      type: "session_input_sending",
+      pendingId: "pending_steer",
+      sinceMs: null,
+      canDismiss: true,
+    });
+    expect(parseEvent("session.input.dismissed", { pending_id: "pending_steer" })).toEqual({
+      type: "session_input_dismissed",
+      pendingId: "pending_steer",
+    });
+  });
 });
 
 describe("parseEvent — response.output_text.delta", () => {

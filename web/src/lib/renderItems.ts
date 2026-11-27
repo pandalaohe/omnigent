@@ -213,6 +213,8 @@ export type Bubble =
       pending?: boolean;
       /** Pending input sent mid-turn that the agent hasn't read yet. */
       awaitingAgent?: boolean;
+      /** Server pending ID for an input that can be removed from chat. */
+      dismissiblePendingId?: string;
       /** Pending input whose send request has not been answered for a while. */
       stillSending?: boolean;
       sendingSinceMs?: number;
@@ -2153,6 +2155,7 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
       a.itemId !== b.itemId ||
       Boolean(a.pending) !== Boolean(b.pending) ||
       Boolean(a.awaitingAgent) !== Boolean(b.awaitingAgent) ||
+      a.dismissiblePendingId !== b.dismissiblePendingId ||
       Boolean(a.stillSending) !== Boolean(b.stillSending) ||
       a.sendingSinceMs !== b.sendingSinceMs ||
       a.uploadProgress !== b.uploadProgress ||

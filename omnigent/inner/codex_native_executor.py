@@ -1803,7 +1803,11 @@ class CodexNativeExecutor(Executor):
                 or (undelivered and state is not None and state.active_turn_id is not None),
             )
         else:
-            yield TurnComplete(response=None, native_acceptance=native_acceptance)
+            yield TurnComplete(
+                response=None,
+                input_received=native_acceptance is not None,
+                native_acceptance=native_acceptance,
+            )
 
     def _record_owned_turn(self, state: CodexNativeBridgeState) -> None:
         self._owned_turn_state = state

@@ -1199,9 +1199,11 @@ export type StreamEvent =
       sinceMs: number | null;
       /** The native agent accepted the input; it may wait for the turn's next step. */
       received?: boolean;
+      canDismiss?: boolean;
       /** The client's id for the input, for a sender whose POST has not returned yet. */
       stableId?: string;
     }
+  | { type: "session_input_dismissed"; pendingId: string }
   | SessionInterruptedEvent
   | SessionCreatedEvent
   | SessionSupersededEvent

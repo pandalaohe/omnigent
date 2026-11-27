@@ -994,8 +994,15 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       pendingId,
       sinceMs,
       ...(data.received === true ? { received: true } : {}),
+      ...(data.can_dismiss === true ? { canDismiss: true } : {}),
       ...(typeof data.stable_id === "string" ? { stableId: data.stable_id } : {}),
     };
+  }
+  if (eventType === "session.input.dismissed") {
+    const pendingId = data.pending_id;
+    return typeof pendingId === "string" && pendingId
+      ? { type: "session_input_dismissed", pendingId }
+      : null;
   }
   if (eventType === "session.input.consumed") {
     // Nested envelope: `{type, data: {item_id, type, data}}`.

@@ -779,6 +779,7 @@ function seedPendingInputs(
     stable_id?: string;
     sending_since_ms?: number;
     received?: boolean;
+    can_dismiss?: boolean;
   }[],
 ): void {
   sessionPendingInputs.set(id, inputs);
@@ -2338,6 +2339,28 @@ describe("chatStore — switchTo", () => {
         replayed: true,
       },
     ]);
+  });
+
+  it("clears only the dismissed server pending id when a collaborator removes it", async () => {
+    const conversationId = "conv_dismiss_pending";
+    const content = [{ type: "input_text", text: "queued message" }];
+    seedSession(conversationId);
+    seedPendingInputs(conversationId, [
+      { pending_id: "pending_received", content, can_dismiss: true },
+      { pending_id: "pending_waiting", content },
+    ]);
+    await useChatStore.getState().switchTo(conversationId);
+
+    const before = buildPendingBubbles(useChatStore.getState().pendingUserMessages, null);
+    expect(before[0]).toMatchObject({ dismissiblePendingId: "pending_received" });
+    expect(before[1]).not.toHaveProperty("dismissiblePendingId");
+
+    handleSessionEvent({ type: "session_input_dismissed", pendingId: "pending_received" });
+
+    expect(useChatStore.getState().pendingUserMessages.map(({ tempId }) => tempId)).toEqual([
+      "pending_waiting",
+    ]);
+    expect(useChatStore.getState().blocks).toEqual([]);
   });
 
   it("replays a received paste as received on a reload or second device", async () => {
