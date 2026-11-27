@@ -3889,7 +3889,7 @@ async def test_project_blocked_agents_enforced_at_funnel_choice_routing_and_suba
     rec = choice_record(env.store.get_conversation(r5.json()["id"]))
     assert rec is not None
     assert any(
-        s.get("agent") == agent_a and s.get("why") == "blocked_for_project"
+        s["link"]["agent"] == agent_a and s["why"] == "blocked_for_project"
         for s in rec.get("skipped", [])
     )
 
@@ -4089,12 +4089,6 @@ async def test_j1_independent_opens_use_project_host_default_and_respect_boundar
         assert not isinstance(sel_20b, _AdmitBodyOverride)
         assert sel_20b.body.agent_id == agent_a
 
-    # Scenario 23a: child create in P keeps session choice pin ("p0" -> agent_a), NOT J1
-    r23_child = await create(env, project_id=proj_id, host_id=HOST, workspace="/opt/work/project")
-    assert r23_child.status_code == 201, r23_child.text
-    assert r23_child.json()["agent_id"] == agent_a
-    assert choice_record(env.store.get_conversation(r23_child.json()["id"])) is not None
-
     # Scenario 23b: independent create with explicit project_id=None → unfiled, J1 does NOT fire
     body_23_null = ProjectSessionCreateRequest(
         project_id=None, host_id=HOST, workspace="/opt/work/project", work_type="work"
@@ -4103,6 +4097,12 @@ async def test_j1_independent_opens_use_project_host_default_and_respect_boundar
         assert sel_23_null is not None
         assert not isinstance(sel_23_null, _AdmitBodyOverride)
         assert sel_23_null.body.agent_id == agent_a
+
+    # Scenario 23a: child create in P keeps session choice pin ("p0" -> agent_a), NOT J1
+    r23_child = await create(env, project_id=proj_id, host_id=HOST, workspace="/opt/work/project")
+    assert r23_child.status_code == 201, r23_child.text
+    assert r23_child.json()["agent_id"] == agent_a
+    assert choice_record(env.store.get_conversation(r23_child.json()["id"])) is not None
 
     # Scenario 21: project session_choice="off", independent orchestrated create without agent_id
     # gets project default agent_b, while explicit agent_id=agent_a keeps agent_a
