@@ -378,6 +378,7 @@ export function TerminalView({
   const isDarkRef = useRef(isDark);
   isDarkRef.current = isDark;
   const sessionRef = useRef<TerminalSession | null>(null);
+  const reconnectSessionRef = useRef<(() => boolean) | null>(null);
   const terminalPaste = useTerminalPaste(sessionRef, clipboardScope, active, readOnly);
   const cancelPaste = terminalPaste.cancel;
   const [copySheet, setCopySheet] = useState<string | null>(null);
@@ -756,6 +757,7 @@ export function TerminalView({
   const disposeActiveSession = useCallback(() => {
     cancelPaste();
     setCopySheet(null);
+    reconnectSessionRef.current = null;
     sessionRef.current?.dispose();
     sessionRef.current = null;
   }, [cancelPaste]);
@@ -839,13 +841,7 @@ export function TerminalView({
       // only after the first await)? React 18 never calls the ref cleanup.
       const superseded = () =>
         cancelled || attachGenerationRef.current !== generation || !mountedRef.current;
-      void (async () => {
-        // The awaited microtask preserves the StrictMode-collapse
-        // behavior queueMicrotask provided; the URL resolution (when a
-        // direct URL exists) adds real async time, so re-check after
-        // every await.
-        await Promise.resolve();
-        if (superseded()) return;
+      const resolveAttach = async () => {
         // Browser WebSockets carry the host ID in the query string so they
         // reach the replica holding the runner tunnel. A host proven keyless
         // dials unkeyed; a hostless session carries the client's own key.
@@ -877,6 +873,13 @@ export function TerminalView({
         // direct only when the loopback listener is already known
         // reachable; otherwise it returns the relay URL immediately.
         const url = await resolveInitialAttachUrl(directUrl, relayUrl);
+        return { url, isRelay: url === relayUrl, directUrl };
+      };
+      void (async () => {
+        // Collapse StrictMode's synchronous attach and cleanup into a single dial.
+        await Promise.resolve();
+        if (superseded()) return;
+        const { url, isRelay, directUrl } = await resolveAttach();
         if (superseded()) return;
         terminalSession = new TerminalSession(
           node,
@@ -896,18 +899,30 @@ export function TerminalView({
           (...args) => {
             if (!superseded()) onClipboardActionRef.current(...args);
           },
-          url === relayUrl,
+          isRelay,
         );
         sessionRef.current = terminalSession;
+        reconnectSessionRef.current = () => {
+          if (superseded() || !terminalSession?.reconnect?.(resolveAttach)) return false;
+          upgradeCtl.abort();
+          return true;
+        };
         // Relay-connected with a direct URL on offer: negotiate the
         // loopback upgrade in the background. In Chrome this is what
         // raises the Local Network Access prompt; the probe socket
         // waits out the user's decision behind the live relay session.
         // On success, re-dial — the known-good cache makes the remount
         // pick the direct URL.
-        if (directUrl !== undefined && url === relayUrl) {
+        if (directUrl !== undefined && isRelay) {
           const upgraded = await watchDirectUpgrade(directUrl, upgradeCtl.signal);
           if (superseded() || !upgraded) return;
+          if (reconnectSessionRef.current?.()) {
+            dialSeqRef.current += 1;
+            connectStartedAtRef.current = Date.now();
+            setCopySheet(null);
+            notifyState({ kind: "connecting" });
+            return;
+          }
           disposeActiveSession();
           setConnectAttempt((attempt) => attempt + 1);
         }
@@ -916,6 +931,7 @@ export function TerminalView({
         cancelled = true;
         upgradeCtl.abort();
         terminalSession?.dispose();
+        reconnectSessionRef.current = null;
         sessionRef.current = null;
         if (terminalNodeRef.current === node) terminalNodeRef.current = null;
         onStateChangeRef.current?.(null);
@@ -997,11 +1013,16 @@ export function TerminalView({
       setReconnectPending(true);
       dialSeqRef.current += 1;
       connectStartedAtRef.current = Date.now();
+      if (reconnectSessionRef.current?.()) {
+        setCopySheet(null);
+        notifyState({ kind: "connecting" });
+        return;
+      }
       stateRef.current = { kind: "connecting" };
       disposeActiveSession();
       setConnectAttempt((attempt) => attempt + 1);
     },
-    [disposeActiveSession],
+    [disposeActiveSession, notifyState],
   );
 
   const triggerReconnect = useCallback(() => startRedial(true), [startRedial]);
@@ -1143,11 +1164,8 @@ export function TerminalView({
 
   // Auto-reconnect on transport-level drops (background-tab freezes,
   // server restarts — see isUnexpectedTerminalClose). Deliberate
-  // closes keep the dead-end overlay so a terminal the server ended
-  // isn't resurrected in a loop. The re-dial reuses the resume path's
-  // remount: bumping connectAttempt swaps the keyed mount node, which
-  // disposes the dead session and attaches a fresh one — tmux
-  // re-renders the full screen on attach, so nothing visible is lost.
+  // closes keep the dead-end overlay. A negotiated ConPTY re-dial keeps
+  // xterm mounted to receive the missed bytes. Other attaches remount.
   useEffect(() => {
     if (state.kind === "connected") {
       connectedAtRef.current = Date.now();

@@ -896,6 +896,24 @@ async def test_attach_terminal_proxy_forwards_await_launch(app: FastAPI) -> None
     ]
 
 
+async def test_attach_terminal_proxy_carries_conpty_cursor_and_output_ack(app: FastAPI) -> None:
+    epoch = "0123456789abcdef" * 2
+    conn = _FakeRunnerWSConn(wait_close_after=1)
+    factory = _FakeRunnerWSFactory(conn)
+    set_runner_ws_factory(factory)
+    attach = "/v1/sessions/conv_ws/resources/terminals/terminal_bash_s1/attach"
+    replay = f"conpty_replay=2&replay_epoch={epoch}&since_offset=42"
+
+    with TestClient(app).websocket_connect(f"{attach}?{replay}&unrelated=omit") as ws:
+        ack = '{"type":"output_ack","offset":49}'
+        ws.send_text(ack)
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_bytes()
+
+    assert factory.calls == [f"{attach}?read_only=false&{replay}"]
+    assert conn.received == [ack]
+
+
 async def test_attach_terminal_proxy_forwards_browser_bytes_to_runner(
     app: FastAPI,
 ) -> None:

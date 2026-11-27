@@ -6,8 +6,9 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any, Final
 
 if TYPE_CHECKING:
@@ -31,6 +32,18 @@ WS_CLOSE_INTERNAL_ERROR: Final[int] = 4500
 
 # A local tmux liveness probe should never stall bridge teardown.
 _TMUX_HAS_SESSION_TIMEOUT_S: Final[float] = 2.0
+
+
+def terminal_replay_params(query: Mapping[str, str]) -> dict[str, str]:
+    """Keep only the advertised ConPTY protocol and a well-formed resume cursor."""
+    if query.get("conpty_replay") != "2":
+        return {}
+    params = {"conpty_replay": "2"}
+    epoch = query.get("replay_epoch", "")
+    offset = query.get("since_offset", "")
+    if re.fullmatch(r"[0-9a-f]{32}", epoch) and re.fullmatch(r"[0-9]{1,16}", offset):
+        params.update(replay_epoch=epoch, since_offset=offset)
+    return params
 
 
 def make_terminal_pong_frame(frame: dict[str, Any]) -> str | None:

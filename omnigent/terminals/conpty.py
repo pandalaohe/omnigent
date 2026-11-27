@@ -107,6 +107,7 @@ def windows_terminal_environment(
 class _OutputState:
     chunks: deque[bytes] = field(default_factory=deque)
     size: int = 0
+    end_offset: int = 0
     limit: int = _RING_BYTES
     modes: dict[int, bool] = field(default_factory=lambda: {mode: mode == 25 for mode in _MODES})
     carry: bytes = b""
@@ -127,6 +128,7 @@ class _OutputState:
         )
         self.chunks.append(chunk)
         self.size += len(chunk)
+        self.end_offset += len(chunk)
         overflow = self.size > self.limit
         while self.size > self.limit and self.chunks:
             self.size -= len(self.chunks.popleft())
@@ -151,6 +153,45 @@ class _OutputState:
 
     def snapshot(self) -> bytes:
         return b"".join(self.chunks)
+
+    @property
+    def base_offset(self) -> int:
+        return self.end_offset - self.size
+
+    def read_from(self, offset: int, limit: int) -> bytes | None:
+        """Return at most limit bytes, or None if the cursor is outside the ring."""
+        if not self.base_offset <= offset <= self.end_offset:
+            return None
+        if offset == self.end_offset:
+            return b""
+        skip = offset - self.base_offset
+        if skip > self.end_offset - offset:
+            # Live output is near the end even when the ring holds a long history.
+            remaining = min(limit, self.end_offset - offset)
+            skip = self.end_offset - offset - remaining
+            sections: list[bytes] = []
+            for chunk in reversed(self.chunks):
+                if skip >= len(chunk):
+                    skip -= len(chunk)
+                    continue
+                end = len(chunk) - skip
+                section = chunk[max(0, end - remaining) : end]
+                sections.append(section)
+                remaining -= len(section)
+                if remaining == 0:
+                    break
+                skip = 0
+            return b"".join(reversed(sections))
+        result = bytearray()
+        for chunk in self.chunks:
+            if skip >= len(chunk):
+                skip -= len(chunk)
+                continue
+            result.extend(chunk[skip : skip + limit - len(result)])
+            if len(result) == limit:
+                break
+            skip = 0
+        return bytes(result)
 
     def prelude(self) -> bytes:
         return b"".join(
@@ -208,7 +249,11 @@ class ConPtyTerminalInstance(TerminalInstance):
     _process: PseudoConsoleProcess | None = field(default=None, init=False, repr=False)
     _output: _OutputState = field(default_factory=_OutputState, init=False, repr=False)
     _output_lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
+    _resize_lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
+    _input_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    attach_input_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
     _subscribers: list[_OutputQueue] = field(default_factory=list, init=False, repr=False)
+    _output_waiters: set[asyncio.Future[None]] = field(default_factory=set, init=False, repr=False)
     _reader_done: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _exit_done: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _reader: threading.Thread | None = field(default=None, init=False, repr=False)
@@ -253,6 +298,7 @@ class ConPtyTerminalInstance(TerminalInstance):
                     self._screen_changed_at = time.monotonic()
                     for queue in self._subscribers:
                         queue.offer(chunk)
+                    self._wake_output_waiters()
                     callback = self._on_activity
                 if callback is not None:
                     self._fire_watch_callback(callback, "activity")
@@ -280,6 +326,7 @@ class ConPtyTerminalInstance(TerminalInstance):
                 self._exit_done.set()
                 for queue in self._subscribers:
                     queue.offer(None)
+                self._wake_output_waiters()
                 callback, self._on_exit = self._on_exit, None
             if callback is not None:
                 self._fire_watch_callback(callback, "exit")
@@ -295,6 +342,50 @@ class ConPtyTerminalInstance(TerminalInstance):
                 queue.offer(None)
             return AttachSeed(data, queue)
 
+    def replay_start(self, epoch: str | None, offset: int | None) -> tuple[int, int, bytes | None]:
+        """Choose a retained cursor. A prelude marks a fresh screen or a history gap."""
+        with self._output_lock:
+            output = self._output
+            if (
+                epoch == self.instance_id
+                and offset is not None
+                and output.base_offset <= offset <= output.end_offset
+            ):
+                return offset, output.end_offset, None
+            start = output.end_offset if output.modes[1049] else output.base_offset
+            return start, output.end_offset, output.prelude()
+
+    def read_replay(self, offset: int, limit: int) -> bytes | None:
+        with self._output_lock:
+            return self._output.read_from(offset, limit)
+
+    async def wait_for_output(self, offset: int) -> bool:
+        """Wait at the current end. Return False when the process has drained."""
+        with self._output_lock:
+            if offset != self._output.end_offset:
+                return True
+            if self._exit_done.is_set():
+                return False
+            waiter = asyncio.get_running_loop().create_future()
+            self._output_waiters.add(waiter)
+        try:
+            await waiter
+        finally:
+            with self._output_lock:
+                self._output_waiters.discard(waiter)
+        return True
+
+    def _wake_output_waiters(self) -> None:
+        # The caller holds the output lock; one scheduled wake covers any following chunks.
+        def wake(waiter: asyncio.Future[None]) -> None:
+            if not waiter.done():
+                waiter.set_result(None)
+
+        for waiter in self._output_waiters:
+            with contextlib.suppress(RuntimeError):
+                waiter.get_loop().call_soon_threadsafe(wake, waiter)
+        self._output_waiters.clear()
+
     def unsubscribe(self, queue: _OutputQueue) -> None:
         with self._output_lock:
             queue.active = False
@@ -302,18 +393,21 @@ class ConPtyTerminalInstance(TerminalInstance):
                 self._subscribers.remove(queue)
 
     def request_repaint(self) -> None:
-        self.resize(self.cols, self.rows)
+        with self._resize_lock:
+            self.resize(self.cols, self.rows)
 
-    def resize(self, cols: int, rows: int) -> None:
-        if self._process is not None:
-            self._process.resize(cols, rows)
-            self.cols, self.rows = cols, rows
+    def resize(self, cols: int, rows: int, *, force: bool = True) -> None:
+        with self._resize_lock:
+            if self._process is not None and (force or (cols, rows) != (self.cols, self.rows)):
+                self._process.resize(cols, rows)
+                self.cols, self.rows = cols, rows
 
     def write_input(self, data: bytes) -> None:
-        if self._process is None or not self.running:
-            raise OSError("terminal is not running")
-        self.note_input()
-        self._process.write(data)
+        with self._input_lock:
+            if self._process is None or not self.running:
+                raise OSError("terminal is not running")
+            self.note_input()
+            self._process.write(data)
 
     async def send(self, text: str | None = None, *, keys: str = "Enter") -> TerminalResult:
         if not self.running:
