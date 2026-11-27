@@ -16,6 +16,7 @@ from pydantic import (
     Field,
     StrictInt,
     StrictStr,
+    ValidationError,
     model_validator,
 )
 
@@ -23,6 +24,7 @@ from omnigent.calling_defaults import (
     CallingResolution,
     _catalog_efforts,
     check_calling_defaults,
+    default_agent_for_host_or_legacy,
     load_master,
     model_option_harnesses,
     resolve_calling,
@@ -34,6 +36,7 @@ from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_availability import HARNESS_NEEDS_AUTH, reported_harness_availability
 from omnigent.harness_capabilities import IntegrationMode
 from omnigent.harness_plugins import capability_for_harness
+from omnigent.project_agent_blocks import check_default_agents_not_blocked
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider, effective_admin
 from omnigent.server.model_resolution import ResolutionContext, read_provider_groups
 from omnigent.server.project_host_agents import resolve_project_host_template
@@ -119,6 +122,26 @@ class _SettingsPatch(BaseModel):
 
 def _invalid(field: str, message: str) -> OmnigentError:
     return OmnigentError(f"{field}: {message}", code=ErrorCode.INVALID_INPUT)
+
+
+def _canonical_harness(harness: str | None) -> str | None:
+    if harness is None:
+        return None
+    return harness if harness.startswith("acp:") else canonicalize_harness(harness) or harness
+
+
+def validate_project_orchestration(value: object) -> None:
+    """Validate ``config.orchestration`` with the same rules as ``PUT /settings``."""
+    if not isinstance(value, dict):
+        raise _invalid("orchestration", "must be an object")
+    filtered = {key: item for key, item in value.items() if key != "setup"}
+    try:
+        _OrchestrationPatch.model_validate(filtered)
+    except ValidationError as exc:
+        first = exc.errors(include_context=False)[0]
+        loc = ".".join(str(part) for part in first.get("loc", ()))
+        prefix = f"orchestration.{loc}" if loc else "orchestration"
+        raise _invalid(prefix, str(first.get("msg", "invalid value"))) from exc
 
 
 def _available_speed(harness: str, model: str | None, catalog: dict[str, Any] | None) -> list[str]:
@@ -359,6 +382,14 @@ def create_project_settings_router(
 
         return _create_resolved_harness(agent, None, agent_cache), agent.name
 
+    def default_harness_for_host(
+        config: dict[str, Any], host_id: str, owner: str, state: Any
+    ) -> str | None:
+        default_agent = default_agent_for_host_or_legacy(config, host_id)
+        if not default_agent or default_agent.startswith("ca_"):
+            return None
+        return _canonical_harness(agent_lookup(default_agent, owner, state)[0])
+
     async def render(
         request: Request,
         project: Any,
@@ -411,13 +442,14 @@ def create_project_settings_router(
         for host in hosts:
             if host_filter is not None and host.host_id != host_filter:
                 continue
-            configured = set((host.configured_harnesses or {}).keys())
-            saved = (project.config.get("calling_defaults") or {}).get(host.host_id) or {}
-            configured.update((saved.get("harnesses") or {}).keys())
-            configured.update(model_option_harnesses())
-            if canonical is not None:
-                configured = {canonical}
-            for harness in sorted(configured):
+            default_harness = default_harness_for_host(
+                project.config, host.host_id, owner, request.app.state
+            )
+            if default_harness is None:
+                continue
+            if canonical is not None and canonical != default_harness:
+                continue
+            for harness in (default_harness,):
                 if capability_for_harness(harness) is None:
                     continue
 
@@ -534,6 +566,7 @@ def create_project_settings_router(
                 "Project settings changed. Read again before updating.", code=ErrorCode.CONFLICT
             )
         next_config, named = _apply_patch(project.config, body)
+        check_default_agents_not_blocked(next_config)
         warnings: list[str] = []
         host_map, catalog_map, _hosts, master, models = await context(project, warnings=warnings)
         owner = project.user_id or RESERVED_USER_LOCAL
@@ -634,7 +667,21 @@ def create_project_settings_router(
             ).outcome not in {"exact", "renamed", "pinned"}:
                 raise _invalid("project.model", "model is not offered by the selected host")
         if body.host and body.host.harnesses:
+            host_default_harness = default_harness_for_host(
+                next_config, body.host.host_id, owner, request.app.state
+            )
             for harness, patch in body.host.harnesses.items():
+                if host_default_harness is None:
+                    raise _invalid(
+                        f"host.harnesses.{harness}",
+                        "set a default agent on this host before configuring harness settings",
+                    )
+                if harness != host_default_harness:
+                    raise _invalid(
+                        f"host.harnesses.{harness}",
+                        f"only the host's default agent harness ({host_default_harness}) "
+                        "can be configured",
+                    )
                 supplied = patch.model_fields_set
                 if not supplied:
                     continue
@@ -711,9 +758,15 @@ def create_project_settings_router(
                 model_resolver=models[host_id].resolve,
             )
 
-        # Clearing a model or editing All hosts can change several inherited rows.
+        # Clearing a model or editing All hosts can change the default harness row.
+        option_harnesses = set(model_option_harnesses())
         for host_id in host_map:
-            for harness in model_option_harnesses():
+            host_default_harness = default_harness_for_host(
+                next_config, host_id, owner, request.app.state
+            )
+            if host_default_harness is None or host_default_harness not in option_harnesses:
+                continue
+            for harness in (host_default_harness,):
                 previous = resolved_for(project.config, host_id, harness)
                 current = resolved_for(next_config, host_id, harness)
                 if previous.model == current.model:

@@ -10,6 +10,7 @@ gated.
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from dataclasses import replace
 from typing import Any
 
@@ -18,6 +19,7 @@ from pydantic import BaseModel, ConfigDict
 
 from omnigent.entities import ProjectHostEntry
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.project_agent_blocks import check_default_agents_not_blocked
 from omnigent.server.auth import AuthProvider
 from omnigent.server.project_host_agents import resolve_project_host_template
 from omnigent.server.routes._auth_helpers import require_user
@@ -163,6 +165,20 @@ def create_project_entries_router(
         if "project_agent_id" in body.model_fields_set:
             config["agent_id"] = body.project_agent_id
             has_project_agent = bool(body.project_agent_id)
+        if body.agent_id or "project_agent_id" in body.model_fields_set:
+            projected = deepcopy(project.config or {})
+            if "project_agent_id" in body.model_fields_set:
+                if body.project_agent_id is None:
+                    projected.pop("agent_id", None)
+                else:
+                    projected["agent_id"] = body.project_agent_id
+            if body.agent_id:
+                defaults = dict(projected.get("calling_defaults") or {})
+                host_entry = dict(defaults.get(host_id) or {})
+                host_entry["agent_id"] = body.agent_id
+                defaults[host_id] = host_entry
+                projected["calling_defaults"] = defaults
+            check_default_agents_not_blocked(projected)
         initial_agent_id = None
         notice = None
         if not body.agent_id:

@@ -280,6 +280,7 @@ class ErrorCode:
     PROJECT_ARCHIVED = "project_archived"
     PROJECT_NAME_ARCHIVED = "project_name_archived"
     PROJECT_ARCHIVE_BUSY = "project_archive_busy"
+    AGENT_BLOCKED_FOR_PROJECT = "agent_blocked_for_project"
 
 
 # Client-facing text for ``SESSION_AGENT_MISSING``: the session's agent was
@@ -308,6 +309,7 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     ErrorCode.PROJECT_ARCHIVED: 409,
     ErrorCode.PROJECT_NAME_ARCHIVED: 409,
     ErrorCode.PROJECT_ARCHIVE_BUSY: 409,
+    ErrorCode.AGENT_BLOCKED_FOR_PROJECT: 409,
     ErrorCode.INTERNAL_ERROR: 500,
     # Harness protocol violations are server-side bugs in the
     # harness implementation — surface as 500 (no client action
@@ -372,6 +374,7 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     ErrorCode.PROJECT_ARCHIVED: ErrorCategory.USER,
     ErrorCode.PROJECT_NAME_ARCHIVED: ErrorCategory.USER,
     ErrorCode.PROJECT_ARCHIVE_BUSY: ErrorCategory.USER,
+    ErrorCode.AGENT_BLOCKED_FOR_PROJECT: ErrorCategory.USER,
     # Our fault, raised where the site knows it is ours.
     ErrorCode.INTERNAL_ERROR: ErrorCategory.SERVER,
     ErrorCode.HARNESS_PROTOCOL_VIOLATION: ErrorCategory.SERVER,
@@ -453,6 +456,7 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     ErrorCode.PROJECT_ARCHIVED: ErrorImpact.BENIGN,
     ErrorCode.PROJECT_NAME_ARCHIVED: ErrorImpact.BENIGN,
     ErrorCode.PROJECT_ARCHIVE_BUSY: ErrorImpact.BENIGN,
+    ErrorCode.AGENT_BLOCKED_FOR_PROJECT: ErrorImpact.BENIGN,
     ErrorCode.REFRESH_UNSUPPORTED: ErrorImpact.BENIGN,
     ErrorCode.LOGIN_UNSUPPORTED: ErrorImpact.BENIGN,
     ErrorCode.STALE_CURSOR: ErrorImpact.BENIGN,
@@ -489,6 +493,7 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.PROJECT_ARCHIVED: ErrorPhase.REQUEST,
     ErrorCode.PROJECT_NAME_ARCHIVED: ErrorPhase.REQUEST,
     ErrorCode.PROJECT_ARCHIVE_BUSY: ErrorPhase.REQUEST,
+    ErrorCode.AGENT_BLOCKED_FOR_PROJECT: ErrorPhase.REQUEST,
     ErrorCode.WRONG_REPLICA: ErrorPhase.ROUTING,
     ErrorCode.RUNNER_UNAVAILABLE: ErrorPhase.RUNNER_LAUNCH,
     ErrorCode.TERMINAL_TRANSFER_OWNER_WRITE_FAILED: ErrorPhase.ROUTING,

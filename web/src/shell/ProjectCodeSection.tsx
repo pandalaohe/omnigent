@@ -3,6 +3,7 @@
 // what agents are told. Rendered OUTSIDE the settings dialog's defaults <form>
 // (nested forms are invalid HTML), and every action here applies immediately
 // instead of going through Save.
+import { Trash2Icon } from "lucide-react";
 import { useEffect, useId, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
@@ -18,7 +19,6 @@ import {
   getHostFolderFacts,
   getProjectCollaboration,
   listProjectEntries,
-  putProjectEntry,
   putProjectHostBinding,
   putProjectRepository,
   verifyProjectHostBinding,
@@ -234,46 +234,41 @@ function FolderFactsLine({
           </Button>
         </div>
       )}
-      {onRunAgain && (
-        <div className="space-y-1" data-testid={`${testId}-setup`}>
-          <div className="flex items-center gap-2 text-sm font-medium">
+      {onRunAgain && facts.setup_command_configured && (
+        <div
+          className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground"
+          data-testid={`${testId}-setup`}
+        >
+          <span className="flex items-center gap-1 font-medium text-foreground">
             Host setup command
             <HelpTip label="About the host setup command">
               Host configuration, read-only here. Edit host.post_bind_command in this host&apos;s
               ~/.omnigent/config.yaml. It runs after a folder is saved or verified, not when a
               session starts. Command text stays on the host.
             </HelpTip>
-          </div>
-          <p className="text-sm text-muted-foreground">
-            {facts.setup_command_configured ? "Configured on host" : "Not configured"}
-          </p>
-          {facts.setup_command_configured && (
-            <>
-              <p className="text-sm text-muted-foreground" data-testid={`${testId}-setup-outcome`}>
-                {outcome ? (
-                  <>
-                    Last run: {hookStatusLabel(outcome.status)}
-                    {typeof outcome.exit_code === "number"
-                      ? ` (exit code ${outcome.exit_code})`
-                      : ""}
-                    {` · ${formatOutcomeTime(outcome.at)}`}
-                  </>
-                ) : (
-                  "No run yet since the server started."
-                )}
-              </p>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                data-testid={`${testId}-run-again`}
-                onClick={onRunAgain}
-                disabled={disabled}
-              >
-                Run again
-              </Button>
-            </>
-          )}
+          </span>
+          <span data-testid={`${testId}-setup-outcome`}>
+            {outcome ? (
+              <>
+                Last run: {hookStatusLabel(outcome.status)}
+                {typeof outcome.exit_code === "number" ? ` (exit code ${outcome.exit_code})` : ""}
+                {` · ${formatOutcomeTime(outcome.at)}`}
+              </>
+            ) : (
+              "No run yet since the server started."
+            )}
+          </span>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-7"
+            data-testid={`${testId}-run-again`}
+            onClick={onRunAgain}
+            disabled={disabled}
+          >
+            Run again
+          </Button>
         </div>
       )}
     </div>
@@ -471,14 +466,6 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
     });
   };
 
-  const runEntrySetup = (hostId: string, workspace: string) => {
-    void runAction(async () => {
-      const entry = await putProjectEntry(projectId, hostId, workspace);
-      if (entry.initialization_notice) setActionError(entry.initialization_notice);
-      invalidate(hostId);
-    });
-  };
-
   const runBindingSetup = (hostId: string, bindingName: string) => {
     void runAction(async () => {
       await verifyProjectHostBinding(projectId, hostId, bindingName);
@@ -657,282 +644,433 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
     saveBinding(hostId, repository, path, bindingName);
   };
 
+  const renderRepoFolderControls = (
+    hostId: string,
+    repository: ProjectRepository,
+    { showRepoHeading = false }: { showRepoHeading?: boolean } = {},
+  ) => {
+    const host = (hosts.data ?? []).find((candidate) => candidate.host_id === hostId);
+    const entry = entryByHost.get(hostId);
+    const hostOnline = host?.status === "online";
+    const binding = bindings.find(
+      (candidate) => candidate.host_id === hostId && candidate.repository_id === repository.id,
+    );
+    const bindingName = binding?.name ?? repository.name;
+    const sameAsEntry = binding ? sameFolder(binding.workspace, entry?.workspace) : false;
+    const draftKey = `${hostId}::binding::${bindingName}`;
+    return (
+      <div
+        key={repository.id}
+        className={showRepoHeading ? "space-y-1 border-t pt-2" : "space-y-1"}
+        data-testid={`project-code-repo-folder-${hostId}-${repository.name}`}
+      >
+        <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
+          <div className="min-w-0 flex-1 basis-40">
+            {showRepoHeading && (
+              <div className="flex items-center gap-1.5 text-sm font-medium">
+                <span>{repository.name}</span>
+              </div>
+            )}
+            {binding ? (
+              sameAsEntry ? (
+                <p
+                  className="flex items-center gap-1.5 text-sm text-muted-foreground"
+                  data-testid={`project-code-binding-same-${hostId}-${repository.name}`}
+                >
+                  <span>Same as entry folder</span>
+                  <HelpTip label="About the entry folder">
+                    Set or change the entry folder on the Session defaults tab.
+                  </HelpTip>
+                </p>
+              ) : (
+                <p
+                  className="truncate font-mono text-sm text-muted-foreground"
+                  title={binding.workspace}
+                >
+                  {binding.workspace}
+                </p>
+              )
+            ) : (
+              <p className="text-sm text-muted-foreground">Not set</p>
+            )}
+          </div>
+          <div className="flex shrink-0 items-center gap-1">
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              data-testid={`project-code-binding-browse-${hostId}-${repository.name}`}
+              onClick={() => {
+                if (!hostOnline && sameAsEntry) {
+                  setFolderDrafts((current) => ({ ...current, [draftKey]: "" }));
+                  return;
+                }
+                openPicker({
+                  kind: "binding",
+                  hostId,
+                  repositoryId: repository.id,
+                  bindingName,
+                });
+              }}
+              disabled={pending || (!hostOnline && !sameAsEntry)}
+            >
+              {binding ? "Change…" : "Set folder…"}
+            </Button>
+            {binding && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                className="text-muted-foreground hover:text-destructive"
+                aria-label="Remove folder"
+                title="Remove folder"
+                data-testid={`project-code-binding-remove-${hostId}-${repository.name}`}
+                onClick={() => removeBinding(hostId, binding.name)}
+                disabled={pending}
+              >
+                <Trash2Icon className="size-3.5" aria-hidden="true" />
+              </Button>
+            )}
+          </div>
+        </div>
+        {!hostOnline && (!sameAsEntry || draftKey in folderDrafts) && (
+          <div className="flex min-w-0 gap-2">
+            <input
+              className={`${inputClassName} min-w-0 flex-1 font-mono`}
+              data-testid={`project-code-binding-path-${hostId}-${repository.name}`}
+              aria-label={`${repository.name} folder on ${hostName(hostId)}`}
+              placeholder="/path/to/repository"
+              value={folderDrafts[`${hostId}::binding::${bindingName}`] ?? binding?.workspace ?? ""}
+              onChange={(event) =>
+                setFolderDrafts((current) => ({
+                  ...current,
+                  [`${hostId}::binding::${bindingName}`]: event.target.value,
+                }))
+              }
+              disabled={pending}
+            />
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              data-testid={`project-code-binding-save-${hostId}-${repository.name}`}
+              onClick={() => saveTypedBinding(hostId, repository, bindingName)}
+              disabled={pending}
+            >
+              Save this folder path
+            </Button>
+          </div>
+        )}
+        {uncheckedKeys.has(`${hostId}::${repository.name}`) && (
+          <p
+            className="text-sm text-amber-700 dark:text-amber-400"
+            data-testid={`project-code-unchecked-${hostId}-${repository.name}`}
+          >
+            Saved without checking — host offline
+          </p>
+        )}
+        {binding && (
+          <FolderFactsLine
+            projectId={projectId}
+            hostId={hostId}
+            path={binding.workspace}
+            testId={`project-code-binding-facts-${hostId}-${repository.name}`}
+            repository={repository}
+            outcome={outcomes.find(
+              (outcome) =>
+                outcome.host_id === hostId &&
+                outcome.kind === "binding" &&
+                outcome.target === binding.name,
+            )}
+            onRunAgain={() => runBindingSetup(hostId, binding.name)}
+            onUseRemote={(url) => applyFolderRemote(repository, url)}
+            disabled={pending}
+          />
+        )}
+      </div>
+    );
+  };
+
+  const renderDanglingProblems = (hostId: string) =>
+    problems
+      .filter((problem) => problem.host_id === hostId)
+      .map((problem) => {
+        const orphan = bindings.find((binding) => binding.id === problem.binding_id);
+        return (
+          <div
+            key={problem.binding_id}
+            className="space-y-1 rounded-md border border-amber-400/60 p-2"
+            data-testid={`project-code-dangling-${hostId}-${problem.binding_id}`}
+          >
+            <p className="text-sm text-amber-700 dark:text-amber-400">
+              This folder points at a repository that no longer exists.
+            </p>
+            {orphan && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className={mutedButtonClassName}
+                data-testid={`project-code-dangling-remove-${hostId}-${orphan.name}`}
+                onClick={() => removeBinding(hostId, orphan.name)}
+                disabled={pending}
+              >
+                Remove this folder
+              </Button>
+            )}
+          </div>
+        );
+      });
+
   const renderHostCard = (hostId: string) => {
     const host = (hosts.data ?? []).find((candidate) => candidate.host_id === hostId);
     const root = (hostRoots.data?.roots ?? []).find((candidate) => candidate.host_id === hostId);
-    const entry = entryByHost.get(hostId);
     const hostOnline = host?.status === "online";
     return (
       <div
         key={hostId}
-        className="min-w-0 space-y-3 rounded-lg border p-3"
+        className="min-w-0 space-y-2.5 rounded-lg border p-3"
         data-testid={`project-code-host-${hostId}`}
       >
-        <div className="flex items-center gap-2 font-medium text-ui">
-          <span
-            className={`size-2 rounded-full ${hostOnline ? "bg-green-500" : "bg-muted-foreground"}`}
-          />
-          <span className="min-w-0 truncate" title={hostName(hostId)}>
-            {hostName(hostId)}
-          </span>
-          {host?.platform && (
-            <span className="text-sm font-normal text-muted-foreground">{host.platform}</span>
-          )}
-        </div>
-
-        <div className="space-y-1" data-testid={`project-code-entry-${hostId}`}>
-          <div className="flex min-w-0 flex-wrap items-start justify-between gap-2">
-            <div className="min-w-0 flex-1 basis-48">
-              <div className="flex items-center gap-2 text-sm font-medium">
-                Entry folder
-                <HelpTip label={`About the entry folder on ${hostName(hostId)}`}>
-                  Where New Chat sessions on this host start. Set or change it on the Session
-                  defaults page.
-                </HelpTip>
-              </div>
-              {entry ? (
-                <p
-                  className="truncate font-mono text-sm text-muted-foreground"
-                  title={entry.workspace}
-                >
-                  {entry.workspace}
-                </p>
-              ) : (
-                <p className="text-sm text-muted-foreground">No project folder set</p>
-              )}
-            </div>
-          </div>
-          {uncheckedKeys.has(`${hostId}::project`) && (
-            <p
-              className="text-sm text-amber-700 dark:text-amber-400"
-              data-testid={`project-code-unchecked-${hostId}-project`}
-            >
-              Saved without checking — host offline
-            </p>
-          )}
-          {entry && (
-            <FolderFactsLine
-              projectId={projectId}
-              hostId={hostId}
-              path={entry.workspace}
-              testId={`project-code-entry-facts-${hostId}`}
-              outcome={outcomes.find(
-                (outcome) => outcome.host_id === hostId && outcome.kind === "entry",
-              )}
-              onRunAgain={() => runEntrySetup(hostId, entry.workspace)}
-              disabled={pending}
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex min-w-0 items-center gap-2 font-medium text-ui">
+            <span
+              className={`size-2 shrink-0 rounded-full ${hostOnline ? "bg-green-500" : "bg-muted-foreground"}`}
             />
-          )}
+            <span className="min-w-0 truncate" title={hostName(hostId)}>
+              {hostName(hostId)}
+            </span>
+            {host?.platform && (
+              <span className="text-sm font-normal text-muted-foreground">{host.platform}</span>
+            )}
+          </div>
+          <AgentCodeNotePanel projectId={projectId} hostId={hostId} hostName={hostName(hostId)} />
         </div>
 
-        {repositories.map((repository) => {
-          const binding = bindings.find(
-            (candidate) =>
-              candidate.host_id === hostId && candidate.repository_id === repository.id,
-          );
-          const bindingName = binding?.name ?? repository.name;
-          const sameAsEntry = binding ? sameFolder(binding.workspace, entry?.workspace) : false;
-          const draftKey = `${hostId}::binding::${bindingName}`;
-          return (
-            <div
-              key={repository.id}
-              className="space-y-1 border-t pt-2"
-              data-testid={`project-code-repo-folder-${hostId}-${repository.name}`}
-            >
-              <div className="flex min-w-0 flex-wrap items-start justify-between gap-2">
-                <div className="min-w-0 flex-1 basis-48">
-                  <div className="flex items-center gap-2 text-sm font-medium">
-                    {repository.name} folder
-                    <HelpTip label={`About the ${repository.name} folder on ${hostName(hostId)}`}>
-                      The checkout this repository uses on this host. The code repository supplies
-                      new worktrees; related repositories are reference folders for agents. Entry
-                      and repository paths are saved separately; changing the entry folder does not
-                      move an existing checkout.
-                    </HelpTip>
-                  </div>
-                  {binding ? (
-                    sameAsEntry ? (
-                      <p
-                        className="text-sm text-muted-foreground"
-                        data-testid={`project-code-binding-same-${hostId}-${repository.name}`}
-                      >
-                        Same as entry folder
-                      </p>
-                    ) : (
-                      <p
-                        className="truncate font-mono text-sm text-muted-foreground"
-                        title={binding.workspace}
-                      >
-                        {binding.workspace}
-                      </p>
-                    )
-                  ) : (
-                    <p className="text-sm text-muted-foreground">No folder set</p>
-                  )}
-                </div>
-                <div className="flex shrink-0 gap-1">
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    data-testid={`project-code-binding-browse-${hostId}-${repository.name}`}
-                    onClick={() => {
-                      if (!hostOnline && sameAsEntry) {
-                        setFolderDrafts((current) => ({ ...current, [draftKey]: "" }));
-                        return;
-                      }
-                      openPicker({
-                        kind: "binding",
-                        hostId,
-                        repositoryId: repository.id,
-                        bindingName,
-                      });
-                    }}
-                    disabled={pending || (!hostOnline && !sameAsEntry)}
-                  >
-                    {sameAsEntry ? "Use another folder…" : binding ? "Change…" : "Set folder…"}
-                  </Button>
-                  {binding && (
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      data-testid={`project-code-binding-remove-${hostId}-${repository.name}`}
-                      onClick={() => removeBinding(hostId, binding.name)}
-                      disabled={pending}
-                    >
-                      Remove this folder
-                    </Button>
-                  )}
-                </div>
-              </div>
-              {!hostOnline && (!sameAsEntry || draftKey in folderDrafts) && (
-                <div className="flex min-w-0 gap-2">
-                  <input
-                    className={`${inputClassName} min-w-0 flex-1 font-mono`}
-                    data-testid={`project-code-binding-path-${hostId}-${repository.name}`}
-                    aria-label={`${repository.name} folder on ${hostName(hostId)}`}
-                    placeholder="/path/to/repository"
-                    value={
-                      folderDrafts[`${hostId}::binding::${bindingName}`] ?? binding?.workspace ?? ""
-                    }
-                    onChange={(event) =>
-                      setFolderDrafts((current) => ({
-                        ...current,
-                        [`${hostId}::binding::${bindingName}`]: event.target.value,
-                      }))
-                    }
-                    disabled={pending}
-                  />
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    data-testid={`project-code-binding-save-${hostId}-${repository.name}`}
-                    onClick={() => saveTypedBinding(hostId, repository, bindingName)}
-                    disabled={pending}
-                  >
-                    Save this folder path
-                  </Button>
-                </div>
-              )}
-              {uncheckedKeys.has(`${hostId}::${repository.name}`) && (
-                <p
-                  className="text-sm text-amber-700 dark:text-amber-400"
-                  data-testid={`project-code-unchecked-${hostId}-${repository.name}`}
-                >
-                  Saved without checking — host offline
-                </p>
-              )}
-              {binding && !sameAsEntry && (
-                <FolderFactsLine
-                  projectId={projectId}
-                  hostId={hostId}
-                  path={binding.workspace}
-                  testId={`project-code-binding-facts-${hostId}-${repository.name}`}
-                  repository={repository}
-                  outcome={outcomes.find(
-                    (outcome) =>
-                      outcome.host_id === hostId &&
-                      outcome.kind === "binding" &&
-                      outcome.target === binding.name,
-                  )}
-                  onRunAgain={() => runBindingSetup(hostId, binding.name)}
-                  onUseRemote={(url) => applyFolderRemote(repository, url)}
-                  disabled={pending}
-                />
-              )}
-            </div>
-          );
-        })}
+        {repositories.map((repository) =>
+          renderRepoFolderControls(hostId, repository, { showRepoHeading: true }),
+        )}
 
-        {problems
-          .filter((problem) => problem.host_id === hostId)
-          .map((problem) => {
-            const orphan = bindings.find((binding) => binding.id === problem.binding_id);
-            return (
-              <div
-                key={problem.binding_id}
-                className="space-y-1 rounded-md border border-amber-400/60 p-2"
-                data-testid={`project-code-dangling-${hostId}-${problem.binding_id}`}
-              >
-                <p className="text-sm text-amber-700 dark:text-amber-400">
-                  This folder points at a repository that no longer exists.
-                </p>
-                {orphan && (
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    className={mutedButtonClassName}
-                    data-testid={`project-code-dangling-remove-${hostId}-${orphan.name}`}
-                    onClick={() => removeBinding(hostId, orphan.name)}
-                    disabled={pending}
-                  >
-                    Remove this folder
-                  </Button>
-                )}
-              </div>
-            );
-          })}
+        {renderDanglingProblems(hostId)}
 
-        {root ? (
-          <HelpTip label={`About session folders on ${hostName(hostId)}`}>
-            <div data-testid={`project-code-root-${hostId}`}>
-              <p>
-                New sessions open in: {root.workspace}
-                {root.source === "config" ? " (from the project's single-folder setting)" : ""}
-              </p>
-              <p>New worktrees come from: {root.checkout ?? root.workspace}</p>
-            </div>
-          </HelpTip>
-        ) : (
+        {!root && (
           <p
             className="text-sm text-amber-700 dark:text-amber-400"
             data-testid={`project-code-refused-${hostId}`}
           >
-            Sessions here are refused — set a project folder
+            Sessions on this host are refused: set an entry folder first
           </p>
         )}
+      </div>
+    );
+  };
 
-        <AgentCodeNotePanel projectId={projectId} hostId={hostId} hostName={hostName(hostId)} />
+  const renderSingleRepoHostRow = (hostId: string, repository: ProjectRepository) => {
+    const host = (hosts.data ?? []).find((candidate) => candidate.host_id === hostId);
+    const root = (hostRoots.data?.roots ?? []).find((candidate) => candidate.host_id === hostId);
+    const hostOnline = host?.status === "online";
+    return (
+      <div
+        key={hostId}
+        className="min-w-0 space-y-1.5 border-t pt-2.5"
+        data-testid={`project-code-host-${hostId}`}
+      >
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex min-w-0 items-center gap-2 text-sm font-medium">
+            <span
+              className={`size-2 shrink-0 rounded-full ${hostOnline ? "bg-green-500" : "bg-muted-foreground"}`}
+            />
+            <span className="min-w-0 truncate" title={hostName(hostId)}>
+              {hostName(hostId)}
+            </span>
+            {host?.platform && (
+              <span className="text-xs font-normal text-muted-foreground">{host.platform}</span>
+            )}
+          </div>
+          <AgentCodeNotePanel projectId={projectId} hostId={hostId} hostName={hostName(hostId)} />
+        </div>
+        {renderRepoFolderControls(hostId, repository, { showRepoHeading: false })}
+        {renderDanglingProblems(hostId)}
+        {!root && (
+          <p
+            className="text-sm text-amber-700 dark:text-amber-400"
+            data-testid={`project-code-refused-${hostId}`}
+          >
+            Sessions on this host are refused: set an entry folder first
+          </p>
+        )}
+      </div>
+    );
+  };
+
+  const singleRepo = repositories.length === 1 ? repositories[0] : null;
+
+  const renderAddHostPicker = () =>
+    addableHosts.length > 0 ? (
+      <label className="block space-y-1 text-sm">
+        <span className="block font-medium">Add a host</span>
+        {addableHosts.length > COMBOBOX_OPTION_THRESHOLD ? (
+          <div data-testid="project-code-add-host-picker">
+            <Combobox
+              mode="select"
+              options={addableHosts.map((host) => ({
+                key: host.host_id,
+                label: host.name,
+                description: host.status === "online" ? undefined : "Offline",
+              }))}
+              value=""
+              onValueChange={(hostId) => {
+                if (hostId) {
+                  setExtraHostIds((current) =>
+                    current.includes(hostId) ? current : [...current, hostId],
+                  );
+                }
+              }}
+              placeholder="Add a host…"
+              aria-label="Add a host"
+              className="h-auto w-full rounded-none! bg-transparent p-0"
+            />
+          </div>
+        ) : (
+          <select
+            className={inputClassName}
+            data-testid="project-code-add-host-picker"
+            value=""
+            onChange={(event) => {
+              const hostId = event.target.value;
+              if (hostId) {
+                setExtraHostIds((current) =>
+                  current.includes(hostId) ? current : [...current, hostId],
+                );
+              }
+            }}
+          >
+            <option value="">Add a host…</option>
+            {addableHosts.map((host) => (
+              <option key={host.host_id} value={host.host_id}>
+                {host.name}
+              </option>
+            ))}
+          </select>
+        )}
+      </label>
+    ) : null;
+
+  const renderRepositoryCard = (repository: ProjectRepository, nestedHosts: boolean) => {
+    const showRoleSelect = repositories.length >= 2 || repository.role === "related";
+    return (
+      <div
+        key={repository.id}
+        className="min-w-0 space-y-2.5 rounded-lg border p-3"
+        data-testid={`project-code-repo-${repository.name}`}
+      >
+        <div className="flex min-w-0 items-start justify-between gap-3">
+          <div className="min-w-0 flex-1">
+            <p className="truncate font-medium text-ui" title={repository.name}>
+              {repository.name}
+            </p>
+            <p
+              className="truncate font-mono text-sm text-muted-foreground"
+              title={repository.remote_url}
+            >
+              {repository.remote_url || "No git location"}
+            </p>
+          </div>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            className="shrink-0 text-muted-foreground hover:text-destructive"
+            aria-label="Remove repository"
+            title="Remove repository"
+            data-testid={`project-code-repo-remove-${repository.name}`}
+            onClick={() => removeRepository(repository)}
+            disabled={pending}
+          >
+            <Trash2Icon className="size-3.5" aria-hidden="true" />
+          </Button>
+        </div>
+        <div className="flex min-w-0 flex-wrap gap-4">
+          {showRoleSelect && (
+            <label className="space-y-1 text-sm">
+              <span className="flex items-center gap-2 font-medium">
+                Role
+                <HelpTip label={`About the role of ${repository.name}`}>
+                  Code we change: on hosts where it has a folder, new worktrees come from it and
+                  agents are told it is the code to change. Related code: on hosts where it has a
+                  folder, agents are told where it is, for reference.
+                </HelpTip>
+              </span>
+              <select
+                className={inputClassName}
+                data-testid={`project-code-repo-role-${repository.name}`}
+                aria-label={`Role for ${repository.name}`}
+                value={repository.role}
+                onChange={(event) =>
+                  changeRole(repository, event.target.value === "code" ? "code" : "related")
+                }
+                disabled={pending}
+              >
+                <option value="code">Code we change</option>
+                <option value="related">Related code</option>
+              </select>
+            </label>
+          )}
+          <label className="min-w-0 flex-1 space-y-1 text-sm">
+            <span className="flex items-center gap-2 font-medium">
+              Default branch
+              <HelpTip label={`About the default branch of ${repository.name}`}>
+                {repository.role === "code"
+                  ? "New worktrees branch from this when no base branch is given."
+                  : "Kept for reference; sessions do not use it."}
+              </HelpTip>
+            </span>
+            <input
+              className={inputClassName}
+              data-testid={`project-code-repo-branch-${repository.name}`}
+              aria-label={`Default branch for ${repository.name}`}
+              value={branchDrafts[repository.name] ?? repository.default_branch}
+              onChange={(event) =>
+                setBranchDrafts((current) => ({
+                  ...current,
+                  [repository.name]: event.target.value,
+                }))
+              }
+              onBlur={() => commitBranch(repository)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") event.currentTarget.blur();
+              }}
+              disabled={pending}
+            />
+          </label>
+        </div>
+        {nestedHosts && (
+          <div className="space-y-2.5 pt-1" data-testid="project-code-nested-hosts">
+            <div className="flex min-w-0 items-center justify-between gap-2 border-t pt-2.5">
+              <span className="text-sm font-medium text-muted-foreground">Hosts</span>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-7"
+                data-testid="project-code-refresh"
+                onClick={() => {
+                  void queryClient.invalidateQueries({ queryKey: ["project-code-folder-facts"] });
+                }}
+              >
+                Refresh host folders
+              </Button>
+            </div>
+            {cardHostIds.map((id) => renderSingleRepoHostRow(id, repository))}
+            {renderAddHostPicker()}
+          </div>
+        )}
       </div>
     );
   };
 
   return (
-    <div className="flex min-w-0 flex-col gap-6" data-testid="project-code-section">
-      <div className="min-w-0">
-        <div className="flex items-center gap-2 font-medium text-ui">
-          Project code
-          <HelpTip label="About project code settings">
-            Repository and checkout changes save immediately. Session defaults and Random worktree
-            apply when you press Save. Repository information reaches new sessions; after a runner
-            restart, resumed sessions receive it too.
-          </HelpTip>
-        </div>
-      </div>
-
+    <div className="flex min-w-0 flex-col gap-5" data-testid="project-code-section">
       {actionError && (
         <p className="text-destructive text-ui" role="alert" data-testid="project-code-error">
           {actionError}
@@ -940,19 +1078,17 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
       )}
 
       <section className="min-w-0 space-y-3" data-testid="project-code-repositories">
-        <h3 className="flex items-center gap-2 font-medium text-ui">
-          Repositories
-          <HelpTip label="About project repositories">
-            One repository is the code your sessions change; other repositories are references. A
-            saved Git address identifies the repository for agents. Configure Git remotes, push
-            targets, credentials and network access in Git on each host.
-          </HelpTip>
-        </h3>
-        <p className="text-sm text-muted-foreground">
-          A repository is identified by its Git address across hosts. Set the folder where its code
-          lives separately on each host. Agents receive these locations as a code note. Registering
-          an address does not clone the repository.
-        </p>
+        <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
+          <h3 className="flex items-center gap-2 font-medium text-ui">
+            <span>Code repositories</span>
+            <HelpTip label="About code repositories">
+              A repository is identified by its Git address across hosts. Set the folder where its
+              code lives on each host so agents receive its location. Registering an address does
+              not clone the repository.
+            </HelpTip>
+          </h3>
+          <span className="text-xs text-muted-foreground">Changes save immediately</span>
+        </div>
         {repositories.length === 0 && (
           <p className="text-sm text-muted-foreground">No repositories yet.</p>
         )}
@@ -968,90 +1104,9 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
             </HelpTip>
           </div>
         )}
-        {repositories.map((repository) => (
-          <div
-            key={repository.id}
-            className="min-w-0 space-y-2 rounded-lg border p-3"
-            data-testid={`project-code-repo-${repository.name}`}
-          >
-            <div className="flex min-w-0 items-start justify-between gap-3">
-              <div className="min-w-0 flex-1">
-                <p className="truncate font-medium text-ui" title={repository.name}>
-                  {repository.name}
-                </p>
-                <p
-                  className="truncate font-mono text-sm text-muted-foreground"
-                  title={repository.remote_url}
-                >
-                  {repository.remote_url || "No git location"}
-                </p>
-              </div>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                className="shrink-0"
-                data-testid={`project-code-repo-remove-${repository.name}`}
-                onClick={() => removeRepository(repository)}
-                disabled={pending}
-              >
-                Remove this repository
-              </Button>
-            </div>
-            <div className="flex min-w-0 flex-wrap gap-4">
-              <label className="space-y-1 text-sm">
-                <span className="flex items-center gap-2 font-medium">
-                  Role
-                  <HelpTip label={`About the role of ${repository.name}`}>
-                    Code we change: on hosts where it has a folder, new worktrees come from it and
-                    agents are told it is the code to change. Related code: on hosts where it has a
-                    folder, agents are told where it is, for reference.
-                  </HelpTip>
-                </span>
-                <select
-                  className={inputClassName}
-                  data-testid={`project-code-repo-role-${repository.name}`}
-                  aria-label={`Role for ${repository.name}`}
-                  value={repository.role}
-                  onChange={(event) =>
-                    changeRole(repository, event.target.value === "code" ? "code" : "related")
-                  }
-                  disabled={pending}
-                >
-                  <option value="code">Code we change</option>
-                  <option value="related">Related code</option>
-                </select>
-              </label>
-              <label className="min-w-0 flex-1 space-y-1 text-sm">
-                <span className="flex items-center gap-2 font-medium">
-                  Default branch
-                  <HelpTip label={`About the default branch of ${repository.name}`}>
-                    {repository.role === "code"
-                      ? "New worktrees branch from this when no base branch is given."
-                      : "Kept for reference; sessions do not use it."}
-                  </HelpTip>
-                </span>
-                <input
-                  className={inputClassName}
-                  data-testid={`project-code-repo-branch-${repository.name}`}
-                  aria-label={`Default branch for ${repository.name}`}
-                  value={branchDrafts[repository.name] ?? repository.default_branch}
-                  onChange={(event) =>
-                    setBranchDrafts((current) => ({
-                      ...current,
-                      [repository.name]: event.target.value,
-                    }))
-                  }
-                  onBlur={() => commitBranch(repository)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") event.currentTarget.blur();
-                  }}
-                  disabled={pending}
-                />
-              </label>
-            </div>
-          </div>
-        ))}
+        {singleRepo
+          ? renderRepositoryCard(singleRepo, true)
+          : repositories.map((repository) => renderRepositoryCard(repository, false))}
 
         {!addOpen ? (
           <Button
@@ -1421,79 +1476,33 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
         )}
       </section>
 
-      <section className="min-w-0 space-y-3" data-testid="project-code-hosts">
-        <div className="flex min-w-0 items-center justify-between gap-3">
-          <h3 className="flex items-center gap-2 font-medium text-ui">
-            Hosts
-            <HelpTip label="About entry and code folders">
-              Sessions opened from New Chat use the entry folder on the selected host. Projects
-              without any entries can fall back to the code checkout. New worktrees come from the
-              code repository&apos;s checkout when one is set on that host.
-            </HelpTip>
-          </h3>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            data-testid="project-code-refresh"
-            onClick={() => {
-              void queryClient.invalidateQueries({ queryKey: ["project-code-folder-facts"] });
-            }}
-          >
-            Refresh host folders
-          </Button>
-        </div>
-        {cardHostIds.map(renderHostCard)}
-        {addableHosts.length > 0 && (
-          <label className="block space-y-1 text-sm">
-            <span className="block font-medium">Add a host</span>
-            {addableHosts.length > COMBOBOX_OPTION_THRESHOLD ? (
-              <div data-testid="project-code-add-host-picker">
-                <Combobox
-                  mode="select"
-                  options={addableHosts.map((host) => ({
-                    key: host.host_id,
-                    label: host.name,
-                    description: host.status === "online" ? undefined : "Offline",
-                  }))}
-                  value=""
-                  onValueChange={(hostId) => {
-                    if (hostId) {
-                      setExtraHostIds((current) =>
-                        current.includes(hostId) ? current : [...current, hostId],
-                      );
-                    }
-                  }}
-                  placeholder="Add a host…"
-                  aria-label="Add a host"
-                  className="h-auto w-full rounded-none! bg-transparent p-0"
-                />
-              </div>
-            ) : (
-              <select
-                className={inputClassName}
-                data-testid="project-code-add-host-picker"
-                value=""
-                onChange={(event) => {
-                  const hostId = event.target.value;
-                  if (hostId) {
-                    setExtraHostIds((current) =>
-                      current.includes(hostId) ? current : [...current, hostId],
-                    );
-                  }
-                }}
-              >
-                <option value="">Add a host…</option>
-                {addableHosts.map((host) => (
-                  <option key={host.host_id} value={host.host_id}>
-                    {host.name}
-                  </option>
-                ))}
-              </select>
-            )}
-          </label>
-        )}
-      </section>
+      {!singleRepo && (
+        <section className="min-w-0 space-y-3" data-testid="project-code-hosts">
+          <div className="flex min-w-0 items-center justify-between gap-3">
+            <h3 className="flex items-center gap-2 font-medium text-ui">
+              Hosts
+              <HelpTip label="About entry and code folders">
+                Sessions opened from New Chat use the entry folder on the selected host. Projects
+                without any entries can fall back to the code checkout. New worktrees come from the
+                code repository&apos;s checkout when one is set on that host.
+              </HelpTip>
+            </h3>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              data-testid="project-code-refresh"
+              onClick={() => {
+                void queryClient.invalidateQueries({ queryKey: ["project-code-folder-facts"] });
+              }}
+            >
+              Refresh host folders
+            </Button>
+          </div>
+          {cardHostIds.map(renderHostCard)}
+          {renderAddHostPicker()}
+        </section>
+      )}
 
       {picker && (
         <WorkspacePickerDialog

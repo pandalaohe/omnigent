@@ -2768,3 +2768,52 @@ def test_link_permission_tier_schema_roundtrip_and_tool_docs():
     schema = SysSessionChoiceUpdateTool().get_schema()["function"]
     assert "members" in schema["description"]
     assert "permissionTier" in schema["description"]
+
+
+def test_select_skips_project_blocked_agent_before_unavailable() -> None:
+    """Scenario 5: project-blocked agents are skipped with reason blocked_for_project."""
+    doc = parse_session_choice(
+        {
+            "enabled": True,
+            "workTypes": [{"id": "impl", "label": "Implementation"}],
+            "presets": [
+                {
+                    "id": "p1",
+                    "name": "P1",
+                    "links": [
+                        {"agent": "ag_blocked", "model": "m1"},
+                        {"agent": "ag_codex", "model": "m2"},
+                    ],
+                }
+            ],
+            "hosts": {
+                "host-a": {
+                    "impl": [
+                        [
+                            {
+                                "preset": "p1",
+                                "links": [
+                                    {"agent": "ag_blocked", "model": "m1"},
+                                    {"agent": "ag_codex", "model": "m2"},
+                                ],
+                                "weight": 1,
+                            }
+                        ]
+                    ]
+                }
+            },
+        }
+    )
+    req = ChoiceRequest(
+        owner=OWNER,
+        host="host-a",
+        blocked=frozenset({"ag_blocked"}),
+        unavailable=frozenset({"ag_blocked"}),
+    )
+    outcome = choose(doc, "impl", req, {}, {}, {}, {}, {}, now=NOW)
+    assert outcome.link is not None
+    assert outcome.link.agent_id == "ag_codex"
+    assert any(
+        skip.link.agent_id == "ag_blocked" and skip.why == "blocked_for_project"
+        for skip in outcome.skipped
+    )

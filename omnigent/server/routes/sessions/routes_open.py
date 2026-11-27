@@ -25,7 +25,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from omnigent.db.db_models import uuid_to_bytes
-from omnigent.errors import OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native.native_coding_agents import public_agent_name
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.server.feature_flags import Feature, resolve_feature_flags
@@ -523,7 +523,6 @@ def register_open_routes(
                 "project_id": project.id,
                 "host_id": host_id,
                 "workspace": workspace,
-                "agent_id": agent.id if agent is not None else None,
                 "title": body.title,
                 "work_type": body.work_type,
                 "user_named": body.user_named,
@@ -531,6 +530,8 @@ def register_open_routes(
                 "exclude": body.exclude,
                 "differ_from": body.differ_from,
             }
+            if agent is not None:
+                create_fields["agent_id"] = agent.id
             # Omitted fields fall through to create defaults: a plain open
             # leaves git for the project hint, an explicit workspace pins it.
             if body.workspace is not None or git is not None:
@@ -579,6 +580,8 @@ def register_open_routes(
                         exc_info=True,
                         extra={"session_id": sid},
                     )
+            if isinstance(exc, OmnigentError) and exc.code == ErrorCode.AGENT_BLOCKED_FOR_PROJECT:
+                return _problem("refused", ErrorCode.AGENT_BLOCKED_FOR_PROJECT, exc.message)
             if (
                 isinstance(exc, HTTPException)
                 and isinstance(exc.detail, dict)
@@ -911,13 +914,17 @@ def register_open_routes(
         )
         if placement is not None:
             return placement
+        from omnigent.calling_defaults import default_agent_for_host_or_legacy
         from omnigent.server.session_choice import active_on
         from omnigent.server.session_choice_runtime import CHOICE_PROTOCOL_HEADER
 
         agent_hint = body.agent
+        choice_override = (project.config.get("orchestration") or {}).get("session_choice")
         use_choice = False
-        if request.headers.get(CHOICE_PROTOCOL_HEADER) == "1" and not (
-            body.agent and (body.user_named or body.choice_reason)
+        if (
+            choice_override != "off"
+            and request.headers.get(CHOICE_PROTOCOL_HEADER) == "1"
+            and not (body.agent and (body.user_named or body.choice_reason))
         ):
             settings = (
                 await asyncio.to_thread(
@@ -925,16 +932,17 @@ def register_open_routes(
                 )
             ).session_choice
             use_choice = active_on(settings, host_id)
-        if agent_hint is None and not use_choice:
+        project_default = default_agent_for_host_or_legacy(project.config, host_id)
+        if agent_hint is None and not use_choice and project_default is None:
             return _problem(
                 "needs_input",
                 "agent_not_found",
-                "Choose an agent or configure session choice on this host.",
+                "Choose an agent, set a project default agent for this host, "
+                "or configure session choice on this host.",
             )
         agent = None
-        agent_name = "Session choice"
-        if not use_choice:
-            assert agent_hint is not None
+        agent_name = "Session choice" if use_choice else "Project default"
+        if not use_choice and agent_hint is not None:
             agent = (
                 await asyncio.to_thread(agent_store.get, agent_hint)
                 if agent_store and _store_id(agent_hint)

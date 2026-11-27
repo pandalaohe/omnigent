@@ -147,3 +147,41 @@ async def test_session_choice_tools_registered_on_native_and_dispatch_routes(tmp
         ),
         ("POST", "/v1/me/session-choice/floor", {"tile": "account-a", "off": True, "keep": True}),
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("placement", ["child", "same_host"])
+async def test_session_create_surfaces_agent_blocked_409_without_ambiguous_warning(placement: str):
+    """Scenario 29: blocked 409 returns agent_blocked_for_project for every placement."""
+    blocked_msg = (
+        "Antigravity is blocked for project Alpha on host TMB. "
+        "Pick another agent or remove it from the project's blocked agents."
+    )
+
+    def receive(request: httpx.Request) -> httpx.Response:
+        if request.url.path in ("/v1/sessions", "/v1/sessions/orchestrated"):
+            return httpx.Response(
+                409,
+                json={"error": {"code": "agent_blocked_for_project", "message": blocked_msg}},
+            )
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        base_url="http://server", transport=httpx.MockTransport(receive)
+    ) as client:
+        raw = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {
+                    "agent_id": "ag_antigravity",
+                    "placement": placement,
+                    "message": "Run task",
+                }
+            ),
+            server_client=client,
+            conversation_id="conv_parent",
+        )
+    parsed = json.loads(raw)
+    assert parsed["error"] == "agent_blocked_for_project"
+    assert parsed["message"] == blocked_msg
+    assert "could not be confirmed" not in raw

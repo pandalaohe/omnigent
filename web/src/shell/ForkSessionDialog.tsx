@@ -53,6 +53,8 @@ import { fetchSessionRepositoryBranches, forkSession, launchRunner } from "@/lib
 import { conversationRowFromSession, insertCreatedRowIntoCaches } from "@/lib/sessionListCache";
 import { useAvailableAgents, prefetchAvailableAgentDetails } from "@/hooks/useAvailableAgents";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
+import { useProjectConfig } from "@/hooks/useConversations";
+import { projectBlockedAgents } from "@/lib/projectAgentBlocks";
 import { partitionAgentsByKind } from "@/lib/agentGrouping";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useSession } from "@/hooks/useSession";
@@ -1251,6 +1253,21 @@ function SupportedForkSessionForm({
     }
   }, [agents, queryClient]);
 
+  // Source session snapshot — seeds the run-config pickers on a same-harness
+  // fork (its current model / effort / permission mode). Cheap: the chat page
+  // already holds this in the shared ["session", id] cache.
+  const { session: sourceSession } = useSession(sourceSessionId);
+  const { data: sourceProjectConfig } = useProjectConfig(sourceSession?.projectId ?? null);
+  const forkBlockHostId = sandboxSelected
+    ? null
+    : isCodingSource
+      ? (selectedHostId ?? sourceHostId ?? null)
+      : (sourceHostId ?? null);
+  const projectBlockedIds = useMemo(
+    () => projectBlockedAgents(sourceProjectConfig, forkBlockHostId),
+    [sourceProjectConfig, forkBlockHostId],
+  );
+
   // Switch targets, excluding:
   //   1. the source's OWN agent — "Same as source" already represents
   //      keeping it, so listing it again is a confusing duplicate (e.g.
@@ -1263,12 +1280,14 @@ function SupportedForkSessionForm({
   //      transcript from the copied items (any source) — see
   //      forkTargetCarriesHistory. Unclassifiable harnesses
   //      (harness=null) are hidden.
+  //   3. catalog agents blocked for the source session's project on the target host.
   const switchableAgents = (agents ?? []).filter(
     (a) =>
       a.id !== sourceAgent?.id &&
       a.name !== sourceAgentName &&
       a.name !== sourceAgentBaseName &&
-      forkTargetCarriesHistory(a.harness),
+      forkTargetCarriesHistory(a.harness) &&
+      !projectBlockedIds.has(a.id),
   );
   // Group the switch targets like the new-session picker: built-ins first,
   // then a divider, then custom agents — each sorted into display order.
@@ -1277,12 +1296,13 @@ function SupportedForkSessionForm({
     [switchableAgents],
   );
 
-  const switching = agentChoice !== SAME_AS_SOURCE;
+  useEffect(() => {
+    if (agentChoice !== SAME_AS_SOURCE && projectBlockedIds.has(agentChoice)) {
+      setAgentChoice(SAME_AS_SOURCE);
+    }
+  }, [agentChoice, projectBlockedIds]);
 
-  // Source session snapshot — seeds the run-config pickers on a same-harness
-  // fork (its current model / effort / permission mode). Cheap: the chat page
-  // already holds this in the shared ["session", id] cache.
-  const { session: sourceSession } = useSession(sourceSessionId);
+  const switching = agentChoice !== SAME_AS_SOURCE;
 
   // The agent the fork will bind: the switched-to target, else the source's
   // own agent. Its harness drives the run-config section (shown only for a

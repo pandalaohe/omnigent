@@ -192,6 +192,12 @@ def _master_entry(
     return entry if isinstance(entry, Mapping) else None
 
 
+def _canonical_harness(harness: str | None) -> str | None:
+    if harness is None:
+        return None
+    return harness if harness.startswith("acp:") else canonicalize_harness(harness) or harness
+
+
 def resolve_calling(
     *,
     explicit: dict[str, Any],
@@ -257,6 +263,16 @@ def resolve_calling(
         harness = None
         mode_harness = None
 
+    default_agent_id = default_agent_for_host_or_legacy(project_config, host_id)
+    default_harness = (
+        _canonical_harness(agent_harness(default_agent_id))
+        if (
+            default_agent_id is not None
+            and not default_agent_id.startswith(_LIBRARY_AGENT_ID_PREFIX)
+        )
+        else None
+    )
+
     levels: dict[str, str] = {}
 
     def resolve(field: str, request_key: str, target: str | None) -> tuple[str | None, str]:
@@ -265,10 +281,19 @@ def resolve_calling(
         normalize = _field_normalizer(field, target, host_id, permission_options)
         native = sdk_native_parent(target)
         for candidate_harness, suffix in ((target, ""), (native, "_native")):
-            entry = _project_harness_entry(project_config, host_id, candidate_harness)
-            value = normalize(_setting(entry.get(field)) if entry else None)
-            if value is not None:
-                return value, "project_host" + suffix
+            if (
+                not suffix
+                and agent_id is not None
+                and agent_id == default_agent_id
+                and default_harness is not None
+                and _canonical_harness(candidate_harness) == default_harness
+            ):
+                entry = _project_harness_entry(
+                    project_config, host_id, candidate_harness
+                ) or _project_harness_entry(project_config, host_id, default_harness)
+                value = normalize(_setting(entry.get(field)) if entry else None)
+                if value is not None:
+                    return value, "project_host"
             if (
                 field == "model"
                 and not suffix

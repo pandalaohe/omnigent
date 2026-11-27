@@ -8,43 +8,48 @@ export type ProjectChoiceOverride = NonNullable<ProjectConfig["orchestration"]>[
 export function ProjectSessionChoiceField({
   value,
   onChange,
+  disabled = false,
 }: {
   value: ProjectChoiceOverride;
   onChange: (value: ProjectChoiceOverride) => void;
+  disabled?: boolean;
 }) {
   const document = useSessionChoiceDocument();
   const presets = document.data?.settings?.presets ?? [];
   const pin = value && typeof value === "object" ? value.pin : null;
   return (
     <label className="flex flex-wrap items-center gap-2 text-sm">
-      Session choice
+      <span className="text-ui font-medium">Session choice</span>
       {presets.length > COMBOBOX_OPTION_THRESHOLD ? (
-        <Combobox
-          mode="select"
-          options={[
-            { key: "inherit", label: "Use account strategy" },
-            { key: "off", label: "Off for this project" },
-            ...(pin && !presets.some((preset) => preset.id === pin)
-              ? [{ key: `pin:${pin}`, label: `${pin} (preset unavailable)` }]
-              : []),
-            ...presets.map((preset) => ({
-              key: `pin:${preset.id}`,
-              label: `Pin ${preset.name}`,
-            })),
-          ]}
-          value={pin ? `pin:${pin}` : value === "off" ? "off" : "inherit"}
-          onValueChange={(next) =>
-            onChange(
-              next === "inherit" ? undefined : next === "off" ? "off" : { pin: next.slice(4) },
-            )
-          }
-          aria-label="Project session choice"
-          className="h-auto w-64 max-w-full rounded-none! bg-transparent p-0"
-        />
+        <fieldset disabled={disabled} className="contents">
+          <Combobox
+            mode="select"
+            options={[
+              { key: "inherit", label: "Use account strategy" },
+              { key: "off", label: "Off for this project" },
+              ...(pin && !presets.some((preset) => preset.id === pin)
+                ? [{ key: `pin:${pin}`, label: `${pin} (preset unavailable)` }]
+                : []),
+              ...presets.map((preset) => ({
+                key: `pin:${preset.id}`,
+                label: `Pin ${preset.name}`,
+              })),
+            ]}
+            value={pin ? `pin:${pin}` : value === "off" ? "off" : "inherit"}
+            onValueChange={(next) =>
+              onChange(
+                next === "inherit" ? undefined : next === "off" ? "off" : { pin: next.slice(4) },
+              )
+            }
+            aria-label="Project session choice"
+            className="h-auto w-64 max-w-full rounded-none! bg-transparent p-0"
+          />
+        </fieldset>
       ) : (
         <select
           aria-label="Project session choice"
           className={CHOICE_SELECT}
+          disabled={disabled}
           value={pin ? `pin:${pin}` : value === "off" ? "off" : "inherit"}
           onChange={(event) =>
             onChange(

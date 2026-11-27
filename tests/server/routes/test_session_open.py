@@ -905,7 +905,9 @@ async def test_plain_open_body_lets_project_calling_defaults_fill(
     }
     modes["speed"] = "fast"
     config = dict(env["project"].config)
-    config["calling_defaults"] = {HOST_ID: {"harnesses": {native_agent.harness: modes}}}
+    config["calling_defaults"] = {
+        HOST_ID: {"agent_id": native_agent_id, "harnesses": {native_agent.harness: modes}}
+    }
     env["projects"].update(env["project"].id, user_id=ALICE, config=config)
     captured = _patch_create(env, monkeypatch)
     async with await _client(env) as client:
@@ -1452,3 +1454,44 @@ async def test_master_switch_off_refuses_open(
         env["app"].state.user_preferences_store = _FakePreferences({"enabled": True})
         opened = await _post(client, env["sender"].id, env["sender_token"])
     assert opened["state"] == "opened"
+
+
+@pytest.mark.asyncio
+async def test_open_j1_uses_project_host_default_and_maps_blocked_409(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Scenarios 22 & 29: J1 allows no-agent open with project default; blocked maps to refused."""
+    from omnigent.errors import ErrorCode, OmnigentError
+
+    env = open_env
+    orig_config = dict(env["project"].config)
+    # Scenario 22: no agent, session choice off, host default present → opens with agent_id omitted
+    config = {**orig_config, "calling_defaults": {HOST_ID: {"agent_id": env["agent_id"]}}}
+    env["projects"].update(env["project"].id, user_id=ALICE, config=config)
+    captured = _patch_create(env, monkeypatch)
+    async with await _client(env) as client:
+        opened = await _post(client, env["sender"].id, env["sender_token"], agent=None)
+    assert opened["state"] == "opened", opened
+    assert "agent_id" not in captured["body"].model_fields_set
+
+    # Scenario 22: without host default or legacy agent, and session choice off → needs_input
+    no_default_config = {k: v for k, v in orig_config.items() if k != "agent_id"}
+    env["projects"].update(env["project"].id, user_id=ALICE, config=no_default_config)
+    async with await _client(env) as client:
+        missing = await _post(client, env["sender"].id, env["sender_token"], agent=None)
+    assert missing["state"] == "needs_input"
+
+    # Scenario 29: blocked agent error from funnel → refused with agent_blocked_for_project
+    _patch_create(
+        env,
+        monkeypatch,
+        error=OmnigentError(
+            "Agent is blocked for this project on this host.",
+            code=ErrorCode.AGENT_BLOCKED_FOR_PROJECT,
+        ),
+    )
+    async with await _client(env) as client:
+        refused = await _post(client, env["sender"].id, env["sender_token"])
+    assert refused["state"] == "refused"
+    assert refused["reason"] == "agent_blocked_for_project"
+    assert "blocked" in refused["message"].lower()

@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import Mapping
+from copy import deepcopy
 from typing import Any, Literal
 
 from fastapi import APIRouter, Query, Request
@@ -23,10 +25,16 @@ from fastapi import APIRouter, Query, Request
 from omnigent.calling_defaults import validate_project_calling_defaults
 from omnigent.entities import Project
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.project_agent_blocks import (
+    check_default_agents_not_blocked,
+    validate_blocked_agents,
+)
+from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runner.routing import RunnerRouter
 from omnigent.server.auth import AuthProvider
 from omnigent.server.project_archive import ProjectArchiveService
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.routes.project_settings import validate_project_orchestration
 from omnigent.server.routes.sessions import announce_projects_changed
 from omnigent.server.schemas import (
     CreateProjectRequest,
@@ -69,14 +77,42 @@ def _to_response(project: Project) -> dict[str, Any]:
     }
 
 
-def _validate_calling_defaults(config: dict[str, Any]) -> None:
-    """Validate the config's per-host calling defaults when the key is present.
+def _normalized_orchestration(config: Mapping[str, Any] | None) -> dict[str, Any]:
+    raw = config.get("orchestration") if isinstance(config, Mapping) else None
+    if not isinstance(raw, Mapping):
+        return {}
+    out: dict[str, Any] = {}
+    for key, value in raw.items():
+        if key == "setup":
+            continue
+        if key == "standing_pass":
+            out["standing_approval"] = value
+        else:
+            out[key] = value
+    return out
+
+
+def _validate_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Validate and normalize project config fields before persistence.
 
     :param config: Incoming project config.
-    :raises OmnigentError: 400 when ``calling_defaults`` has a bad shape.
+    :returns: Normalized config copy.
+    :raises OmnigentError: 400 when calling_defaults, blocked_agents,
+        orchestration, or default-agent invariants fail.
     """
-    if "calling_defaults" in config:
-        validate_project_calling_defaults(config["calling_defaults"])
+    normalized = dict(config)
+    if "calling_defaults" in normalized:
+        validate_project_calling_defaults(normalized["calling_defaults"])
+    if "blocked_agents" in normalized:
+        cleaned_blocked = validate_blocked_agents(normalized["blocked_agents"])
+        if cleaned_blocked:
+            normalized["blocked_agents"] = cleaned_blocked
+        else:
+            normalized.pop("blocked_agents", None)
+    if "orchestration" in normalized:
+        validate_project_orchestration(normalized["orchestration"])
+    check_default_agents_not_blocked(normalized)
+    return normalized
 
 
 def create_projects_router(
@@ -141,13 +177,13 @@ def create_projects_router(
         """
         user_id = require_user(request, auth_provider)
         await _require_private_source(request, user_id)
-        _validate_calling_defaults(body.config)
+        validated_config = _validate_config(body.config)
         project = await asyncio.to_thread(
             project_store.create,
             uuid.uuid4().hex,
             body.name,
             user_id,
-            body.config,
+            validated_config,
         )
         # Push the change to the owner's other connected clients so their
         # sidebars pick up the new folder without a reload.
@@ -298,14 +334,28 @@ def create_projects_router(
         """
         user_id = require_user(request, auth_provider)
         await _require_private_source(request, user_id)
+        validated_config: dict[str, Any] | None = None
         if body.config is not None:
-            _validate_calling_defaults(body.config)
+            validated_config = _validate_config(body.config)
+            if ORCHESTRATION_SOURCE_HEADER in request.headers:
+                existing = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
+                if existing is not None and (
+                    _normalized_orchestration(existing.config)
+                    != _normalized_orchestration(validated_config)
+                    or (existing.config.get("blocked_agents") or {})
+                    != (validated_config.get("blocked_agents") or {})
+                ):
+                    raise OmnigentError(
+                        "Agent tools cannot change project orchestration or blocked agents "
+                        "through PATCH /v1/projects/{id}.",
+                        code=ErrorCode.FORBIDDEN,
+                    )
         project = await asyncio.to_thread(
             project_store.update,
             project_id,
             user_id=user_id,
             name=body.name,
-            config=body.config,
+            config=validated_config,
         )
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
@@ -323,6 +373,31 @@ def create_projects_router(
     ) -> dict[str, Any]:
         """Apply selected defaults without replacing the project's other config."""
         user_id = require_user(request, auth_provider)
+        existing = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
+        if existing is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        if project_config_revision(existing.config) != body.expected_revision:
+            raise OmnigentError(
+                "Project settings changed. Reload before applying these defaults.",
+                code=ErrorCode.CONFLICT,
+            )
+        projected = deepcopy(existing.config)
+        defaults = dict(projected.get("calling_defaults") or {})
+        host_entry = dict(defaults.get(body.host_id) or {})
+        if body.copy_agent:
+            if body.agent_id is None:
+                host_entry.pop("agent_id", None)
+            else:
+                host_entry["agent_id"] = body.agent_id
+        if host_entry:
+            defaults[body.host_id] = host_entry
+        else:
+            defaults.pop(body.host_id, None)
+        if defaults:
+            projected["calling_defaults"] = defaults
+        else:
+            projected.pop("calling_defaults", None)
+        check_default_agents_not_blocked(projected)
         project = await asyncio.to_thread(
             project_store.patch_calling_defaults,
             project_id,

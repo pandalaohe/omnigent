@@ -9565,6 +9565,35 @@ def register_core_routes(
         if body.host_id is not None:
             await _check_requested_host_id(request, body.host_id, user_id)
 
+        if switching_agent and fork_project_id is not None and project_store is not None:
+            fork_project = await asyncio.to_thread(
+                project_store.get, fork_project_id, user_id=user_id
+            )
+            if fork_project is not None:
+                from omnigent.native.native_coding_agents import public_agent_name
+                from omnigent.project_agent_blocks import assert_agent_allowed
+
+                fork_host_id = (
+                    effective_host_id(conversation_store, source) if body.side_chat else None
+                )
+                fork_host_store = getattr(request.app.state, "host_store", None)
+                fork_host_row = (
+                    await asyncio.to_thread(fork_host_store.get_host, fork_host_id)
+                    if fork_host_id is not None and fork_host_store is not None
+                    else None
+                )
+                assert_agent_allowed(
+                    project=fork_project,
+                    host_id=fork_host_id,
+                    agent_id=base_agent.id,
+                    agent_label=public_agent_name(base_agent.name) or base_agent.name,
+                    host_label=(
+                        fork_host_row.name
+                        if fork_host_row is not None and fork_host_row.name
+                        else fork_host_id
+                    ),
+                )
+
         if validate_only:
             return None
         # Copied last, after every validation above; the copy row itself is

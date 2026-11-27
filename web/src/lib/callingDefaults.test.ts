@@ -129,7 +129,7 @@ describe("calling_defaults master table", () => {
         "model",
         "another",
       ),
-    ).toEqual({ value: "native-project", source: "project_host_native" });
+    ).toEqual({ value: "native-master", source: "master_native" });
     expect(
       resolveProjectInheritedField(config, master, "h1", "codex", "permission", "another"),
     ).toEqual({ value: "read-only", source: "master_native" });

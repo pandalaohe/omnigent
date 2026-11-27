@@ -1877,6 +1877,52 @@ def create_hosts_router(
             sandbox_profiles=getattr(request.app.state, "sandbox_profiles", None),
         )
         conn = target.conn
+        conv = target.conv
+        if (
+            conv.project_id is not None
+            and conv.host_id is None
+            and conv.runner_id is None
+            and conv.agent_id is not None
+        ):
+            from omnigent.native.native_coding_agents import public_agent_name
+            from omnigent.project_agent_blocks import assert_agent_allowed
+            from omnigent.stores.conversation_store import FORK_SOURCE_LABEL_KEY
+
+            fork_source_id = (conv.labels or {}).get(FORK_SOURCE_LABEL_KEY)
+            same_agent_fork = False
+            if fork_source_id:
+                fork_source = await asyncio.to_thread(
+                    conversation_store.get_conversation, fork_source_id
+                )
+                if fork_source is not None and fork_source.agent_id == conv.agent_id:
+                    same_agent_fork = True
+            if not same_agent_fork:
+                bind_project_store = getattr(request.app.state, "project_store", None)
+                bind_project = (
+                    await asyncio.to_thread(
+                        bind_project_store.get, conv.project_id, user_id=user_id
+                    )
+                    if bind_project_store is not None
+                    else None
+                )
+                if bind_project is not None:
+                    bind_agent = (
+                        await asyncio.to_thread(agent_store.get, conv.agent_id)
+                        if agent_store is not None
+                        else None
+                    )
+                    agent_label = (
+                        (public_agent_name(bind_agent.name) or bind_agent.name)
+                        if bind_agent is not None
+                        else conv.agent_id
+                    )
+                    assert_agent_allowed(
+                        project=bind_project,
+                        host_id=host_id,
+                        agent_id=conv.agent_id,
+                        agent_label=agent_label,
+                        host_label=target.host.name or host_id,
+                    )
         if target.conv.family_id is not None and flags.enabled(Feature.SIBLING_SESSIONS):
             from omnigent.server.session_families import require_sibling_destination
 

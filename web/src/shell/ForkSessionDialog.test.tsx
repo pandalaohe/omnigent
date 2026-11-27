@@ -3848,4 +3848,55 @@ describe("Antigravity fork controls", () => {
       permissionTier: expected,
     });
   });
+
+  it("hides project-blocked switch targets for the source project and selected host (D10)", async () => {
+    const agy = testAgent("ag_agy", "antigravity-native-ui", {
+      display_name: "Antigravity",
+      harness: "antigravity-native",
+    });
+    setAgents([agy, ...AVAILABLE_AGENTS], "claude-native");
+    useSessionAgentMock.mockReturnValue({ data: AVAILABLE_AGENTS[1] } as unknown as ReturnType<
+      typeof useSessionAgent
+    >);
+    useSessionMock.mockReturnValue({
+      session: {
+        id: "conv_src",
+        projectId: "proj_blocked",
+        agentId: "ag_claude_native",
+        harness: "claude-native",
+        hostId: "host_1",
+        workspace: "/opt/work/repo",
+        labels: { "omnigent.wrapper": "claude-native-ui" },
+        terminalLaunchArgs: [],
+      },
+      isLoading: false,
+      error: null,
+    } as unknown as ReturnType<typeof useSession>);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      if (String(input).includes("/v1/projects/proj_blocked")) {
+        return Response.json({
+          id: "proj_blocked",
+          name: "Blocked Project",
+          config: { blocked_agents: { host_1: ["ag_agy"] } },
+        });
+      }
+      return new Response(null, { status: 404 });
+    });
+    try {
+      renderDialog({ sourceWorkspace: "/opt/work/repo", sourceHostId: "host_1" });
+      await waitFor(() =>
+        expect(fetchSpy).toHaveBeenCalledWith(
+          expect.stringContaining("/v1/projects/proj_blocked"),
+          expect.anything(),
+        ),
+      );
+      openAgentSelect();
+      await waitFor(() =>
+        expect(screen.queryByTestId("fork-session-agent-option-ag_agy")).not.toBeInTheDocument(),
+      );
+      expect(screen.getByTestId("fork-session-agent-option-same")).toBeInTheDocument();
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
 });

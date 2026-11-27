@@ -2246,6 +2246,33 @@ async def _resolve_fire_calling(
     if _is_library_agent_task(deps, task):
         return task
     project = await _task_project(deps, task)
+    if project is not None:
+        from omnigent.native.native_coding_agents import public_agent_name
+        from omnigent.project_agent_blocks import assert_agent_allowed
+
+        fire_agent = (
+            await asyncio.to_thread(deps.agent_store.get, task.agent_id)
+            if deps.agent_store is not None
+            else None
+        )
+        fire_host = (
+            await asyncio.to_thread(deps.host_store.get_host, task.host_id)
+            if task.host_id is not None and deps.host_store is not None
+            else None
+        )
+        assert_agent_allowed(
+            project=project,
+            host_id=task.host_id,
+            agent_id=task.agent_id,
+            agent_label=(
+                (public_agent_name(fire_agent.name) or fire_agent.name)
+                if fire_agent is not None
+                else task.agent_id
+            ),
+            host_label=(
+                fire_host.name if fire_host is not None and fire_host.name else task.host_id
+            ),
+        )
     explicit: dict[str, Any] = {
         "agent_id": task.agent_id,
         "model_override": task.model_override,

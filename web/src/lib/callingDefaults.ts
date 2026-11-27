@@ -371,7 +371,6 @@ export function resolveProjectInheritedField(
   agentId: string | null,
   capabilities?: HarnessCapabilityMap,
 ): { value: string | null; source: ProjectDefaultSource } {
-  const projectHost = config.calling_defaults?.[hostId]?.harnesses;
   const parent = callingDefaultParent(harness, capabilities);
   const candidates: [string | undefined, ProjectDefaultSource][] = [];
   if (field === "model" && agentId && agentId === config.agent_id) {
@@ -383,7 +382,6 @@ export function resolveProjectInheritedField(
     "master",
   ]);
   if (parent) {
-    candidates.push([projectHost?.[parent]?.[field], "project_host_native"]);
     candidates.push([
       resolveCallingMasterField(master, hostId, parent, field, capabilities).value as
         string | undefined,

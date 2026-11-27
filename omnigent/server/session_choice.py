@@ -1075,6 +1075,7 @@ class ChoiceRequest:
     quota_periods: Mapping[tuple[str, str | None], str] = field(default_factory=dict)
     link_exclusions: Mapping[str, float] | None = None
     required_model: str | None = None
+    blocked: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -1574,6 +1575,8 @@ def _filter_link(
     link = resolved_link(settings, link, request)
     product = request.products.get(link.agent_id, link.agent_id)
     pool = pool_of(settings, link, product, request.provider_groups)
+    if link.agent_id in request.blocked:
+        return Skipped(link, "blocked_for_project")
     if link.agent_id in request.unavailable:
         return Skipped(link, "unavailable")
     required_model = request.required_model

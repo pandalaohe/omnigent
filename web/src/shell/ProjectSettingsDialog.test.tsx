@@ -5,11 +5,7 @@ import userEvent from "@testing-library/user-event";
 
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
-import {
-  callingDefaultHarnesses,
-  callingHarnessLabel,
-  readCallingDefaults,
-} from "@/lib/callingDefaults";
+import { readCallingDefaults } from "@/lib/callingDefaults";
 import { writeAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import {
   createProject,
@@ -197,7 +193,7 @@ function catalogRow(hostId: string, harness: string, models: Record<string, unkn
 function useMobileViewport(): () => void {
   const original = window.matchMedia;
   window.matchMedia = ((query: string) => ({
-    matches: query === "(max-width: 767.98px)",
+    matches: query === "(max-width: 1180.98px)" || query === "(max-width: 767.98px)",
     media: query,
     onchange: null,
     addListener: () => {},
@@ -1546,16 +1542,7 @@ describe("ProjectSettingsDialog", () => {
     );
     await pickOption("project-settings-host-speed-h1", "Fast");
     await pickOption("project-settings-host-permission-h1", "Approve for me");
-    fireEvent.click(screen.getByTestId("project-settings-host-other-toggle-h1"));
-    expect(
-      screen.getByTestId("project-settings-host-other-speed-h1-claude-native"),
-    ).toHaveTextContent("Standard");
-    expect(screen.getByTestId("project-settings-host-other-speed-h1-claude-sdk")).toHaveTextContent(
-      "Fast",
-    );
-    await pickOption("project-settings-host-other-speed-h1-claude-native", "Fast");
-    await pickOption("project-settings-host-other-speed-h1-claude-sdk", "Standard");
-    await pickOption("project-settings-host-other-permission-h1-claude-native", "Auto");
+    expect(screen.queryByTestId("project-settings-host-other-toggle-h1")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId("project-settings-save"));
     await waitFor(() =>
       expect(updateMock).toHaveBeenCalledWith("p_1", {
@@ -1564,8 +1551,6 @@ describe("ProjectSettingsDialog", () => {
             agent_id: "ag_codex_sdk",
             harnesses: {
               codex: { speed: "fast", permission: "approve-for-me" },
-              "claude-native": { speed: "fast", permission: "auto" },
-              "claude-sdk": { speed: "standard" },
             },
           },
         },
@@ -1716,7 +1701,6 @@ describe("ProjectSettingsDialog", () => {
           h1: {
             agent_id: "ag_claude",
             harnesses: {
-              codex: { model: "gpt-6-sol", effort: "high" },
               "claude-native": { model: "opus" },
             },
           },
@@ -1859,139 +1843,6 @@ describe("ProjectSettingsDialog", () => {
     }
   });
 
-  const offeredHarnesses = [...callingDefaultHarnesses(), "pi", "acp", "grok", "jcode"];
-  it.each(offeredHarnesses)(
-    "adds %s with its calling defaults and saves without reselecting a model",
-    async (harness) => {
-      harnessCapabilitiesMock.mockReturnValue(
-        Object.fromEntries(
-          offeredHarnesses.map((id) => [
-            id,
-            { calling_defaults: { model_options: true, inherits_from: null } },
-          ]),
-        ),
-      );
-      listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/example")]);
-      getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
-      const defaults = {
-        model: "shared-model",
-        effort: "high",
-        ...(harness === "codex" || harness === "codex-native"
-          ? { speed: "standard", permission: "read-only" }
-          : {}),
-      };
-      localStorage.setItem(
-        "omnigent:calling-defaults",
-        JSON.stringify({ h1: { [harness]: defaults }, h2: { [harness]: { model: "other-host" } } }),
-      );
-      const rows = [
-        catalogRow("h1", harness, [{ id: "shared-model", displayName: "Shared model" }]),
-      ];
-      listCatalogsMock.mockResolvedValue(rows);
-      syncCatalogsMock.mockResolvedValue(rows);
-      renderDialog();
-      await screen.findByTestId("project-settings-host-detail-h1");
-      fireEvent.click(screen.getByTestId("project-settings-host-other-toggle-h1"));
-      await pickOption("project-settings-host-other-add-h1", callingHarnessLabel(harness));
-      expect(
-        screen.getByTestId(`project-settings-host-other-model-h1-${harness}`),
-      ).toHaveTextContent("Shared model");
-      fireEvent.click(screen.getByTestId("project-settings-save"));
-      await waitFor(() =>
-        expect(updateMock).toHaveBeenCalledWith("p_1", {
-          calling_defaults: { h1: { harnesses: { [harness]: defaults } } },
-        }),
-      );
-    },
-  );
-
-  it("adds an SDK harness from unsaved native defaults without copying the primary agent model", async () => {
-    harnessCapabilitiesMock.mockReturnValue({
-      codex: { calling_defaults: { model_options: true, inherits_from: "codex-native" } },
-    });
-    availableAgentsMock.mockReturnValue({ data: [claudeAgent(), codexSdkAgent()] });
-    listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/example")]);
-    getProjectMock.mockResolvedValue({
-      id: "p_1",
-      name: "Work",
-      config: {
-        agent_id: "ag_claude",
-        model: "opus",
-        calling_defaults: {
-          h1: { harnesses: { "codex-native": { model: "old-model", effort: "high" } } },
-        },
-      },
-    });
-    const rows = [
-      catalogRow("h1", "codex-native", [{ id: "new-model", displayName: "New model" }]),
-    ];
-    listCatalogsMock.mockResolvedValue(rows);
-    syncCatalogsMock.mockResolvedValue(rows);
-    renderDialog();
-    await screen.findByTestId("project-settings-host-detail-h1");
-    fireEvent.click(screen.getByTestId("project-settings-host-other-toggle-h1"));
-    await pickOption("project-settings-host-other-model-h1-codex-native", "New model");
-    await pickOption("project-settings-host-other-add-h1", "Codex SDK");
-    expect(screen.getByTestId("project-settings-host-other-model-h1-codex")).toHaveTextContent(
-      "new-model",
-    );
-    fireEvent.click(screen.getByTestId("project-settings-save"));
-    await waitFor(() =>
-      expect(updateMock).toHaveBeenCalledWith("p_1", {
-        agent_id: "ag_claude",
-        model: "opus",
-        calling_defaults: {
-          h1: {
-            harnesses: {
-              "codex-native": { model: "new-model", effort: "high" },
-              codex: { model: "new-model", effort: "high" },
-            },
-          },
-        },
-      }),
-    );
-  });
-
-  it("adds and deletes an other-harness model row", async () => {
-    availableAgentsMock.mockReturnValue({ data: [claudeAgent()] });
-    listEntriesMock.mockResolvedValue([entry("h1", "/repo")]);
-    getProjectMock.mockResolvedValue({
-      id: "p_1",
-      name: "Work",
-      config: {
-        calling_defaults: {
-          h1: { agent_id: "ag_claude", harnesses: { "claude-native": { model: "opus" } } },
-        },
-      },
-    });
-    syncCatalogsMock.mockResolvedValue([
-      catalogRow("h1", "codex", [{ id: "gpt-6-sol", displayName: "GPT-6-Sol" }]),
-    ]);
-    renderDialog();
-    await waitFor(() =>
-      expect(screen.getByTestId("project-settings-host-detail-h1")).toBeInTheDocument(),
-    );
-
-    fireEvent.click(screen.getByTestId("project-settings-host-other-toggle-h1"));
-    fireEvent.click(screen.getByTestId("project-settings-host-other-add-h1"));
-    fireEvent.click(await screen.findByRole("option", { name: "Codex SDK" }));
-    await pickOption("project-settings-host-other-model-h1-codex", "GPT-6-Sol");
-    expect(screen.getByTestId("project-settings-host-other-h1-codex")).toBeInTheDocument();
-
-    // Deleting the row omits its harness entry from the next save.
-    fireEvent.click(screen.getByTestId("project-settings-host-other-remove-h1-codex"));
-    expect(screen.queryByTestId("project-settings-host-other-h1-codex")).not.toBeInTheDocument();
-
-    fireEvent.click(screen.getByTestId("project-settings-save"));
-    await waitFor(() =>
-      expect(updateMock).toHaveBeenCalledWith("p_1", {
-        calling_defaults: {
-          h1: { agent_id: "ag_claude", harnesses: { "claude-native": { model: "opus" } } },
-        },
-      }),
-    );
-  });
-
   it("leads a project without an entry to its selected host's folder", async () => {
     getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { host_id: "h1" } });
     renderDialog();
@@ -2062,7 +1913,7 @@ describe("ProjectSettingsDialog", () => {
     await waitFor(() =>
       expect(updateMock).toHaveBeenCalledWith("p_1", {
         calling_defaults: {
-          h1: { agent_id: "ag_codex_sdk", harnesses: { "claude-native": { model: "sonnet" } } },
+          h1: { agent_id: "ag_codex_sdk" },
         },
       }),
     );
@@ -2148,7 +1999,7 @@ describe("ProjectSettingsDialog", () => {
       "Other",
     );
     fireEvent.click(screen.getByRole("button", { name: "Use selected projects" }));
-    expect(screen.getByTestId("project-settings-copy-field-agent")).not.toBeChecked();
+    expect(screen.queryByTestId("project-settings-copy-field-agent")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Apply selected fields" }));
     await waitFor(() => expect(patchDefaultsMock).toHaveBeenCalledTimes(1));
     expect(patchDefaultsMock).toHaveBeenCalledWith("p_2", {
@@ -2156,7 +2007,8 @@ describe("ProjectSettingsDialog", () => {
       host_id: "h1",
       harness: "codex",
       fields: { model: "gpt-6-sol", effort: null, speed: null, permission: "read-only" },
-      copy_agent: false,
+      copy_agent: true,
+      agent_id: "ag_codex_sdk",
     });
     expect(patchDefaultsMock).toHaveBeenCalledTimes(1);
   });
@@ -2179,7 +2031,7 @@ describe("ProjectSettingsDialog", () => {
     await waitFor(() => expect(master).not.toHaveAttribute("data-disabled"));
     fireEvent.click(master);
     expect(screen.getByTestId("project-settings-master-panel")).toHaveTextContent(
-      "model: gpt-6-sol",
+      "Model: gpt-6-sol",
     );
     expect(screen.getByTestId("project-settings-master-panel")).toHaveTextContent(
       "Applies on Laptop to every project on this host; projects with their own changes keep them, and the default agent is not changed.",
@@ -2358,7 +2210,7 @@ describe("ProjectSettingsDialog", () => {
     expect(screen.queryByTestId("project-settings-host-reset-effort-h1")).toBeNull();
   });
 
-  it("shows Default for unresolved fields in primary and other harness rows", async () => {
+  it("shows Default for unresolved fields in the default harness row", async () => {
     availableAgentsMock.mockReturnValue({ data: [codexSdkAgent()] });
     listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/example")]);
     getProjectMock.mockResolvedValue({
@@ -2373,10 +2225,7 @@ describe("ProjectSettingsDialog", () => {
     for (const field of ["model", "effort", "speed", "permission"]) {
       expectPickerLabel(`project-settings-host-${field}-h1`, "Default");
     }
-    fireEvent.click(screen.getByTestId("project-settings-host-other-toggle-h1"));
-    for (const field of ["model", "effort", "speed", "permission"]) {
-      expectPickerLabel(`project-settings-host-other-${field}-h1-claude-native`, "Default");
-    }
+    expect(screen.queryByTestId("project-settings-host-other-toggle-h1")).not.toBeInTheDocument();
   });
 
   it("shows the All hosts Agent instead of treating another harness row as the default", async () => {
@@ -2518,7 +2367,8 @@ describe("ProjectSettingsDialog", () => {
       host_id: "h1",
       harness: "codex",
       fields: { effort: null, permission: null },
-      copy_agent: false,
+      copy_agent: true,
+      agent_id: "ag_codex_sdk",
     });
   });
 
@@ -2689,16 +2539,16 @@ describe("ProjectSettingsDialog", () => {
     });
   });
 
-  it("resolves an SDK target's Native project model after model reset", async () => {
+  it("ignores an SDK target's inert Native project model after model reset", async () => {
     await openModelCopy({
       sourceSet: { effort: "high", speed: "fast" },
       targetSet: { model: "m-fast" },
       targetModel: null,
       targetNativeModel: "m-slow",
     });
-    expect(openCopyPreview()).toHaveTextContent("Apply: model, effort, permission");
+    expect(openCopyPreview()).toHaveTextContent("Apply: model, speed, permission, Agent");
     expect(screen.getByRole("dialog", { name: "Apply to which projects" })).toHaveTextContent(
-      "Skip: speed unavailable",
+      "Skip: effort unavailable",
     );
     closeCopyPreview();
   });
@@ -2709,7 +2559,7 @@ describe("ProjectSettingsDialog", () => {
     closeCopyPreview();
   });
 
-  it("uses the optional copied Agent when resolving the target legacy model", async () => {
+  it("always copies the default Agent when resolving the target legacy model", async () => {
     window.localStorage.setItem(
       "omnigent:calling-defaults",
       JSON.stringify({ h1: { codex: { model: "m-fast" } } }),
@@ -2718,9 +2568,6 @@ describe("ProjectSettingsDialog", () => {
       sourceSet: { effort: "high", speed: "fast" },
       targetAgent: "ag_other",
     });
-    expect(openCopyPreview()).toHaveTextContent("Apply: model, effort, speed, permission");
-    closeCopyPreview();
-    fireEvent.click(screen.getByTestId("project-settings-copy-field-agent"));
     expect(openCopyPreview()).toHaveTextContent("Apply: model, effort, permission, Agent");
     expect(screen.getByRole("dialog", { name: "Apply to which projects" })).toHaveTextContent(
       "Skip: speed unavailable",
@@ -2836,5 +2683,150 @@ describe("ProjectSettingsDialog", () => {
     fireEvent.click(screen.getByTestId("project-settings-host-reset-model-h1"));
     expect(screen.getByRole("button", { name: "Save host defaults" })).toBeDisabled();
     expect(readCallingDefaults()).toEqual({});
+  });
+
+  it("edits orchestration inline, saves child_cap, and restores all to account settings (Scenario 15)", async () => {
+    listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/example")]);
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    renderDialog();
+    await screen.findByTestId("project-orchestration-section");
+    expect(screen.getByTestId("project-orchestration-summary-default")).toHaveTextContent(
+      "Use account settings",
+    );
+    expect(screen.getByTestId("project-orchestration-toggle")).toHaveTextContent("Customize");
+
+    fireEvent.click(screen.getByTestId("project-orchestration-toggle"));
+    fireEvent.click(screen.getByTestId("project-orchestration-cap-custom"));
+    fireEvent.change(screen.getByTestId("project-orchestration-cap-input"), {
+      target: { value: "4" },
+    });
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        orchestration: { child_cap: 4 },
+      }),
+    );
+
+    updateMock.mockClear();
+    fireEvent.click(screen.getByTestId("project-orchestration-restore-all"));
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", {}));
+  });
+
+  it("handles blocked agents: offline picker disabled with removable chips, inherited *, Not installed, deleted id, and default exclusion (Scenario 16)", async () => {
+    const offlineHost = { ...LAPTOP, status: "offline" as const };
+    const readyAgent = pickerAgent({
+      id: "ag_claude",
+      name: "claude-native",
+      display_name: "Claude Code",
+      harness: "claude-native",
+    });
+    const unreadyAgent = pickerAgent({
+      id: "ag_pi",
+      name: "pi-native",
+      display_name: "Pi",
+      harness: "pi-native",
+    });
+    const blockedOnline = pickerAgent({
+      id: "ag_codex",
+      name: "codex-native",
+      display_name: "Codex",
+      harness: "codex-native",
+    });
+    hostsMock.mockReturnValue({
+      data: [
+        { ...offlineHost, configured_harnesses: { "claude-native": true, "codex-native": true } },
+        { ...DESKTOP, configured_harnesses: { "claude-native": true, "codex-native": true } },
+      ],
+    });
+    availableAgentsMock.mockReturnValue({ data: [readyAgent, unreadyAgent, blockedOnline] });
+    listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/one"), entry("h2", "/opt/work/two")]);
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: {
+        calling_defaults: { h1: { agent_id: "ag_claude" } },
+        blocked_agents: {
+          "*": ["ag_pi"],
+          h1: ["ag_codex", "ag_deleted_99"],
+        },
+      },
+    });
+    renderDialog();
+    await screen.findByTestId("project-settings-blocked-section-h1");
+    expect(screen.getByTestId("project-settings-host-blocked-count-h1")).toHaveTextContent(
+      "Blocked 3",
+    );
+    expect(screen.getByTestId("project-settings-blocked-add-h1")).toBeDisabled();
+    expect(screen.getByTestId("project-settings-blocked-disabled-reason-h1")).toBeInTheDocument();
+    expect(screen.getByTestId("project-settings-blocked-inherited-h1-ag_pi")).toHaveTextContent(
+      "All hosts",
+    );
+    expect(
+      screen.queryByTestId("project-settings-blocked-remove-h1-ag_pi"),
+    ).not.toBeInTheDocument();
+    expect(screen.getByTestId("project-settings-blocked-chip-h1-ag_deleted_99")).toHaveTextContent(
+      "ag_deleted_99",
+    );
+    fireEvent.click(screen.getByTestId("project-settings-blocked-remove-h1-ag_deleted_99"));
+    expect(
+      screen.queryByTestId("project-settings-blocked-chip-h1-ag_deleted_99"),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        calling_defaults: { h1: { agent_id: "ag_claude" } },
+        blocked_agents: {
+          "*": ["ag_pi"],
+          h1: ["ag_codex"],
+        },
+      }),
+    );
+  });
+
+  it("skips injecting a draft-blocked host template in one Save and shows the notice (Scenario 25)", async () => {
+    const agAgent = pickerAgent({
+      id: "ag_antigravity",
+      name: "antigravity-native",
+      display_name: "Antigravity",
+      harness: "antigravity-native",
+    });
+    const claude = claudeAgent();
+    hostsMock.mockReturnValue({
+      data: [
+        {
+          ...LAPTOP,
+          configured_harnesses: { "claude-native": true, "antigravity-native": true },
+        },
+      ],
+    });
+    availableAgentsMock.mockReturnValue({ data: [claude, agAgent] });
+    listEntriesMock.mockResolvedValue([]);
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    putEntryMock.mockResolvedValue({
+      host_id: "h1",
+      workspace: "/picked/dir",
+      host_agent_id: "ag_antigravity",
+      checked: true,
+      updated_at: null,
+    });
+    renderDialog();
+    await screen.findByTestId("project-settings-add-host");
+    await pickOption("project-settings-add-host", "Laptop");
+    fireEvent.click(screen.getByTestId("project-settings-entry-browse-h1"));
+    fireEvent.click(screen.getByRole("button", { name: "pick dir" }));
+    fireEvent.click(screen.getByTestId("project-settings-blocked-add-h1"));
+    fireEvent.click(await screen.findByTestId("project-settings-blocked-option-h1-ag_antigravity"));
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        blocked_agents: { h1: ["ag_antigravity"] },
+      }),
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "New project agent unavailable on this host",
+    );
   });
 });

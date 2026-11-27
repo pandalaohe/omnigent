@@ -10,6 +10,7 @@ from omnigent.calling_defaults import default_agent_for_host_or_legacy
 from omnigent.db.db_models import InvalidUuidError
 from omnigent.entities import Project
 from omnigent.errors import OmnigentError
+from omnigent.project_agent_blocks import blocked_agents
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.stores.project_host_binding_store import ProjectHostBindingStore
 
@@ -40,6 +41,12 @@ async def resolve_project_host_template(
     template = templates.get(host_id) if isinstance(templates, dict) else None
     if not isinstance(template, str) or not template:
         return None, None
+    if not template.startswith("ca_") and template in blocked_agents(project.config, host_id):
+        return (
+            None,
+            "New project agent unavailable on this host. "
+            "Using the project's existing agent selection rules.",
+        )
 
     from omnigent.server.routes._sessions.orchestration import _create_resolved_harness
 

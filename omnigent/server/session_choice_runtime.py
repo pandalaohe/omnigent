@@ -1176,6 +1176,8 @@ def _context_request(
                 _resolve_harness_impl(target, agent_store=agents, agent_cache=cache)
             )
             differ_family = model_family(model or product or "")
+    from omnigent.project_agent_blocks import blocked_agents
+
     request = ChoiceRequest(
         owner,
         host,
@@ -1195,6 +1197,7 @@ def _context_request(
         quota_tiers=quota_tiers,
         quota_periods=quota_periods,
         provider_groups=groups,
+        blocked=blocked_agents(project_config, host),
     )
     return replace(
         request, link_exclusions=external_link_exclusions(app, settings, request, time.time())
@@ -1357,6 +1360,13 @@ def limit_receipt(app, settings, revision, link, request, running, now, *, inclu
     }
 
 
+@dataclass(frozen=True)
+class _AdmitBodyOverride:
+    """Forwards a modified request body to create without recording a session choice."""
+
+    body: Any
+
+
 @dataclass
 class CreateChoice:
     body: Any
@@ -1503,7 +1513,8 @@ async def admit_create(
     body: Any,
     caller: Conversation | None,
     user_id: str | None,
-) -> AsyncIterator[CreateChoice | None]:
+) -> AsyncIterator[CreateChoice | _AdmitBodyOverride | None]:
+    from omnigent.calling_defaults import default_agent_for_host_or_legacy
     from omnigent.runner.routing import routing_host_id
     from omnigent.server.auth import LEVEL_READ
     from omnigent.server.routes._auth_helpers import require_access
@@ -1521,7 +1532,7 @@ async def admit_create(
     if not host:
         yield None
         return
-    project_id = body.project_id or caller.project_id
+    project_id = body.project_id if "project_id" in body.model_fields_set else caller.project_id
     projects = getattr(app.state, "project_store", None)
     project = projects.get(project_id, user_id=user_id) if projects and project_id else None
     override = (
@@ -1532,16 +1543,28 @@ async def admit_create(
         return
     pin = override.get("pin") if isinstance(override, dict) else None
     named = bool(body.agent_id and (body.user_named or body.choice_reason))
+    j1_applies = (
+        body.parent_session_id is None
+        and not named
+        and project is not None
+        and default_agent_for_host_or_legacy(project.config, body.host_id) is not None
+    )
     async with AsyncExitStack() as stack:
         await stack.enter_async_context(app.state.child_cap_locks.hold(f"owner:{owner}"))
         state = state_for(app)
         settings, snapshot = await asyncio.to_thread(choice_settings_snapshot, app, owner)
-        if (
-            active_on(settings, host)
-            and not named
-            and pin is None
-            and owner in state.pending_drain_closures
-        ):
+        if not active_on(settings, host):
+            yield None
+            return
+        if j1_applies:
+            j1_body = body
+            if "agent_id" in body.model_fields_set:
+                j1_body = body.model_copy(update={"agent_id": None})
+                j1_body.model_fields_set.discard("agent_id")
+            await stack.aclose()
+            yield _AdmitBodyOverride(body=j1_body)
+            return
+        if not named and pin is None and owner in state.pending_drain_closures:
             if not await _flush_drain_closures(app, owner):
                 raise HTTPException(503, {"code": "session_choice_unavailable"})
             settings, snapshot = await asyncio.to_thread(choice_settings_snapshot, app, owner)

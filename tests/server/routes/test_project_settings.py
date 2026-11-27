@@ -453,7 +453,11 @@ async def test_invalid_orchestration_is_atomic(settings_app, patch):
 
 
 @pytest.mark.asyncio
-async def test_named_leaves_entry_and_revision_guard(settings_app: FastAPI) -> None:
+async def test_named_leaves_entry_and_revision_guard(
+    settings_app: FastAPI, tmp_path: Path
+) -> None:
+    LocalArtifactStore(str(tmp_path / "artifacts")).put("agent/bundle", _bundle("codex-native"))
+    settings_app.state.agent_store.create(AGENT_ID, "Default Agent", "agent/bundle")
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=settings_app), base_url="http://test"
     ) as client:
@@ -461,13 +465,14 @@ async def test_named_leaves_entry_and_revision_guard(settings_app: FastAPI) -> N
         url = f"/v1/projects/{project_id}/settings"
         initial = (await client.get(url)).json()
         assert initial["default_host"] == {"host_id": None, "reason": "none"}
-        assert any(row["harness"] == "codex-native" for row in initial["rows"])
+        assert initial["rows"] == []
         first_revision = initial["revision"]
         patch: dict[str, Any] = {
             "expected_revision": first_revision,
             "project": {"host_id": _HOST_B},
             "host": {
                 "host_id": _HOST_B,
+                "agent_id": AGENT_ID,
                 "workspace": "/opt/work/project",
                 "harnesses": {"codex-native": {"model": "offered-model", "effort": "high"}},
             },
@@ -565,9 +570,9 @@ async def test_sdk_inheritance_and_unnamed_config_survive_ui_writer(
         ).status_code == 200
         read = await client.get(url, params={"host_id": _HOST_A, "harness": "codex"})
         assert read.status_code == 200, read.text
-        assert len(read.json()["rows"]) == 1
-        assert read.json()["rows"][0]["effective"]["model"] == "offered-model"
-        assert read.json()["rows"][0]["sources"]["model"] == "project_host_native"
+        # Under D6, a host with no default agent renders no harness rows and does
+        # not apply stale other-harness rows.
+        assert read.json()["rows"] == []
         revision = read.json()["revision"]
         saved = await client.put(
             url,
@@ -593,8 +598,10 @@ async def test_sdk_inheritance_and_unnamed_config_survive_ui_writer(
 
 @pytest.mark.asyncio
 async def test_invalid_model_rejects_all_changes_and_ui_entry_edit_conflicts(
-    settings_app: FastAPI,
+    settings_app: FastAPI, tmp_path: Path
 ) -> None:
+    LocalArtifactStore(str(tmp_path / "artifacts")).put("agent/bundle", _bundle("codex-native"))
+    settings_app.state.agent_store.create(AGENT_ID, "Default Agent", "agent/bundle")
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=settings_app), base_url="http://test"
     ) as client:
@@ -607,6 +614,7 @@ async def test_invalid_model_rejects_all_changes_and_ui_entry_edit_conflicts(
                 "expected_revision": revision,
                 "host": {
                     "host_id": _HOST_A,
+                    "agent_id": AGENT_ID,
                     "workspace": "/opt/work/project",
                     "harnesses": {"codex-native": {"model": "not-offered"}},
                 },
@@ -904,7 +912,8 @@ async def test_unready_harness_rejects_new_defaults_but_allows_reset(
         config = {
             "calling_defaults": {
                 _HOST_A: {
-                    "harnesses": {"codex-native": {"model": "offered-model", "effort": "high"}}
+                    "agent_id": AGENT_ID,
+                    "harnesses": {"codex-native": {"model": "offered-model", "effort": "high"}},
                 }
             }
         }
@@ -940,7 +949,9 @@ async def test_unready_harness_rejects_new_defaults_but_allows_reset(
             },
         )
         assert cleared.status_code == 200, cleared.text
-        assert _HOST_A not in cleared.json()["config"].get("calling_defaults", {})
+        assert "harnesses" not in cleared.json()["config"].get("calling_defaults", {}).get(
+            _HOST_A, {}
+        )
 
 
 @pytest.mark.asyncio
