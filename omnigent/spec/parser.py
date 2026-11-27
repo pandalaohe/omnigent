@@ -2582,11 +2582,12 @@ def discover_host_skills(
     skills_filter: str | list[str],
     *,
     include_agents: bool = True,
+    prefer_agents: bool = False,
 ) -> list[SkillSpec]:
     """
     Discover host-scope skills from ``.claude/skills/`` and
     ``.agents/skills/`` directories walking up from *agent_root*,
-    plus the user's global ``~/.claude/skills/``.
+    plus the corresponding directories in the user's home.
 
     Not called by :func:`parse` — host-scope skills are a REPL
     concern, not a spec concern. Callers (e.g. ``chat.py``) merge
@@ -2600,6 +2601,8 @@ def discover_host_skills(
         those.
     :param include_agents: When ``False``, skip every
         ``.agents/skills/`` tier.
+    :param prefer_agents: Scan ``.agents/skills/`` first within each
+        scope for harnesses that use the portable mount.
     :returns: Deduplicated list of :class:`SkillSpec` objects.
         Later directories (closer to /) lose on name collision
         with earlier ones (closer to agent_root).
@@ -2624,8 +2627,9 @@ def discover_host_skills(
             skills.append(spec)
 
     dotdirs = (".claude", ".agents") if include_agents else (".claude",)
-    # Walk from agent_root up to filesystem root, scanning
-    # .claude/skills/ and .agents/skills/ at each level.
+    if prefer_agents:
+        dotdirs = dotdirs[::-1]
+    # Walk from agent_root up to filesystem root, scanning both tiers at each level.
     current = agent_root.resolve()
     while True:
         for dotdir in dotdirs:

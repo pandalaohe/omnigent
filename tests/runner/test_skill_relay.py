@@ -205,6 +205,93 @@ def test_execute_skill_tool_effective_harness_wins(
     assert "agents api body" in api
 
 
+@pytest.mark.parametrize(
+    ("harness", "expected"),
+    [
+        ("antigravity-native", "shared"),
+        ("claude-native", "claude"),
+        ("codex-native", "shared"),
+        ("pi-native", "claude"),
+    ],
+)
+def test_skill_tools_select_the_session_harness_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, harness: str, expected: str
+) -> None:
+    """A same-named skill and its resources come from the same mount."""
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path / "home")
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    workspace = tmp_path / "workspace"
+    (workspace / ".git").mkdir(parents=True)
+    for mount, variant in ((".claude", "claude"), (".agents", "shared")):
+        skills_dir = workspace / mount / "skills"
+        _write_skill(skills_dir, "example", f"{variant} instructions")
+        (skills_dir / "example" / "NOTES.md").write_text(f"{variant} notes")
+
+    spec = _agent_spec("claude-native")
+    loaded = _execute_skill_tool(
+        "load_skill",
+        {"name": "example"},
+        agent_spec=spec,
+        runner_workspace=workspace,
+        effective_harness=harness,
+    )
+    assert loaded.splitlines()[0] == f"{expected} instructions"
+    assert "- NOTES.md" in loaded
+
+    notes = _execute_skill_tool(
+        "read_skill_file",
+        {"skill_name": "example", "path": "NOTES.md"},
+        agent_spec=spec,
+        runner_workspace=workspace,
+        effective_harness=harness,
+    )
+    assert notes == f"{expected} notes"
+
+
+@pytest.mark.parametrize("filter_name", ["example", "example-label"])
+def test_antigravity_skill_tools_keep_scope_and_directory_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, filter_name: str
+) -> None:
+    """Starting below the mount retains ancestor and home skills and their aliases."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    _write_skill(home / ".agents" / "skills", "home-skill", "user instructions")
+    workspace = tmp_path / "workspace"
+    cwd = workspace / "child"
+    cwd.mkdir(parents=True)
+    _write_skill(workspace / ".claude" / "skills", "example", "claude instructions")
+    skill_dir = workspace / ".agents" / "skills" / "example"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: example-label\ndescription: An example skill.\n---\nshared instructions\n"
+    )
+    (skill_dir / "NOTES.md").write_text("shared notes")
+    spec = _agent_spec("antigravity-native")
+    spec.skills_filter = [filter_name, "home-skill"]
+
+    loaded = _execute_skill_tool(
+        "load_skill", {"name": "example"}, agent_spec=spec, runner_workspace=cwd
+    )
+    assert loaded.splitlines()[0] == "shared instructions"
+    assert "- NOTES.md" in loaded
+    assert (
+        _execute_skill_tool(
+            "read_skill_file",
+            {"skill_name": "example", "path": "NOTES.md"},
+            agent_spec=spec,
+            runner_workspace=cwd,
+        )
+        == "shared notes"
+    )
+    assert (
+        _execute_skill_tool(
+            "load_skill", {"name": "home-skill"}, agent_spec=spec, runner_workspace=cwd
+        )
+        == "user instructions"
+    )
+
+
 def test_relayed_load_skill_description_uses_the_given_registry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

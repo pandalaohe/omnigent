@@ -408,9 +408,9 @@ def _session_skills(
     elif _harness_family(harness) in ("claude", "codex"):
         host_skills = _harness_skills(ctx, harness)
     else:
-        # Every other harness keeps today's load_skill behavior: the generic
-        # walk at the session cwd, never its own (possibly empty) provider.
-        host_skills = discover_host_skills(roots[0], spec.skills_filter)
+        host_skills = discover_host_skills(
+            roots[0], spec.skills_filter, prefer_agents=_harness_family(harness) == "antigravity"
+        )
     for skill in host_skills:
         if skill.name in seen:
             continue
@@ -471,9 +471,10 @@ def resolve_session_skill_registry(
 ) -> list[SkillSpec]:
     """What ``load_skill`` / ``read_skill_file`` may load for a session.
 
-    Claude and Codex families: the menu's sources without the
-    user-invocable filter. Any other harness: bundled + the generic walk at
-    the first root.
+    Claude and Codex use the menu's host skill sources without the
+    user-invocable filter. Other harnesses use the generic walk at the first
+    root, with native Antigravity preferring the portable mount within each
+    scope. Bundled skills take precedence in both cases.
 
     :param harness: The harness whose sources to use; ``None`` means the
         spec's declared harness.
