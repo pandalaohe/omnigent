@@ -168,7 +168,16 @@ async def test_windows_os_shell_checks_the_selected_executor(tmp_path, monkeypat
     result = host.evaluate_host_tool(
         state, "sys_os_shell", {"command": command}, control_paths=(r"C:\control",)
     )
-    assert result.action == (Verdict.ALLOW if selection == "bash" else Verdict.DENY)
+    assert result.action == Verdict.ALLOW
+    assert (
+        host.evaluate_host_tool(
+            replace(state, tier="ask"),
+            "sys_os_shell",
+            {"command": command},
+            control_paths=(r"C:\control",),
+        ).action
+        == Verdict.ASK
+    )
     monkeypatch.setattr(os_env, "_shell_impl", lambda **kwargs: {"shell": kwargs["shell_path"]})
     monkeypatch.setattr(
         type(executor._helper),
@@ -185,7 +194,7 @@ async def test_windows_os_shell_checks_the_selected_executor(tmp_path, monkeypat
     native = host.evaluate_host_tool(
         state, "run_command", {"CommandLine": command}, control_paths=(r"C:\control",)
     )
-    assert native.action == Verdict.DENY
+    assert native.action == Verdict.ALLOW
 
 
 @pytest.mark.parametrize("tool_name", ["bash", "sys_os_shell"])
@@ -217,12 +226,18 @@ async def test_windows_os_shell_checks_the_selected_executor(tmp_path, monkeypat
         ("cat <<EOF > out.txt\n$(( $(sudo ls) ))\nEOF", Verdict.ASK),
         ('env -S "git" reset --hard', Verdict.ASK),
         ('find . -type f "$ACTION"', Verdict.ASK),
-        # Hard-denied destructive or malformed commands keep decide_tier's DENY.
+        # Unclosed quote is opaque, not malformed, so it runs under auto unless D5 matches.
+        ('echo "unclosed', Verdict.ALLOW),
+        # D5 hidden scripts and nested destructive shells elevate to ASK.
+        ("printf '\\x73' | bash", Verdict.ASK),
+        ("pwsh -enc $x", Verdict.ASK),
+        ('pwsh -Command "git branch -D main"', Verdict.ASK),
+        ('bash -c "sudo ls"', Verdict.ASK),
+        # Hard-denied destructive commands keep decide_tier's DENY.
         ("rm -rf ~", Verdict.DENY),
         ('rm -rf "$HOME"', Verdict.DENY),
         ("rm -rf /", Verdict.DENY),
         ("diskutil eraseDisk JHFS+ X disk2", Verdict.DENY),
-        ('echo "unclosed', Verdict.DENY),
     ],
 )
 def test_pi_auto_approval_floor_allows_ordinary_shell_and_stops_destructive(
@@ -263,14 +278,24 @@ def test_pi_auto_approval_floor_keeps_outside_workspace_edit_and_strict_acp_floo
         auto_approval_floor="narrow",
     )
     assert outside.action == Verdict.ASK
-    strict_acp = host.evaluate_host_tool(
+    # D5 removes the broad floor; auto_approval_floor="narrow" allows ordinary shell syntax
+    # while still elevating destructive commands to ASK.
+    ordinary_acp = host.evaluate_host_tool(
         state,
         "sys_os_shell",
         {"command": "echo $HOME"},
         control_paths=controls,
-        auto_approval_floor=True,
+        auto_approval_floor="narrow",
     )
-    assert strict_acp.action == Verdict.ASK
+    assert ordinary_acp.action == Verdict.ALLOW
+    destructive_acp = host.evaluate_host_tool(
+        state,
+        "run_command",
+        {"CommandLine": "git reset --hard"},
+        control_paths=controls,
+        auto_approval_floor="narrow",
+    )
+    assert destructive_acp.action == Verdict.ASK
 
 
 def test_windows_pi_bash_and_powershell_select_their_own_executors(
@@ -327,9 +352,7 @@ def test_windows_pi_bash_and_powershell_select_their_own_executors(
         == Verdict.ALLOW
     )
     for command in (
-        "git reset --hard",
         "Clear-Content local.txt",
-        "Set-ExecutionPolicy Bypass",
         "Get-ChildItem Env:",
         'Get-ChildItem "Env:"',
     ):
@@ -339,7 +362,35 @@ def test_windows_pi_bash_and_powershell_select_their_own_executors(
                 "powershell",
                 {"command": command},
                 control_paths=controls,
-                auto_approval_floor=True,
+                auto_approval_floor="narrow",
+            ).action
+            == Verdict.ALLOW
+        ), command
+        assert (
+            host.evaluate_host_tool(
+                replace(state, tier="ask"),
+                "powershell",
+                {"command": command},
+                control_paths=controls,
+                auto_approval_floor="narrow",
+            ).action
+            == Verdict.ASK
+        ), command
+    for command in (
+        "git reset --hard",
+        "Set-ExecutionPolicy Bypass",
+        "Start-Process pwsh -Verb RunAs",
+        "Invoke-Command -ScriptBlock { Get-Date }",
+        "Set-Acl local.txt $acl",
+        r"Set-ItemProperty HKLM:\Software\Test -Name Key -Value 1",
+    ):
+        assert (
+            host.evaluate_host_tool(
+                state,
+                "powershell",
+                {"command": command},
+                control_paths=controls,
+                auto_approval_floor="narrow",
             ).action
             == Verdict.ASK
         ), command

@@ -308,7 +308,7 @@ Promise.resolve(handlers.session_start({}, { isIdle: () => true })).then(async (
         expected_revision=1,
     )
     allowed = scope in ("user", "bridge")
-    assert decision.action.value == ("ALLOW" if allowed else "DENY"), decision.reason
+    assert decision.action.value == ("ALLOW" if allowed else "ASK"), decision.reason
     assert (
         runtime.authorize(
             state.session_id,
@@ -317,7 +317,7 @@ Promise.resolve(handlers.session_start({}, { isIdle: () => true })).then(async (
             arguments_digest=binding.arguments_digest,
             expected_revision=1,
         )
-        == allowed
+        is True
     )
 
 

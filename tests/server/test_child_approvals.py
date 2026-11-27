@@ -1922,6 +1922,12 @@ def test_auto_floor_asks_only_for_narrow_destructive_classes(
             "Set-Content -Path 'C:\\Windows\\System32\\x' -Value bad",
             "user_only",
         ),
+        (
+            "tee /etc/hosts",
+            "Set-Content C:\\Windows\\System32\\x bad",
+            "user_only",
+        ),
+        ("touch foo.txt", "Set-ItemProperty ./foo.txt -Name IsReadOnly -Value 1", "clear"),
         ("install -d /etc/newdir", "New-Item -Path /etc -Name newfile", "user_only"),
         ("rm -rf /", "Remove-Item tmp.txt", "user_only"),
         ("rm -rf /", "ri tmp.txt", "user_only"),
@@ -1968,3 +1974,49 @@ def test_floor_reads_run_command_command_line_in_permission_tier_cards() -> None
     assert approvals.floor(clear_card) == "clear"
     assert approvals.floor(destructive_card) == "user_only"
     assert approvals.floor(missing_field) == "user_only"
+
+
+@pytest.mark.parametrize(
+    ("command", "platform", "opaque", "expected"),
+    [
+        # Scenario 7: hidden scripts
+        ("printf '\\x73\\x74' | bash", "posix", False, True),
+        ("echo 7374 | xxd -r -p | bash", "posix", False, True),
+        ("pwsh -enc $x", "windows", True, True),
+        ("powershell -EncodedCommand SQBlAHgA", "windows", False, True),
+        ("Invoke-Expression $payload", "windows", True, True),
+        ("cat script.ps1 | iex", "windows", False, True),
+        ("echo x | pwsh -Command -", "windows", False, True),
+        ("echo x | pwsh -File -", "windows", False, True),
+        ("echo x | pwsh -InputFormat Text -Command -", "windows", False, True),
+        ('pwsh -WorkingDirectory /tmp -Command "sudo ls"', "windows", False, True),
+        # Scenario 8: nested shells unwrapping destructive commands
+        ('pwsh -Command "git branch -D main"', "windows", False, True),
+        ('bash -c "sudo ls"', "posix", False, True),
+        ('bash -o pipefail -c "sudo ls"', "posix", False, True),
+        ('cmd /c "git reset --hard"', "windows", False, True),
+        ("git clean -fdx", "posix", False, True),
+        ("git clean -- -n", "posix", False, True),
+        ("git clean -e n", "posix", False, True),
+        ("git clean -en", "posix", False, True),
+        ("git clean -n", "posix", False, False),
+        ("git clean -n -- src", "posix", False, False),
+        ("git clean --dry-run", "posix", False, False),
+        ("Start-Process pwsh -Verb RunAs", "windows", False, True),
+        ("Set-ExecutionPolicy Bypass", "windows", False, True),
+        ("Invoke-Command -ComputerName host -ScriptBlock { ls }", "windows", False, True),
+        ("Set-Acl a.txt $acl", "windows", True, True),
+        (r"Set-ItemProperty HKLM:\Software\Test -Name X -Value 1", "windows", False, True),
+        # Delete verb in opaque command asks; bound delete / ordinary commands allow (Scenario 9)
+        ("Remove-Item $target", "windows", True, True),
+        ("rm -rf build", "posix", False, False),
+        ('python -c "print(1)"', "posix", False, False),
+        ("Remove-Item tmp.log", "windows", False, False),
+        # Piping stdin data to a script file is not stdin-as-script
+        ("cat prompt.txt | bash /opt/work/scripts/run.sh", "posix", False, False),
+    ],
+)
+def test_auto_floor_asks_d5_classes_and_nested_unwrap(
+    command: str, platform: str, opaque: bool, expected: bool
+) -> None:
+    assert approvals.auto_floor_asks(command, platform=platform, opaque=opaque) is expected

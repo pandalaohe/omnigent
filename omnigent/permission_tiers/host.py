@@ -17,13 +17,13 @@ from omnigent.permission_tiers import (
     NativeSupport,
     PermissionTier,
     TierDecision,
+    ToolIntent,
     ToolKind,
     TrustedHostContext,
     Verdict,
     _under,
     adapt_tool_call,
     decide_tier,
-    is_powershell_version_query,
     load_rules,
     normalize_permission_tier,
     resolve_local_path,
@@ -92,7 +92,10 @@ def write_host_permission_state(path: Path, state: HostPermissionState) -> None:
 
 
 def local_host_context(
-    state: HostPermissionState, *, control_paths: tuple[str, ...]
+    state: HostPermissionState,
+    *,
+    control_paths: tuple[str, ...],
+    readable_control_subtrees: tuple[str, ...] = (),
 ) -> TrustedHostContext:
     """Resolve paths on this executor's host, using its own environment."""
     platform = "windows" if sys.platform == "win32" else sys.platform
@@ -127,6 +130,7 @@ def local_host_context(
         resolver=resolve_local_path,
         drive_cwds=drive_cwds,
         environment=environment,
+        readable_control_subtrees=readable_control_subtrees,
     )
 
 
@@ -144,6 +148,42 @@ def trusted_permission_control_paths(
     return tuple(dict.fromkeys(str(path) for path in paths))
 
 
+def apply_auto_floor(
+    tier: PermissionTier,
+    intent: ToolIntent,
+    decision: TierDecision,
+    *,
+    floor: Literal["narrow"] | None,
+) -> TierDecision:
+    """Apply the single narrow auto-tier floor after decide_tier returns ALLOW."""
+    if tier != "auto" or floor is None or decision.action != Verdict.ALLOW:
+        return decision
+    windows = intent.context.platform == "windows"
+    if (
+        intent.kind == ToolKind.EDIT
+        and intent.target is not None
+        and intent.workspace_path is not None
+        and any(
+            not _under(bound.path, intent.workspace_path.path, windows)
+            for bound in (intent.target, intent.source)
+            if bound is not None and bound.kind != "unknown"
+        )
+    ):
+        return TierDecision(Verdict.ASK, "Writing outside the workspace requires approval")
+    if intent.kind == ToolKind.EXEC:
+        if intent.hidden_script:
+            return TierDecision(Verdict.ASK, "Command requires user approval")
+        from omnigent.server.child_approvals import auto_floor_asks
+
+        if intent.command and auto_floor_asks(
+            intent.command,
+            platform=intent.context.platform,
+            opaque=intent.command_opaque,
+        ):
+            return TierDecision(Verdict.ASK, "Command requires user approval")
+    return decision
+
+
 def evaluate_host_tool(
     state: HostPermissionState,
     name: str,
@@ -158,6 +198,7 @@ def evaluate_host_tool(
     agy_delegation_status: Literal["proven", "missing", "failed"] = "missing",
     registry_tool_name: str | None = None,
     readable_control_file: tuple[str, str] | None = None,
+    readable_control_subtrees: tuple[str, ...] = (),
     auto_approval_floor: bool | Literal["narrow"] = False,
     acp_bridge_tool_name: str | None = None,
 ) -> TierDecision:
@@ -187,42 +228,11 @@ def evaluate_host_tool(
             registry_tool_name=registry_tool_name,
             acp_bridge_tool_name=acp_bridge_tool_name,
             readable_control_file=readable_control_file,
+            readable_control_subtrees=readable_control_subtrees,
         )
         intent = adapt_tool_call(name, arguments, context)
         decision = decide_tier(state.tier, intent, load_rules())
-        if state.tier != "auto" or not auto_approval_floor or decision.action != Verdict.ALLOW:
-            return decision
-        if (
-            intent.kind == ToolKind.EDIT
-            and intent.target is not None
-            and intent.workspace_path is not None
-            and any(
-                not _under(bound.path, intent.workspace_path.path, context.platform == "windows")
-                for bound in (intent.target, intent.source)
-                if bound is not None
-            )
-        ):
-            return TierDecision(Verdict.ASK, "Writing outside the workspace requires approval")
-        if intent.kind == ToolKind.EXEC and name in ("bash", "powershell", "sys_os_shell"):
-            command = arguments.get("command")
-            if auto_approval_floor == "narrow":
-                from omnigent.server.child_approvals import auto_floor_asks
-
-                if isinstance(command, str) and auto_floor_asks(command):
-                    return TierDecision(Verdict.ASK, "Command requires user approval")
-            else:
-                from omnigent.server.child_approvals import floor
-
-                if (
-                    not (
-                        name == "powershell"
-                        and context.platform == "windows"
-                        and isinstance(command, str)
-                        and is_powershell_version_query(command)
-                    )
-                    and floor({"tool_name": name, "command": command}) == "user_only"
-                ):
-                    return TierDecision(Verdict.ASK, "Command requires user approval")
-        return decision
+        floor_mode: Literal["narrow"] | None = "narrow" if auto_approval_floor else None
+        return apply_auto_floor(state.tier, intent, decision, floor=floor_mode)
     except Exception as exc:  # noqa: BLE001 - failures never become execution permission
         return TierDecision(Verdict.DENY, f"Permission check unavailable: {type(exc).__name__}")

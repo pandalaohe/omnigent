@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import json
 import logging
@@ -11,7 +12,7 @@ import re
 import shlex
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal, TypedDict
 from uuid import uuid4
 
@@ -320,7 +321,9 @@ def _write_user_only(name: str, args: list[str], _piped: bool) -> bool:
     return forced or any(_critical_target(target) for target in targets)
 
 
-def _git_user_only(_name: str, args: list[str], _piped: bool) -> bool:
+def _git_user_only(
+    _name: str, args: list[str], _piped: bool, *, allow_dry_run: bool = False
+) -> bool:
     index = 0
     while index < len(args) and args[index].startswith("-"):
         arg = args[index]
@@ -333,7 +336,36 @@ def _git_user_only(_name: str, args: list[str], _piped: bool) -> bool:
     short_flags = "".join(
         arg[1:] for arg in options if arg.startswith("-") and not arg.startswith("--")
     )
-    if subcommand in {"clean", "restore", "filter-branch"}:
+    if subcommand == "clean":
+        if not allow_dry_run:
+            return True
+        clean_short: list[str] = []
+        clean_long: set[str] = set()
+        opt_idx = 0
+        while opt_idx < len(options):
+            opt = options[opt_idx]
+            if opt == "--":
+                break
+            if opt in {"-e", "--exclude"}:
+                opt_idx += 2
+                continue
+            if opt.startswith("--exclude="):
+                opt_idx += 1
+                continue
+            if opt.startswith("--"):
+                clean_long.add(opt)
+            elif opt.startswith("-") and len(opt) > 1:
+                for ch in opt[1:]:
+                    if ch == "e":
+                        break
+                    clean_short.append(ch)
+            opt_idx += 1
+        has_dry_run = "n" in clean_short or "--dry-run" in clean_long
+        has_force_or_interactive = any(ch in clean_short for ch in ("f", "i")) or any(
+            flag in clean_long for flag in ("--force", "--interactive")
+        )
+        return not (has_dry_run and not has_force_or_interactive)
+    if subcommand in {"restore", "filter-branch"}:
         return True
     if subcommand == "reset" and any(arg.startswith("--hard") for arg in options):
         return True
@@ -503,6 +535,10 @@ _POWERSHELL_USER_ONLY_CMDLETS = frozenset(
         "invoke-command",
         "icm",
         "set-acl",
+    }
+)
+_POWERSHELL_REGISTRY_CMDLETS = frozenset(
+    {
         "set-itemproperty",
         "sp",
         "clear-itemproperty",
@@ -612,34 +648,130 @@ def _powershell_write_user_only(lower_name: str, args: list[str]) -> bool:
     return any(_critical_target(target) for target in targets)
 
 
+def _windows_preserve_split(segment: str) -> list[str]:
+    """Split a PowerShell segment on whitespace while preserving Windows backslashes."""
+    tokens: list[str] = []
+    current: list[str] = []
+    quote = ""
+    for char in segment:
+        if quote:
+            if char == quote:
+                quote = ""
+            else:
+                current.append(char)
+        elif char in {"'", '"'}:
+            quote = char
+        elif char.isspace():
+            if current:
+                tokens.append("".join(current))
+                current = []
+        else:
+            current.append(char)
+    if quote:
+        raise ValueError("incomplete shell quoting")
+    if current:
+        tokens.append("".join(current))
+    return tokens
+
+
+def _powershell_registry_user_only(args: list[str]) -> bool:
+    for arg in args:
+        cleaned = arg
+        matched_colon = re.fullmatch(r"-(?:path|literalpath)[:=](.+)", arg, re.I)
+        if matched_colon:
+            cleaned = matched_colon.group(1)
+        if _AUTO_REGISTRY_PREFIX.match(cleaned) or (
+            not cleaned.startswith("-") and _critical_target(cleaned)
+        ):
+            return True
+    return False
+
+
+def _split_floor_segments(command: str) -> list[tuple[str, bool]]:
+    """Split command statements on unquoted operators without stripping Windows backslashes."""
+    segments: list[tuple[str, bool]] = []
+    start = 0
+    quote = ""
+    piped = False
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if quote:
+            if (
+                quote == '"'
+                and char == "\\"
+                and index + 1 < len(command)
+                and command[index + 1] == '"'
+            ):
+                index += 2
+                continue
+            if char == quote:
+                quote = ""
+        elif char == "\\" and index + 1 < len(command) and command[index + 1] == "\n":
+            raise ValueError("unsupported shell continuation")
+        elif char in {"'", '"'}:
+            quote = char
+        elif char in "<>(){}*?[":
+            raise ValueError("unsupported shell grouping or expansion")
+        elif char in ";&|\n":
+            segments.append((command[start:index], piped))
+            start = index + 1
+            piped = (
+                char == "|"
+                and (index == 0 or command[index - 1] != "|")
+                and (index + 1 == len(command) or command[index + 1] != "|")
+            )
+        index += 1
+    if quote:
+        raise ValueError("incomplete shell quoting")
+    segments.append((command[start:], piped))
+    return [(seg, p) for seg, p in segments if seg.strip()]
+
+
 def _command_is_user_only(command: str) -> bool:
     if "$" in command or "`" in command:
         return True
     try:
-        statements = _shell_statements(command)
-        if not statements:
+        raw_segments = _split_floor_segments(command)
+        if not raw_segments:
             return True
-        for argv, piped in statements:
-            index = _skip_shell_assignments(argv, 0)
-            if index >= len(argv):
+        for raw_segment, piped in raw_segments:
+            ps_argv = _windows_preserve_split(raw_segment)
+            ps_index = _skip_shell_assignments(ps_argv, 0)
+            if ps_index >= len(ps_argv):
                 return True
-            name = (PurePosixPath(argv[index]).name or argv[index]).removesuffix(".exe")
-            lower_name = name.casefold()
-            args = argv[index + 1 :]
-            if lower_name in _POWERSHELL_USER_ONLY_CMDLETS:
+            ps_head = (
+                PurePosixPath(ps_argv[ps_index].replace("\\", "/")).name or ps_argv[ps_index]
+            ).removesuffix(".exe")
+            ps_lower = ps_head.casefold()
+            ps_args = ps_argv[ps_index + 1 :]
+            if ps_lower in _POWERSHELL_USER_ONLY_CMDLETS:
                 return True
-            if lower_name in {"start-process", "saps"} and _start_process_user_only(args):
+            if ps_lower in {"start-process", "saps"} and _start_process_user_only(ps_args):
                 return True
-            if lower_name in _POWERSHELL_WRITE_CMDLETS and _powershell_write_user_only(
-                lower_name, args
-            ):
+            if ps_lower in _POWERSHELL_REGISTRY_CMDLETS:
+                if _powershell_registry_user_only(ps_args):
+                    return True
+                continue
+            if ps_lower in _POWERSHELL_WRITE_CMDLETS:
+                if _powershell_write_user_only(ps_lower, ps_args):
+                    return True
+                continue
+            statements = _shell_statements(raw_segment)
+            if not statements:
                 return True
-            if any(
-                check(name, args, piped)
-                for names, prefixes, check in _FLOOR_CLASSES.values()
-                if name in names or (prefixes and name.startswith(prefixes))
-            ):
-                return True
+            for argv, _seg_piped in statements:
+                index = _skip_shell_assignments(argv, 0)
+                if index >= len(argv):
+                    return True
+                name = (PurePosixPath(argv[index]).name or argv[index]).removesuffix(".exe")
+                args = argv[index + 1 :]
+                if any(
+                    check(name, args, piped)
+                    for names, prefixes, check in _FLOOR_CLASSES.values()
+                    if name in names or (prefixes and name.startswith(prefixes))
+                ):
+                    return True
     except ValueError:
         return True
     return False
@@ -1133,46 +1265,269 @@ def _find_has_unknown_action(arg_tokens: list[_ShellToken]) -> bool:
     return False
 
 
-def auto_floor_asks(command: str) -> bool:
-    """Narrow auto-tier command floor: ASK only for destructive classes or critical redirects."""
-    if not command.strip():
-        return False
-    pending = [command]
-    while pending:
-        source = pending.pop()
-        embedded: list[str] = []
-        for raw_tokens, write_redirects, piped in _scan_lenient_statements(source, embedded):
-            if any(_redirect_target_is_critical(tok) for tok in write_redirects):
+_AUTO_FLOOR_ARES_RULE_IDS = (
+    "priv-escalation",
+    "system-tamper",
+    "persistence",
+    "git-destructive",
+    "shutdown",
+    "chmod-dangerous",
+    "exfil-tools",
+    "kernel-module",
+)
+_AUTO_DELETE_VERBS = frozenset({"rm", "remove-item", "ri", "del", "erase", "rd", "rmdir"})
+_AUTO_PIPE_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "pwsh", "powershell", "cmd"})
+_AUTO_REGISTRY_ITEMPROPERTY_CMDLETS = frozenset(
+    {
+        "set-itemproperty",
+        "sp",
+        "new-itemproperty",
+        "remove-itemproperty",
+        "rp",
+        "clear-itemproperty",
+        "clp",
+    }
+)
+_AUTO_REGISTRY_PREFIX = re.compile(r"^(?:hklm|hkcu|hkcr|hku|hkcc):|^registry::", re.IGNORECASE)
+_AUTO_PWSH_ENCODED_FLAG = re.compile(
+    r"[-/](?:ec|e(?:n(?:c(?:o(?:d(?:e(?:d(?:c(?:o(?:m(?:m(?:a(?:n(?:d)?)?)?)?)?)?)?)?)?)?)?)?)?)$",
+    re.IGNORECASE,
+)
+_AUTO_PWSH_COMMAND_FLAG = re.compile(r"[-/](?:c|command)$", re.IGNORECASE)
+_AUTO_POSIX_C_FLAG = re.compile(r"-[A-Za-z]*c[A-Za-z]*$")
+_AUTO_WIN_ENV_VAR = re.compile(r"%[A-Za-z_][A-Za-z0-9_]*%")
+
+
+@functools.lru_cache(maxsize=1)
+def _auto_floor_ares_patterns() -> tuple[re.Pattern[str], ...]:
+    rules_path = Path(__file__).resolve().parents[1] / "permission_tiers" / "ares_rules.json"
+    doc = json.loads(rules_path.read_text(encoding="utf-8"))
+    by_id = {entry["id"]: entry for entry in doc["rules"]}
+    return tuple(
+        re.compile(
+            by_id[rule_id]["pattern"],
+            re.IGNORECASE if by_id[rule_id].get("ignore_case") else 0,
+        )
+        for rule_id in _AUTO_FLOOR_ARES_RULE_IDS
+    )
+
+
+_PWSH_VALUE_OPTIONS = frozenset(
+    {
+        "-inputformat",
+        "-if",
+        "-outputformat",
+        "-of",
+        "-workingdirectory",
+        "-wd",
+        "-executionpolicy",
+        "-ep",
+        "-configurationname",
+        "-custompipename",
+        "-settingsfile",
+        "-windowstyle",
+        "-w",
+        "-version",
+        "-v",
+    }
+)
+
+
+def _scan_powershell_invocation(
+    arg_tokens: list[_ShellToken],
+) -> tuple[bool, bool, str | None]:
+    """Return (is_encoded, reads_stdin, inner_command) for a pwsh/powershell invocation."""
+    index = 0
+    while index < len(arg_tokens):
+        opt = arg_tokens[index].text
+        if _AUTO_PWSH_ENCODED_FLAG.fullmatch(opt):
+            return True, False, None
+        if _AUTO_PWSH_COMMAND_FLAG.fullmatch(opt):
+            if index + 1 >= len(arg_tokens) or arg_tokens[index + 1].text == "-":
+                return False, True, None
+            rest = [tok.text for tok in arg_tokens[index + 1 :]]
+            return False, False, rest[0] if len(rest) == 1 else " ".join(rest)
+        if re.fullmatch(r"[-/](?:f|file)$", opt, re.IGNORECASE):
+            reads_stdin = index + 1 >= len(arg_tokens) or arg_tokens[index + 1].text == "-"
+            return False, reads_stdin, None
+        if not opt.startswith(("-", "/")):
+            return False, False, None
+        normalized = "-" + opt[1:].casefold()
+        if normalized in _PWSH_VALUE_OPTIONS:
+            index += 2
+            continue
+        index += 1
+    return False, True, None
+
+
+def _unwrap_nested_shell_for_auto(
+    lower_name: str, arg_tokens: list[_ShellToken]
+) -> tuple[bool, str | None]:
+    """Return (is_encoded_hidden_script, inner_command_string) for nested shell invocations."""
+    from omnigent.permission_tiers import _takes_shell_option_arg
+
+    if lower_name in {"sh", "bash", "zsh", "dash", "ksh"}:
+        index = 0
+        while index < len(arg_tokens) - 1:
+            opt = arg_tokens[index].text
+            if opt in {"--", "-"}:
+                return False, None
+            if _AUTO_POSIX_C_FLAG.fullmatch(opt):
+                return False, arg_tokens[index + 1].text
+            if not opt.startswith(("-", "+")):
+                return False, None
+            index += 2 if _takes_shell_option_arg(opt) else 1
+        return False, None
+    if lower_name in {"pwsh", "powershell"}:
+        is_encoded, _reads_stdin, inner = _scan_powershell_invocation(arg_tokens)
+        return is_encoded, inner
+    if lower_name == "cmd":
+        index = 0
+        while index < len(arg_tokens) - 1:
+            opt = arg_tokens[index].text.casefold()
+            if opt == "/c":
+                rest = [tok.text for tok in arg_tokens[index + 1 :]]
+                return False, rest[0] if len(rest) == 1 else " ".join(rest)
+            if not opt.startswith("/"):
+                return False, None
+            index += 1
+    return False, None
+
+
+def _is_pipe_to_shell_stdin(lower_name: str, arg_tokens: list[_ShellToken]) -> bool:
+    """True when a piped shell interpreter reads commands from stdin instead of a script/flag."""
+    from omnigent.permission_tiers import _takes_shell_option_arg
+
+    if lower_name in {"sh", "bash", "zsh", "dash", "ksh"}:
+        index = 0
+        while index < len(arg_tokens):
+            opt = arg_tokens[index].text
+            if opt == "--":
+                index += 1
+                break
+            if opt == "-":
                 return True
-            tokens = _unwrap_auto_prefixes(raw_tokens, embedded)
-            if not tokens:
-                continue
-            name = (PurePosixPath(tokens[0].text).name or tokens[0].text).removesuffix(".exe")
-            if name in _AUTO_PRIVILEGE_WRAPPERS:
+            if _AUTO_POSIX_C_FLAG.fullmatch(opt):
+                return False
+            if re.fullmatch(r"-[A-Za-z]*s[A-Za-z]*", opt):
                 return True
-            arg_tokens = tokens[1:]
-            args = [tok.text for tok in arg_tokens]
-            for key in _AUTO_FLOOR_CLASSES:
-                names, prefixes, check = _FLOOR_CLASSES[key]
-                if name not in names and not (prefixes and name.startswith(prefixes)):
-                    continue
-                try:
-                    if check(name, args, piped):
-                        return True
-                    if key == "critical path deletion and writes" and _write_has_unknown_target(
-                        name, arg_tokens
-                    ):
-                        return True
-                    if key == "git config injection and discards" and _git_has_unknown_subcommand(
-                        arg_tokens
-                    ):
-                        return True
-                    if key == "find actions" and _find_has_unknown_action(arg_tokens):
-                        return True
-                except ValueError:
-                    return True
-        pending.extend(embedded)
+            if not opt.startswith(("-", "+")):
+                break
+            index += 2 if _takes_shell_option_arg(opt) else 1
+        if index >= len(arg_tokens):
+            return True
+        return arg_tokens[index].text in {"-", "/dev/stdin", "/dev/fd/0"}
+    if lower_name in {"pwsh", "powershell"}:
+        _is_encoded, reads_stdin, _inner = _scan_powershell_invocation(arg_tokens)
+        return reads_stdin
+    if lower_name == "cmd":
+        return not any(tok.text.casefold() == "/c" for tok in arg_tokens)
+    return True
+
+
+def _auto_delete_has_unbound_target(lower_name: str, arg_tokens: list[_ShellToken]) -> bool:
+    for tok in arg_tokens:
+        text = tok.text
+        if lower_name == "rm" and text.startswith("-"):
+            continue
+        if lower_name != "rm" and text.startswith(("-", "/")):
+            continue
+        if tok.unknown_expansion or _AUTO_WIN_ENV_VAR.search(text):
+            return True
     return False
+
+
+def auto_floor_asks(
+    command: str,
+    *,
+    platform: str = "posix",
+    opaque: bool = False,
+) -> bool:
+    """Narrow auto-tier destructive scan across all gate-owned harnesses and shell dialects."""
+    del platform  # Rules cover POSIX, PowerShell and cmd across platforms without dialect splits.
+    try:
+        if not isinstance(command, str) or not command.strip():
+            return False
+        ares_patterns = _auto_floor_ares_patterns()
+        pending = [command]
+        scanned = 0
+        while pending and scanned < 32:
+            source = pending.pop()
+            scanned += 1
+            if any(pattern.search(source) for pattern in ares_patterns):
+                return True
+            embedded: list[str] = []
+            for raw_tokens, write_redirects, piped in _scan_lenient_statements(source, embedded):
+                if any(_redirect_target_is_critical(tok) for tok in write_redirects):
+                    return True
+                tokens = _unwrap_auto_prefixes(raw_tokens, embedded)
+                if not tokens:
+                    continue
+                raw_head = tokens[0].text.replace("\\", "/")
+                name = (PurePosixPath(raw_head).name or raw_head).removesuffix(".exe")
+                lower_name = name.casefold()
+                arg_tokens = tokens[1:]
+                args = [tok.text for tok in arg_tokens]
+                if lower_name in _AUTO_PRIVILEGE_WRAPPERS or lower_name == "runas":
+                    return True
+                if (
+                    piped
+                    and lower_name in _AUTO_PIPE_SHELLS
+                    and _is_pipe_to_shell_stdin(lower_name, arg_tokens)
+                ):
+                    return True
+                if lower_name in _AUTO_PIPE_SHELLS:
+                    is_encoded, inner = _unwrap_nested_shell_for_auto(lower_name, arg_tokens)
+                    if is_encoded:
+                        return True
+                    if inner:
+                        embedded.append(inner)
+                if lower_name in {"invoke-expression", "iex"} and (
+                    piped or any(tok.unknown_expansion or "$" in tok.text for tok in arg_tokens)
+                ):
+                    return True
+                if lower_name in {"set-executionpolicy", "invoke-command", "icm", "set-acl"}:
+                    return True
+                if lower_name in {"start-process", "saps"} and _start_process_user_only(args):
+                    return True
+                if lower_name in _AUTO_REGISTRY_ITEMPROPERTY_CMDLETS and any(
+                    _AUTO_REGISTRY_PREFIX.match(arg) for arg in args
+                ):
+                    return True
+                if lower_name in _AUTO_DELETE_VERBS and (
+                    opaque or _auto_delete_has_unbound_target(lower_name, arg_tokens)
+                ):
+                    return True
+                for key in _AUTO_FLOOR_CLASSES:
+                    names, prefixes, check = _FLOOR_CLASSES[key]
+                    if name not in names and not (prefixes and name.startswith(prefixes)):
+                        continue
+                    try:
+                        matched = (
+                            _git_user_only(name, args, piped, allow_dry_run=True)
+                            if key == "git config injection and discards"
+                            else check(name, args, piped)
+                        )
+                        if matched:
+                            return True
+                        if (
+                            key == "critical path deletion and writes"
+                            and _write_has_unknown_target(name, arg_tokens)
+                        ):
+                            return True
+                        if (
+                            key == "git config injection and discards"
+                            and _git_has_unknown_subcommand(arg_tokens)
+                        ):
+                            return True
+                        if key == "find actions" and _find_has_unknown_action(arg_tokens):
+                            return True
+                    except ValueError:
+                        return True
+            pending.extend(embedded)
+        return bool(pending)
+    except Exception:  # noqa: BLE001 - scan failure counts as no match per D5
+        return False
 
 
 _BINARY_SOURCES = frozenset(

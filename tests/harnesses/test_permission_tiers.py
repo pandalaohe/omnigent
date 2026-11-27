@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import base64
+import errno
 import json
+import ntpath
 import shlex
 from dataclasses import replace
 from pathlib import Path
@@ -96,14 +98,10 @@ def test_agy_delegation_requires_current_host_proof(tier, status):
     expected = (
         Verdict.ALLOW
         if tier == "full" or status == "proven"
-        else (
-            Verdict.ASK
-            if status == "missing" and tier in ("ask", "accept-edits")
-            else Verdict.DENY
-        )
+        else (Verdict.DENY if tier == "plan" else Verdict.ASK)
     )
     assert result.action == expected
-    if status == "failed" and tier != "full":
+    if status == "failed" and tier not in ("full", "plan"):
         assert result.rule_id == "native-proof"
 
 
@@ -120,8 +118,9 @@ def test_agy_delegation_requires_current_host_proof(tier, status):
 def test_agy_proof_does_not_authorize_unchecked_spawn_arguments(extra):
     host = posix_host(agy_delegation_status="proven")
     arguments = {"TypeName": "self", "Prompt": "Read the workspace", **extra}
-    assert decision("auto", "invoke_subagent", arguments, host).action == Verdict.DENY
+    assert decision("auto", "invoke_subagent", arguments, host).action == Verdict.ASK
     assert decision("ask", "invoke_subagent", arguments, host).action == Verdict.ASK
+    assert decision("plan", "invoke_subagent", arguments, host).action == Verdict.DENY
 
 
 def test_agy_spawn_proof_does_not_widen_child_tools_or_messages():
@@ -195,8 +194,11 @@ def test_pi_subagent_is_never_approvable_below_full(tier, background, verified):
     arguments = {"agent": "worker", "task": "Read a.py", "async": background}
     assert decision("full", "subagent", arguments, host).action == Verdict.ALLOW
     result = decision(tier, "subagent", arguments, host)
-    assert result.action == Verdict.DENY
-    assert result.rule_id == "native-proof"
+    if tier == "plan":
+        assert result.action == Verdict.DENY
+    else:
+        assert result.action == Verdict.ASK
+        assert result.rule_id == "native-proof"
 
 
 @pytest.mark.parametrize(
@@ -337,11 +339,14 @@ def test_agy_operations_keep_existing_operational_tiers(name, args):
 )
 def test_uncheckable_agy_tools_keep_fail_closed_tiers_and_explain_why(name, args, reason):
     result = decision("auto", name, args)
-    assert result.action == Verdict.DENY
+    is_native_grant = name in ("ask_permission", "ask_custom_permission")
+    assert result.action == (Verdict.DENY if is_native_grant else Verdict.ASK)
     assert reason in result.reason
-    assert decision("ask", name, args).action == Verdict.ASK
+    assert decision("ask", name, args).action == (Verdict.DENY if is_native_grant else Verdict.ASK)
     assert decision("plan", name, args).action == Verdict.DENY
-    assert decision("accept-edits", name, args).action == Verdict.ASK
+    assert decision("accept-edits", name, args).action == (
+        Verdict.DENY if is_native_grant else Verdict.ASK
+    )
     assert decision("full", name, args).action == Verdict.ALLOW
 
 
@@ -372,7 +377,8 @@ def test_agy_shell_cwd_binds_relative_destinations_and_control_paths():
     args["Cwd"] = "/opt/work/project"
     assert decision("auto", "run_command", args, host).action == Verdict.ALLOW
     args["RunPersistent"] = True
-    assert decision("auto", "run_command", args, host).action == Verdict.DENY
+    assert decision("auto", "run_command", args, host).action == Verdict.ASK
+    assert decision("plan", "run_command", args, host).action == Verdict.DENY
 
 
 def test_agy_command_cwd_does_not_relocate_trusted_control_paths():
@@ -394,12 +400,17 @@ def test_agy_command_cwd_does_not_relocate_trusted_control_paths():
         ("manage_task", {"Action": "future_action"}),
         ("webview_browser", {"action": "future_action"}),
         ("notebook_edit", {"Action": "execute", "NotebookPath": "a.ipynb"}),
-        ("run_command", {"CommandLine": "pwd", "Cwd": "not-a-directory"}),
     ],
 )
 def test_agy_unsupported_actions_and_unbound_targets_fail_closed(name, args):
     for tier in PERMISSION_TIERS:
         assert decision(tier, name, args).action == Verdict.DENY
+    # Unconfirmed run_command Cwd marks the command opaque (D1/D3), not malformed.
+    opaque_cwd = {"CommandLine": "pwd", "Cwd": "not-a-directory"}
+    assert adapt_tool_call("run_command", opaque_cwd, posix_host()).command_opaque is True
+    assert decision("auto", "run_command", opaque_cwd).action == Verdict.ALLOW
+    assert decision("ask", "run_command", opaque_cwd).action == Verdict.ASK
+    assert decision("plan", "run_command", opaque_cwd).action == Verdict.DENY
 
 
 @pytest.mark.parametrize(
@@ -601,11 +612,12 @@ def test_panel_presentation_rejects_unconfirmed_target_paths() -> None:
         return ResolvedPath(path, "directory" if path == "/opt/work/project" else "unknown")
 
     for tier in NON_FULL_TIERS:
+        expected = Verdict.DENY if tier == "plan" else Verdict.ASK
         assert (
             decision(
                 tier, "open_in_panel", {"path": "report.html"}, posix_host(resolver=unresolved)
             ).action
-            == Verdict.DENY
+            == expected
         )
     assert (
         decision(
@@ -739,13 +751,12 @@ def test_antigravity_mcp_calls_classify_the_omnigent_target(
 @pytest.mark.parametrize(
     ("name", "auto_action"),
     [
-        # Deferred/unclassified Omnigent sys_* framework tools stay denied in auto.
-        ("sys_agent_download", Verdict.DENY),
-        ("sys_call_async", Verdict.DENY),
-        ("sys_flow_start", Verdict.DENY),
-        ("sys_terminal_launch", Verdict.DENY),
-        ("sys_future_read", Verdict.DENY),
-        # Genuinely unseen tool kinds ask by approval card under auto.
+        # Unclassified tools (including deferred sys_* tools) ask by approval card under auto (D3).
+        ("sys_agent_download", Verdict.ASK),
+        ("sys_call_async", Verdict.ASK),
+        ("sys_flow_start", Verdict.ASK),
+        ("sys_terminal_launch", Verdict.ASK),
+        ("sys_future_read", Verdict.ASK),
         ("browser_future_read", Verdict.ASK),
         ("web_search", Verdict.ASK),
         ("third_party", Verdict.ASK),
@@ -778,7 +789,7 @@ def test_third_party_mcp_server_cannot_reuse_known_omnigent_names() -> None:
         assert decision("ask", "call_mcp_tool", args).action == Verdict.ASK
         assert decision("plan", "call_mcp_tool", args).action == Verdict.DENY
         assert decision("accept-edits", "call_mcp_tool", args).action == Verdict.ASK
-        assert decision("auto", "call_mcp_tool", args).action == Verdict.DENY
+        assert decision("auto", "call_mcp_tool", args).action == Verdict.ASK
         assert decision("full", "call_mcp_tool", args).action == Verdict.ALLOW
 
 
@@ -918,11 +929,17 @@ def test_unresolved_write_targets_keep_tiers_and_proceed(command: str) -> None:
     ],
 )
 def test_unresolved_delete_targets_stay_refused(command: str) -> None:
-    """A recursive delete of an unresolved target is the accident this guards."""
+    """A recursive delete of an unresolved target asks below full (DENY in plan) per D3."""
     for tier in NON_FULL_TIERS:
         result = decision(tier, "bash", {"command": command})
-        assert result.action == Verdict.DENY
-        assert result.rule_id == "unbound-write"
+        if tier == "plan":
+            assert result.action == Verdict.DENY
+        elif tier == "auto" and "/usr/local/" in command:
+            # Literal protected-path prefix triggers D2 DENY before D3 unbound-write.
+            assert (result.action, result.rule_id) == (Verdict.DENY, "protected-path")
+        else:
+            assert result.action == Verdict.ASK
+            assert result.rule_id == "unbound-write"
     assert decision("full", "bash", {"command": command}).action == Verdict.ALLOW
 
 
@@ -1423,9 +1440,18 @@ def test_windows_drive_unc_ads_device_and_system(option_command: str, expected: 
         result = decision("auto", "run_command", {"CommandLine": command}, host)
         assert result.rule_id == "protected-path"
         assert r"C:\Windows\report" in result.reason
-    for path in (r"\\?\C:\work\project\a.py", r"C:\work\project\a.py:stream", r"D:a.py"):
+    assert (
+        decision(
+            "auto", "write", {"path": r"C:\work\project\a.py:stream", "content": "x"}, host
+        ).action
+        == Verdict.DENY
+    )
+    for path in (r"\\?\C:\work\project\a.py", r"D:a.py"):
         assert (
-            decision("auto", "write", {"path": path, "content": "x"}, host).action == Verdict.DENY
+            decision("auto", "write", {"path": path, "content": "x"}, host).action == Verdict.ASK
+        )
+        assert (
+            decision("plan", "write", {"path": path, "content": "x"}, host).action == Verdict.DENY
         )
     assert (
         decision("auto", "run_command", {"CommandLine": option_command}, host).action == expected
@@ -1469,82 +1495,94 @@ def test_windows_shell_data_roles_keep_normal_tier_policy(platform, tool, key, c
 
 
 @pytest.mark.parametrize(
-    "command",
+    ("command", "expected_auto"),
     [
-        r"Get-Content C:\x\file.txt:stream",
-        "rg -f patterns.txt file.txt:stream",
-        "grep -fpatterns.txt file.txt:stream",
-        "rg -e pattern file.txt:stream",
-        "rg file.txt:stream -e needle",
-        "rg file.txt:stream --regexp=needle",
-        "rg file.txt:stream -f patterns.txt",
-        "rg NUL -e needle",
-        "grep file.txt:stream -e needle",
-        "Get-Content file.txt:stream",
-        r"Get-Content %MISSING%\file.txt",
-        "Get-Content 100%",
-        'git commit -m "task: probe" -F file.txt:stream',
-        'git commit --file "https://example.test/file" -m "task: probe"',
-        'git commit --file=file.txt:stream -m "task: probe"',
-        'git commit -F-file.txt:stream -m "task: probe"',
-        'git commit -F -file.txt:stream -m "task: probe"',
-        'curl -o file.txt:stream "https://example.test/resource"',
-        'curl --output "https://example.test/file" "https://example.test/resource"',
-        'curl -T %MISSING% "https://example.test/resource"',
-        'curl --config file.txt:stream "https://example.test/resource"',
-        'curl --output=file=%MISSING% "https://example.test/resource"',
-        'curl -ofile.txt:stream "https://example.test/resource"',
-        'find . -fprint file.txt:stream -printf "%p"',
-        'find . -fprintf file.txt:stream "%p"',
-        'echo "task: probe" > file.txt:stream',
-        'echo "task: probe" < file.txt:stream',
-        'echo "task: probe" > %MISSING%',
-        'echo "task: probe" > -file.txt:stream',
-        'echo "task: probe" > file=%MISSING%',
-        'echo "task: probe" > ; Get-Content file.txt:stream',
-        'echo "task: probe"; Get-Content file.txt:stream',
-        'echo "task: probe" && Get-Content file.txt:stream',
-        'echo "task: probe" | Get-Content file.txt:stream',
-        'echo "task: probe"\nGet-Content file.txt:stream',
-        'runner "https://example.test/resource"',
-        'echo.exe "file.txt:stream"',
-        'git log -m "task: probe"',
-        'git commit --unknown -m "task: probe"',
-        'curl --unknown "https://example.test/resource"',
-        "find . -exec other -printf file.txt:stream",
-        "pwsh -Command 'Get-Content file.txt:stream'",
-        'cmd /c "echo ok > file.txt:stream"',
-        'cmd /c "echo %MISSING%"',
-        "cmd /c \"echo 'task: & type file.txt:stream'\"",
-        "cmd /c cmd /c cmd /c cmd /c echo task: probe",
+        (r"Get-Content C:\x\file.txt:stream", Verdict.ALLOW),
+        ("rg -f patterns.txt file.txt:stream", Verdict.ALLOW),
+        ("grep -fpatterns.txt file.txt:stream", Verdict.ALLOW),
+        ("rg -e pattern file.txt:stream", Verdict.ALLOW),
+        ("rg file.txt:stream -e needle", Verdict.ALLOW),
+        ("rg file.txt:stream --regexp=needle", Verdict.ALLOW),
+        ("rg file.txt:stream -f patterns.txt", Verdict.ALLOW),
+        ("rg NUL -e needle", Verdict.ALLOW),
+        ("grep file.txt:stream -e needle", Verdict.ALLOW),
+        ("Get-Content file.txt:stream", Verdict.ALLOW),
+        (r"Get-Content %MISSING%\file.txt", Verdict.ALLOW),
+        ("Get-Content 100%", Verdict.ALLOW),
+        ('git commit -m "task: probe" -F file.txt:stream', Verdict.ALLOW),
+        ('git commit --file "https://example.test/file" -m "task: probe"', Verdict.ALLOW),
+        ('git commit --file=file.txt:stream -m "task: probe"', Verdict.ALLOW),
+        ('git commit -F-file.txt:stream -m "task: probe"', Verdict.ALLOW),
+        ('git commit -F -file.txt:stream -m "task: probe"', Verdict.ALLOW),
+        ('curl -o file.txt:stream "https://example.test/resource"', Verdict.ALLOW),
+        (
+            'curl --output "https://example.test/file" "https://example.test/resource"',
+            Verdict.ALLOW,
+        ),
+        ('curl -T %MISSING% "https://example.test/resource"', Verdict.ALLOW),
+        ('curl --config file.txt:stream "https://example.test/resource"', Verdict.ALLOW),
+        ('curl --output=file=%MISSING% "https://example.test/resource"', Verdict.ALLOW),
+        ('curl -ofile.txt:stream "https://example.test/resource"', Verdict.ALLOW),
+        ('find . -fprint file.txt:stream -printf "%p"', Verdict.DENY),
+        ('find . -fprintf file.txt:stream "%p"', Verdict.DENY),
+        ('echo "task: probe" > file.txt:stream', Verdict.DENY),
+        ('echo "task: probe" < file.txt:stream', Verdict.ALLOW),
+        ('echo "task: probe" > %MISSING%', Verdict.ASK),
+        ('echo "task: probe" > -file.txt:stream', Verdict.DENY),
+        ('echo "task: probe" > file=%MISSING%', Verdict.ASK),
+        ('echo "task: probe" > ; Get-Content file.txt:stream', Verdict.ALLOW),
+        ('echo "task: probe"; Get-Content file.txt:stream', Verdict.ALLOW),
+        ('echo "task: probe" && Get-Content file.txt:stream', Verdict.ALLOW),
+        ('echo "task: probe" | Get-Content file.txt:stream', Verdict.ALLOW),
+        ('echo "task: probe"\nGet-Content file.txt:stream', Verdict.ALLOW),
+        ('runner "https://example.test/resource"', Verdict.ALLOW),
+        ('echo.exe "file.txt:stream"', Verdict.ALLOW),
+        ('git log -m "task: probe"', Verdict.ALLOW),
+        ('git commit --unknown -m "task: probe"', Verdict.ALLOW),
+        ('curl --unknown "https://example.test/resource"', Verdict.ALLOW),
+        ("find . -exec other -printf file.txt:stream", Verdict.DENY),
+        ("pwsh -Command 'Get-Content file.txt:stream'", Verdict.ALLOW),
+        ('cmd /c "echo ok > file.txt:stream"', Verdict.DENY),
+        ('cmd /c "echo %MISSING%"', Verdict.ALLOW),
+        ("cmd /c \"echo 'task: & type file.txt:stream'\"", Verdict.ALLOW),
+        ("cmd /c cmd /c cmd /c cmd /c echo task: probe", Verdict.ALLOW),
     ],
 )
-def test_windows_shell_data_roles_do_not_exempt_file_operands(command):
-    for tier in PERMISSION_TIERS:
-        assert (
-            decision(tier, "sys_os_shell", {"command": command}, windows_host()).action
-            == Verdict.DENY
-        )
+def test_windows_shell_data_roles_do_not_exempt_file_operands(command, expected_auto):
+    host = windows_host()
+    assert decision("plan", "sys_os_shell", {"command": command}, host).action == Verdict.DENY
+    assert decision("full", "sys_os_shell", {"command": command}, host).action == Verdict.ALLOW
+    assert decision("auto", "sys_os_shell", {"command": command}, host).action == expected_auto
+    if expected_auto == Verdict.DENY:
+        for tier in NON_FULL_TIERS:
+            assert (
+                decision(tier, "sys_os_shell", {"command": command}, host).action == Verdict.DENY
+            )
+    else:
+        assert decision("ask", "sys_os_shell", {"command": command}, host).action == Verdict.ASK
 
 
 @pytest.mark.parametrize(
-    "shell,command",
+    "shell,command,auto_expected",
     [
-        ("bash", "echo ok;>file.txt:stream"),
-        ("bash", "echo ok|<file.txt:stream cat"),
-        ("cmd", "echo ok&<file.txt:stream more"),
-        ("bash", "echo ok;>100%"),
-        ("pwsh", "echo ok;>-file.txt:stream"),
-        ("pwsh", "echo ok&&>%MISSING%"),
-        ("pwsh", "echo ok;>file=%MISSING%"),
+        ("bash", "echo ok;>file.txt:stream", Verdict.DENY),
+        ("bash", "echo ok|<file.txt:stream cat", Verdict.ALLOW),
+        ("cmd", "echo ok&<file.txt:stream more", Verdict.ALLOW),
+        ("bash", "echo ok;>100%", Verdict.ASK),
+        ("pwsh", "echo ok;>-file.txt:stream", Verdict.DENY),
+        ("pwsh", "echo ok&&>%MISSING%", Verdict.ASK),
+        ("pwsh", "echo ok;>file=%MISSING%", Verdict.ASK),
     ],
 )
-def test_windows_shell_adjacent_operators_preserve_redirection_paths(shell, command):
-    for tier in PERMISSION_TIERS:
-        assert (
-            decision(tier, "sys_os_shell", {"command": command}, windows_host(shell=shell)).action
-            == Verdict.DENY
-        )
+def test_windows_shell_adjacent_operators_preserve_redirection_paths(
+    shell, command, auto_expected
+):
+    host = windows_host(shell=shell)
+    intent = adapt_tool_call("sys_os_shell", {"command": command}, host)
+    assert intent.ads_write or intent.unbound_write or intent.command_opaque
+    assert decision("auto", "sys_os_shell", {"command": command}, host).action == auto_expected
+    assert decision("plan", "sys_os_shell", {"command": command}, host).action == Verdict.DENY
+    assert decision("full", "sys_os_shell", {"command": command}, host).action == Verdict.ALLOW
 
 
 @pytest.mark.parametrize(
@@ -1631,60 +1669,87 @@ def test_windows_quoted_multiline_and_literal_git_messages_keep_normal_tiers(she
 
 @pytest.mark.parametrize("shell", [r"C:\work\Git\bin\bash.exe", "pwsh", "cmd"])
 @pytest.mark.parametrize(
-    "command",
+    ("command", "expected_auto"),
     [
-        "echo x > file.txt:stream",
-        "Set-Content -Path a.txt:s -Value 1",
-        "Set-Content -Path:a.txt:s -Value 1",
-        "cp a b:c",
-        "cp a file.txt:stream",
-        'git commit -m "feat: add x" -- file.txt:stream',
-        'git commit -m "feat: add x" -- -file.txt:stream',
-        'git -C file.txt:stream commit -m "feat: add x"',
-        'git -Cfile.txt:stream commit -m "feat: add x"',
-        'git -C=file.txt:stream commit -m "feat: add x"',
-        'git --git-dir=file.txt:stream commit -m "feat: add x"',
-        'git commit -aF file.txt:stream -m "feat: add x"',
-        'git commit -aFfile.txt:stream -m "feat: add x"',
-        "git tag -a v1 -F file.txt:stream",
-        'git tag -a v1 -m "release: 1" -F file.txt:stream',
-        'git tag -a v1 -m "release: 1" -- -file.txt:stream',
-        "git tag -aFfile.txt:stream v1",
-        'git tag --unknown -m "release: 1" v1',
+        ("echo x > file.txt:stream", Verdict.DENY),
+        ("Set-Content -Path a.txt:s -Value 1", Verdict.DENY),
+        ("Set-Content -Path:a.txt:s -Value 1", Verdict.DENY),
+        ("cp a b:c", Verdict.ASK),
+        ("cp a file.txt:stream", Verdict.DENY),
+        ('git commit -m "feat: add x" -- file.txt:stream', Verdict.ALLOW),
+        ('git commit -m "feat: add x" -- -file.txt:stream', Verdict.ALLOW),
+        ('git -C file.txt:stream commit -m "feat: add x"', Verdict.ALLOW),
+        ('git -Cfile.txt:stream commit -m "feat: add x"', Verdict.ALLOW),
+        ('git -C=file.txt:stream commit -m "feat: add x"', Verdict.ALLOW),
+        ('git --git-dir=file.txt:stream commit -m "feat: add x"', Verdict.ALLOW),
+        ('git commit -aF file.txt:stream -m "feat: add x"', Verdict.ALLOW),
+        ('git commit -aFfile.txt:stream -m "feat: add x"', Verdict.ALLOW),
+        ("git tag -a v1 -F file.txt:stream", Verdict.ALLOW),
+        ('git tag -a v1 -m "release: 1" -F file.txt:stream', Verdict.ALLOW),
+        ('git tag -a v1 -m "release: 1" -- -file.txt:stream', Verdict.ALLOW),
+        ("git tag -aFfile.txt:stream v1", Verdict.ALLOW),
+        ('git tag --unknown -m "release: 1" v1', Verdict.ALLOW),
     ],
 )
-def test_windows_real_ads_and_git_file_targets_stay_denied(shell, command):
+def test_windows_real_ads_and_git_file_targets_stay_denied(shell, command, expected_auto):
     host = windows_host(shell=shell)
-    for tier in PERMISSION_TIERS:
-        assert decision(tier, "sys_os_shell", {"command": command}, host).action == Verdict.DENY
+    assert decision("plan", "sys_os_shell", {"command": command}, host).action == Verdict.DENY
+    assert decision("full", "sys_os_shell", {"command": command}, host).action == Verdict.ALLOW
+    assert decision("auto", "sys_os_shell", {"command": command}, host).action == expected_auto
+    if expected_auto == Verdict.DENY:
+        for tier in NON_FULL_TIERS:
+            assert (
+                decision(tier, "sys_os_shell", {"command": command}, host).action == Verdict.DENY
+            )
+    else:
+        assert decision("ask", "sys_os_shell", {"command": command}, host).action == Verdict.ASK
 
 
 @pytest.mark.parametrize(
-    "command",
+    ("command", "expected_auto", "expected_rule"),
     [
-        "git commit -m 'fix: file.txt:stream'",
-        "git commit -m 'fix: -F file.txt:stream'",
-        "git commit --message='docs: file.txt:stream'",
-        "git commit --message='docs: \"file.txt:stream\"'",
-        "git commit --message='docs: & type file.txt:stream'",
-        "git commit --message='docs: > file.txt:stream'",
-        r"git commit -m'fix: > C:\Windows\report'",
-        "git commit --message='docs: %MISSING%'",
-        'git commit --message="docs: x\ntype file.txt:stream"',
-        "other --opt='a: file.txt:stream'",
-        "rg 'a: b' file.txt",
-        "rg ' -a:b' file.txt",
-        "git commit -m ' -a:b'",
-        "git commit -m 'fix: & type file.txt:stream'",
-        "git commit -m 'fix: > file.txt:stream'",
-        'git commit -m "feat: x\ntype file.txt:stream"',
-        'git commit -m "feat: %MISSING%"',
+        ("git commit -m 'fix: file.txt:stream'", Verdict.ALLOW, None),
+        ("git commit -m 'fix: -F file.txt:stream'", Verdict.ALLOW, None),
+        ("git commit --message='docs: file.txt:stream'", Verdict.ALLOW, None),
+        ("git commit --message='docs: \"file.txt:stream\"'", Verdict.ALLOW, None),
+        ("git commit --message='docs: & type file.txt:stream'", Verdict.ALLOW, None),
+        ("git commit --message='docs: > file.txt:stream'", Verdict.DENY, None),
+        (r"git commit -m'fix: > C:\Windows\report'", Verdict.DENY, "protected-path"),
+        ("git commit --message='docs: %MISSING%'", Verdict.ALLOW, None),
+        ('git commit --message="docs: x\ntype file.txt:stream"', Verdict.ALLOW, None),
+        ("other --opt='a: file.txt:stream'", Verdict.ALLOW, None),
+        ("rg 'a: b' file.txt", Verdict.ALLOW, None),
+        ("rg ' -a:b' file.txt", Verdict.ALLOW, None),
+        ("git commit -m ' -a:b'", Verdict.ALLOW, None),
+        ("git commit -m 'fix: & type file.txt:stream'", Verdict.ALLOW, None),
+        ("git commit -m 'fix: > file.txt:stream'", Verdict.DENY, None),
+        ('git commit -m "feat: x\ntype file.txt:stream"', Verdict.ALLOW, None),
+        ('git commit -m "feat: %MISSING%"', Verdict.ALLOW, None),
     ],
 )
-def test_windows_cmd_unquoted_single_quote_smuggling_and_newlines_stay_denied(command):
+def test_windows_cmd_unquoted_single_quote_smuggling_and_newlines_stay_denied(
+    command, expected_auto, expected_rule
+):
     host = windows_host(shell="cmd")
-    for tier in PERMISSION_TIERS:
-        assert decision(tier, "sys_os_shell", {"command": command}, host).action == Verdict.DENY
+    assert decision("plan", "sys_os_shell", {"command": command}, host).action == Verdict.DENY
+    assert decision("full", "sys_os_shell", {"command": command}, host).action == Verdict.ALLOW
+    res = decision("auto", "sys_os_shell", {"command": command}, host)
+    assert res.action == expected_auto
+    if expected_rule is not None:
+        assert res.rule_id == expected_rule
+        assert decision("ask", "sys_os_shell", {"command": command}, host).action == Verdict.ASK
+        assert (
+            decision("accept-edits", "sys_os_shell", {"command": command}, host).action
+            == Verdict.ASK
+        )
+    elif expected_auto == Verdict.DENY:
+        assert "alternate data stream" in res.reason.lower()
+        for tier in NON_FULL_TIERS:
+            assert (
+                decision(tier, "sys_os_shell", {"command": command}, host).action == Verdict.DENY
+            )
+    else:
+        assert decision("ask", "sys_os_shell", {"command": command}, host).action == Verdict.ASK
 
 
 @pytest.mark.parametrize("shell", [r"C:\work\Git\bin\bash.exe", "pwsh", "cmd"])
@@ -1731,14 +1796,13 @@ def test_windows_git_direct_control_paths_and_non_git_quote_rules_stay_unchanged
         ).rule_id
         == "control-path"
     )
-    unresolved = decision(
-        "auto",
-        "run_command",
-        {"CommandLine": 'git -C "$UNKNOWN" commit -m "plain"'},
-        host,
+    unresolved_intent = adapt_tool_call(
+        "run_command", {"CommandLine": 'git -C "$UNKNOWN" commit -m "plain"'}, host
     )
-    assert unresolved.action == Verdict.DENY
-    assert "Unresolved Windows path variable" in unresolved.reason
+    assert unresolved_intent.command_opaque is True
+    assert "Unresolved Windows path variable" in unresolved_intent.detail
+    assert decide_tier("auto", unresolved_intent, RULES).action == Verdict.ALLOW
+    assert decide_tier("ask", unresolved_intent, RULES).action == Verdict.ASK
     env_host = windows_host(
         shell="pwsh", environment={"SystemRoot": r"C:\Windows", "USERPROFILE": r"C:\work\sample"}
     )
@@ -1752,22 +1816,18 @@ def test_windows_git_direct_control_paths_and_non_git_quote_rules_stay_unchanged
         == "control-path"
     )
     assert (
-        decision(
-            "auto",
+        adapt_tool_call(
             "sys_os_shell",
             {"command": 'git commit -m "$env:USERPROFILE" -- -file.txt:stream'},
             env_host,
-        ).action
-        == Verdict.DENY
+        ).command_opaque
+        is True
     )
     assert (
-        decision(
-            "auto",
-            "sys_os_shell",
-            {"command": 'rg -e "a: b\nc" file.txt'},
-            host,
-        ).action
-        == Verdict.DENY
+        adapt_tool_call(
+            "sys_os_shell", {"command": 'rg -e "a: b\nc" file.txt'}, host
+        ).command_opaque
+        is True
     )
 
 
@@ -1795,22 +1855,26 @@ def test_windows_live_data_and_environment(shell, command):
     [
         ("$PSVersionTable.PSVersion.ToString()", Verdict.ALLOW),
         ("git show HEAD:docs/readme.md", Verdict.ALLOW),
-        ('$a = Get-Location\n$n = (Get-ChildItem -Name).Count\n"$a has $n entries"', Verdict.ASK),
-        ('Get-ChildItem | Where-Object { $_.Name -match "red|green" }', Verdict.ASK),
-        ("[Console]::OutputEncoding = [Text.Encoding]::UTF8; Get-Date", Verdict.ASK),
-        ('Get-Content "$env:UNKNOWN/file.txt"', Verdict.ASK),
-        ('Get-Content "$env:UNKNOWN/file.txt:stream"', Verdict.DENY),
+        (
+            '$a = Get-Location\n$n = (Get-ChildItem -Name).Count\n"$a has $n entries"',
+            Verdict.ALLOW,
+        ),
+        ('Get-ChildItem | Where-Object { $_.Name -match "red|green" }', Verdict.ALLOW),
+        ("[Console]::OutputEncoding = [Text.Encoding]::UTF8; Get-Date", Verdict.ALLOW),
+        ('Get-Content "$env:UNKNOWN/file.txt"', Verdict.ALLOW),
+        ('Get-Content "$env:UNKNOWN/file.txt:stream"', Verdict.ALLOW),
         (r"$a = Get-Date; Set-Content C:\Windows\report.txt x", Verdict.DENY),
         (r'$a = Get-Date; Set-Content "C:\Windows\$a" x', Verdict.DENY),
         (r"$a = Get-Date; Get-Content C:\work\control\tier", Verdict.DENY),
-        ("Get-Content data.txt:stream", Verdict.DENY),
-        ("Get-Content -LiteralPath:[Console]::OutputEncoding", Verdict.DENY),
-        ('Get-Content "unterminated', Verdict.DENY),
+        ("Get-Content data.txt:stream", Verdict.ALLOW),
+        ("Get-Content -LiteralPath:[Console]::OutputEncoding", Verdict.ALLOW),
+        ('Get-Content "unterminated', Verdict.ALLOW),
     ],
 )
 def test_windows_ag_command_distinguishes_powershell_data_and_path_operands(command, expected):
     host = windows_host(shell="cmd")
     assert decision("auto", "run_command", {"CommandLine": command}, host).action == expected
+    assert decision("plan", "run_command", {"CommandLine": command}, host).action == Verdict.DENY
 
 
 def test_windows_ag_cwd_rebinds_drive_relative_command_paths():
@@ -1853,23 +1917,22 @@ def test_windows_git_bash_expansion_and_data_follow_posix_tiers(command):
 
 
 @pytest.mark.parametrize(
-    "command",
+    ("command", "auto_expected"),
     [
-        'printf "%s" "$label" > "$target"',
-        'printf "%s" "$label" > "/unbound/report.txt"',
-        'printf "%s" "$label" > "report.txt:stream"',
-        r"""printf "%s" "$label" > '\\?\C:\work\project\report.txt' """,
-        'printf "%s" "$label" > NUL',
-        'echo "$(cat report.txt:stream)"',
-        'echo "$(printf ok > "$target")"',
+        ('printf "%s" "$label" > "$target"', Verdict.ASK),
+        ('printf "%s" "$label" > "/unbound/report.txt"', Verdict.ASK),
+        ('printf "%s" "$label" > "report.txt:stream"', Verdict.DENY),
+        (r"""printf "%s" "$label" > '\\?\C:\work\project\report.txt' """, Verdict.ASK),
+        ('printf "%s" "$label" > NUL', Verdict.ASK),
+        ('echo "$(cat report.txt:stream)"', Verdict.ALLOW),
+        ('echo "$(printf ok > "$target")"', Verdict.ASK),
     ],
 )
-def test_windows_git_bash_keeps_strict_path_validation(command):
-    for tier in PERMISSION_TIERS:
-        assert (
-            decision(tier, "sys_os_shell", {"command": command}, windows_host(shell="bash")).action
-            == Verdict.DENY
-        )
+def test_windows_git_bash_keeps_strict_path_validation(command, auto_expected):
+    host = windows_host(shell="bash")
+    assert decision("auto", "sys_os_shell", {"command": command}, host).action == auto_expected
+    assert decision("plan", "sys_os_shell", {"command": command}, host).action == Verdict.DENY
+    assert decision("full", "sys_os_shell", {"command": command}, host).action == Verdict.ALLOW
 
 
 def test_windows_git_bash_binds_nested_write_and_keeps_workspace_policy():
@@ -1885,27 +1948,33 @@ def test_windows_git_bash_reassigned_host_variable_cannot_bind_a_path():
         shell="bash", environment={"SystemRoot": r"C:\Windows", "TARGET": "local.txt"}
     )
     arguments = {"command": 'TARGET=$(printf other.txt); echo "$(cat "$TARGET")"'}
-    result = decision("auto", "sys_os_shell", arguments, host)
-    assert result.action == Verdict.DENY
-    assert "TARGET" in result.reason
+    intent = adapt_tool_call("sys_os_shell", arguments, host)
+    assert intent.command_opaque is True
+    assert "TARGET" in intent.detail
+    assert decide_tier("auto", intent, RULES).action == Verdict.ALLOW
+    assert decide_tier("ask", intent, RULES).action == Verdict.ASK
 
 
 @pytest.mark.parametrize(
-    "command",
+    ("command", "expected_action", "expected_rule"),
     [
-        "(( x = 1 << 2 ))\nprintf ok > C:/Windows/report.txt",
-        "(( x = 1 << 2 ))\nprintf ok > C:/Windows/report.txt\n",
-        "(( x = 1 << 2 ))\ncat ../control/tier",
-        "(( x = 1 << 2 ))\ncat ../control/tier\n",
-        "(( x = 1 << 2 ))\ncat report.txt:stream",
-        "(( x = 1 << 2 ))\ncat report.txt:stream\n",
+        ("(( x = 1 << 2 ))\nprintf ok > C:/Windows/report.txt", Verdict.DENY, "protected-path"),
+        ("(( x = 1 << 2 ))\nprintf ok > C:/Windows/report.txt\n", Verdict.DENY, "protected-path"),
+        ("(( x = 1 << 2 ))\ncat ../control/tier", Verdict.DENY, "control-path"),
+        ("(( x = 1 << 2 ))\ncat ../control/tier\n", Verdict.DENY, "control-path"),
+        ("(( x = 1 << 2 ))\ncat report.txt:stream", Verdict.ALLOW, None),
+        ("(( x = 1 << 2 ))\ncat report.txt:stream\n", Verdict.ALLOW, None),
     ],
 )
-def test_windows_git_bash_unclosed_heredoc_scan_refuses_following_commands(command):
+def test_windows_git_bash_unclosed_heredoc_scan_refuses_following_commands(
+    command, expected_action, expected_rule
+):
     host = windows_host(shell="bash")
     result = decision("auto", "sys_os_shell", {"command": command}, host)
-    assert result.action == Verdict.DENY
-    assert "Uncheckable POSIX shell expansion" in result.reason
+    assert result.action == expected_action
+    assert result.rule_id == expected_rule
+    if expected_action == Verdict.ALLOW:
+        assert decision("ask", "sys_os_shell", {"command": command}, host).action == Verdict.ASK
 
 
 @pytest.mark.parametrize(
@@ -1931,7 +2000,8 @@ def test_windows_git_bash_stdin_script_requires_approval(command):
     host = windows_host(shell="bash")
     arguments = {"command": command}
     assert decision("accept-edits", "sys_os_shell", arguments, host).action == Verdict.ASK
-    assert decision("auto", "sys_os_shell", arguments, host).action == Verdict.DENY
+    assert decision("auto", "sys_os_shell", arguments, host).action == Verdict.ASK
+    assert decision("plan", "sys_os_shell", arguments, host).action == Verdict.DENY
 
 
 @pytest.mark.parametrize("command", ["bash script.sh < input.txt", "sh -- script.sh < input.txt"])
@@ -2018,7 +2088,7 @@ def test_windows_git_bash_script_file_uses_stdin_as_data(command):
 )
 def test_posix_stdin_script_requires_approval(platform, command):
     host = posix_host(platform=platform)
-    expected = (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.DENY, Verdict.ALLOW)
+    expected = (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ASK, Verdict.ALLOW)
     actual = tuple(
         decision(tier, "bash", {"command": command}, host).action for tier in PERMISSION_TIERS
     )
@@ -2043,8 +2113,11 @@ def test_posix_stdin_script_keeps_higher_priority_rules(platform):
     sed_heredoc = {"command": "bash <<'EOF'\nsed -n 'w /usr/local/x' in\nEOF\n"}
     for tier in NON_FULL_TIERS:
         result = decision(tier, "bash", sed_heredoc, host)
-        assert result.action == Verdict.DENY
-        assert result.rule_id == "unbound-write"
+        if tier == "plan":
+            assert result.action == Verdict.DENY
+        else:
+            assert result.action == Verdict.ASK
+            assert result.rule_id == "unbound-write"
 
     proc_sub_write = {"command": "bash < <(printf ok > /etc/hosts)"}
     result = decision("auto", "bash", proc_sub_write, host)
@@ -2076,7 +2149,7 @@ def test_posix_stdin_script_reports_opaque_reason(platform, command):
     host = posix_host(platform=platform)
     expected_reason = "Shell script from standard input cannot be bound"
     auto_result = decision("auto", "bash", {"command": command}, host)
-    assert auto_result.action == Verdict.DENY
+    assert auto_result.action == Verdict.ASK
     assert auto_result.rule_id is None
     assert auto_result.reason == expected_reason
     for tier in ("ask", "accept-edits"):
@@ -2098,7 +2171,7 @@ def test_posix_pipeline_comment_keeps_stdin_and_completed_pipeline_allows(platfo
         "cat install.sh | (\n# comment\nbash\n)",
     ):
         auto_result = decision("auto", "bash", {"command": command}, host)
-        assert auto_result.action == Verdict.DENY, command
+        assert auto_result.action == Verdict.ASK, command
         assert auto_result.rule_id is None, command
         assert auto_result.reason == expected_reason, command
         assert decision("accept-edits", "bash", {"command": command}, host).action == Verdict.ASK
@@ -2127,7 +2200,7 @@ def test_posix_stdin_fd_numeric_zero_and_nonzero_descriptors(platform):
         "bash 00<<- END\n\techo ok\nEND\n",
     ):
         auto_result = decision("auto", "bash", {"command": command}, host)
-        assert auto_result.action == Verdict.DENY, command
+        assert auto_result.action == Verdict.ASK, command
         assert auto_result.rule_id is None, command
         assert auto_result.reason == expected_reason, command
         assert decision("accept-edits", "bash", {"command": command}, host).action == Verdict.ASK
@@ -2156,7 +2229,7 @@ def test_posix_whitespace_separated_numeric_script_keeps_auto_allow(platform):
     expected_reason = "Shell script from standard input cannot be bound"
     for command in ("bash 0< input.txt", "bash 00< input.txt"):
         auto_result = decision("auto", "bash", {"command": command}, host)
-        assert auto_result.action == Verdict.DENY, command
+        assert auto_result.action == Verdict.ASK, command
         assert auto_result.reason == expected_reason, command
 
 
@@ -2183,7 +2256,7 @@ def test_posix_non_shell_heredoc_body_is_data_not_script(platform):
         "cat <<'EOF'\nbash -s",
     ):
         auto_result = decision("auto", "bash", {"command": command}, host)
-        assert auto_result.action == Verdict.DENY, command
+        assert auto_result.action == Verdict.ASK, command
         assert auto_result.rule_id is None, command
         assert auto_result.reason == expected_reason, command
     protected = decision(
@@ -2218,7 +2291,7 @@ def test_posix_here_string_preserves_following_write_and_stdin_bindings(platform
         assert intent.status == base_stdin_intent.status == "unknown", command
         assert intent.detail == base_stdin_intent.detail == expected_reason, command
         auto_result = decide_tier("auto", intent, RULES)
-        assert auto_result.action == Verdict.DENY, command
+        assert auto_result.action == Verdict.ASK, command
         assert auto_result.rule_id is None, command
         assert auto_result.reason == expected_reason, command
         accept_result = decide_tier("accept-edits", intent, RULES)
@@ -2251,7 +2324,7 @@ def test_posix_case_arm_subshell_in_process_substitution(platform):
         "bash < <(printf '%s\\n' <(echo hi) case)",
     ):
         auto_result = decision("auto", "bash", {"command": command}, host)
-        assert auto_result.action == Verdict.DENY, command
+        assert auto_result.action == Verdict.ASK, command
         assert auto_result.rule_id is None, command
         assert auto_result.reason == expected_reason, command
         assert decision("accept-edits", "bash", {"command": command}, host).action == Verdict.ASK
@@ -2307,8 +2380,9 @@ def test_posix_ordinary_pipelines_and_script_files_keep_auto_allow(platform, com
 def test_posix_stdin_script_applies_across_exec_tools(tool_name, arg_key):
     host = posix_host(platform="darwin")
     arguments = {arg_key: "cat install.sh | sh"}
-    assert decision("auto", tool_name, arguments, host).action == Verdict.DENY
+    assert decision("auto", tool_name, arguments, host).action == Verdict.ASK
     assert decision("accept-edits", tool_name, arguments, host).action == Verdict.ASK
+    assert decision("plan", tool_name, arguments, host).action == Verdict.DENY
     assert decision("full", tool_name, arguments, host).action == Verdict.ALLOW
 
 
@@ -2316,9 +2390,8 @@ def test_posix_stdin_script_applies_across_exec_tools(tool_name, arg_key):
 @pytest.mark.parametrize("tier", ["auto", "accept-edits"])
 def test_windows_native_shell_keeps_conservative_nested_bash_paths(shell, tier):
     arguments = {"command": 'bash -c "printf %b ok"'}
-    assert (
-        decision(tier, "sys_os_shell", arguments, windows_host(shell=shell)).action == Verdict.DENY
-    )
+    expected = Verdict.ALLOW if tier == "auto" else Verdict.ASK
+    assert decision(tier, "sys_os_shell", arguments, windows_host(shell=shell)).action == expected
 
 
 @pytest.mark.parametrize("path", ["/c/Windows/x", "/c/Users/sample/x", "/tmp/x", "~/x", "$HOME/x"])
@@ -2327,7 +2400,8 @@ def test_windows_git_bash_does_not_guess_msys_write_paths(path):
         shell="bash", environment={"SystemRoot": r"C:\Windows", "HOME": r"C:\work\sample"}
     )
     arguments = {"command": f"printf ok > {path}"}
-    assert decision("auto", "sys_os_shell", arguments, host).action == Verdict.DENY
+    assert decision("auto", "sys_os_shell", arguments, host).action == Verdict.ASK
+    assert decision("plan", "sys_os_shell", arguments, host).action == Verdict.DENY
 
 
 @pytest.mark.parametrize(
@@ -2381,33 +2455,32 @@ def test_windows_search_pattern_never_reaches_resolver(shell, command):
     "shell,variable", [("bash", "$MISSING"), ("cmd", "%MISSING%"), ("pwsh", "$env:MISSING")]
 )
 def test_windows_missing_environment_names_variable(shell, variable):
-    result = decision(
-        "auto",
-        "sys_os_shell",
-        {"command": f'cat "{variable}/file.txt"'},
-        windows_host(shell=shell),
+    intent = adapt_tool_call(
+        "sys_os_shell", {"command": f'cat "{variable}/file.txt"'}, windows_host(shell=shell)
     )
-    assert result.action == Verdict.DENY
-    assert "MISSING" in result.reason
+    assert intent.command_opaque is True
+    assert "MISSING" in intent.detail
+    assert decide_tier("auto", intent, RULES).action == Verdict.ALLOW
+    assert decide_tier("ask", intent, RULES).action == Verdict.ASK
 
 
 @pytest.mark.parametrize(
-    "target",
+    ("target", "expected"),
     [
-        "file.txt:stream",
-        r"\\?\C:\work\file",
-        r"C:\work\control\tier",
-        r"C:\work\sample\.ssh\private_key",
+        ("file.txt:stream", Verdict.DENY),
+        (r"\\?\C:\work\file", Verdict.ASK),
+        (r"C:\work\control\tier", Verdict.DENY),
+        (r"C:\work\sample\.ssh\private_key", Verdict.DENY),
     ],
 )
-def test_windows_live_data_keeps_redirect_guards(target):
+def test_windows_live_data_keeps_redirect_guards(target, expected):
     result = decision(
         "auto",
         "sys_os_shell",
         {"command": f'echo "exit=$?" > {target}'},
         windows_host(shell="bash"),
     )
-    assert result.action == Verdict.DENY
+    assert result.action == expected
 
 
 def test_terminal_and_malformed_calls_fail_closed() -> None:
@@ -2415,7 +2488,7 @@ def test_terminal_and_malformed_calls_fail_closed() -> None:
         {"terminal": "t", "session": "s", "keys": "Up Enter"},
         {"terminal": "t", "session": "s", "text": "rm ", "keys": ""},
     ):
-        assert decision("auto", "sys_terminal_send", args).action == Verdict.DENY
+        assert decision("auto", "sys_terminal_send", args).action == Verdict.ASK
         assert decision("plan", "sys_terminal_send", args).action == Verdict.DENY
         assert decision("ask", "sys_terminal_send", args).action == Verdict.ASK
         assert decision("accept-edits", "sys_terminal_send", args).action == Verdict.ASK
@@ -2441,9 +2514,12 @@ def test_encoded_command_requires_valid_complete_payload() -> None:
     malformed = adapt_tool_call(
         "bash", {"command": "powershell -EncodedCommand 'bad'"}, posix_host()
     )
-    assert malformed.status == "invalid"
-    for tier in NON_FULL_TIERS:
-        assert decide_tier(tier, malformed, RULES).action == Verdict.DENY
+    # D1/D5: _command_text failure marks command_opaque + hidden_script (ASK via auto floor).
+    assert malformed.status == "ok"
+    assert malformed.command_opaque is True
+    assert malformed.hidden_script is True
+    assert decide_tier("plan", malformed, RULES).action == Verdict.DENY
+    assert decide_tier("ask", malformed, RULES).action == Verdict.ASK
 
 
 def test_rule_errors_deny_and_signature_errors_keep_rule_reason() -> None:
@@ -2528,7 +2604,7 @@ def test_sed_write_policy_across_wrappers_and_substitutions(
 ) -> None:
     host = posix_host(platform=platform)
     expected = (
-        (Verdict.DENY,) * 4 + (Verdict.ALLOW,)
+        (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ASK, Verdict.ALLOW)
         if writing
         else (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ALLOW, Verdict.ALLOW)
     )
@@ -2542,7 +2618,7 @@ def test_sed_write_policy_across_wrappers_and_substitutions(
             for tier, action in zip(PERMISSION_TIERS, expected, strict=True):
                 result = decide_tier(tier, intent, RULES)
                 assert result.action == action, (command, tier, result)
-                if writing and tier != "full":
+                if writing and tier not in ("full", "plan"):
                     assert result.rule_id == "unbound-write", (command, tier, result)
 
 
@@ -2582,8 +2658,11 @@ def test_sed_writes_are_never_approvable(command: str, platform: str) -> None:
     host = posix_host(platform=platform)
     for tier in NON_FULL_TIERS:
         result = decision(tier, "bash", {"command": command}, host)
-        assert result.action == Verdict.DENY
-        assert result.rule_id == "unbound-write"
+        if tier == "plan":
+            assert result.action == Verdict.DENY
+        else:
+            assert result.action == Verdict.ASK
+            assert result.rule_id == "unbound-write"
     assert decision("full", "bash", {"command": command}, host).action == Verdict.ALLOW
 
 
@@ -2677,10 +2756,12 @@ def test_read_only_sed_and_literal_shell_data_keep_existing_tiers(
 def test_sed_platform_option_readings_and_control_priority() -> None:
     for command in ("sed -i '' 'w /usr/local/x' f", "sed -i 's/a/b/' web/x.ts"):
         for tier in NON_FULL_TIERS:
-            assert (
-                decision(tier, "bash", {"command": command}, posix_host(platform="darwin")).rule_id
-                == "unbound-write"
-            )
+            result = decision(tier, "bash", {"command": command}, posix_host(platform="darwin"))
+            if tier == "plan":
+                assert result.action == Verdict.DENY
+            else:
+                assert result.action == Verdict.ASK
+                assert result.rule_id == "unbound-write"
     assert (
         decision("auto", "bash", {"command": "sed -i 's/a/b/' web/x.ts"}).action == Verdict.ALLOW
     )
@@ -2701,10 +2782,12 @@ def test_sed_platform_option_readings_and_control_priority() -> None:
 
 
 def test_sed_invalid_calls_and_existing_unbound_targets_stay_closed() -> None:
-    # The outer tokenizer already rejects this literal heredoc's unmatched apostrophe.
+    # Under D1/D3, an unmatched apostrophe inside a heredoc marks the command opaque (not invalid).
     literal = "cat > notes.md <<'EOF'\nuse `sed -f s.sed` here, it's fine\nEOF"
-    for tier in PERMISSION_TIERS:
-        assert decision(tier, "bash", {"command": literal}).action == Verdict.DENY
+    assert adapt_tool_call("bash", {"command": literal}, posix_host()).command_opaque is True
+    assert decision("ask", "bash", {"command": literal}).action == Verdict.ASK
+    assert decision("plan", "bash", {"command": literal}).action == Verdict.DENY
+    assert decision("auto", "bash", {"command": literal}).action == Verdict.ALLOW
     # An unparseable substitution is skipped; it must not invalidate the outer call.
     expected = (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ALLOW, Verdict.ALLOW)
     for command in ('echo "`a <b`"', "echo `sed -n 'w /x' in"):
@@ -2788,14 +2871,14 @@ def test_sed_invalid_calls_and_existing_unbound_targets_stay_closed() -> None:
 def test_sed_script_grammar_uses_public_tier_decisions(script: str, writing: bool) -> None:
     command = "sed -n " + shlex.quote(script) + " in"
     expected = (
-        (Verdict.DENY,) * 4 + (Verdict.ALLOW,)
+        (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ASK, Verdict.ALLOW)
         if writing
         else (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ALLOW, Verdict.ALLOW)
     )
     for tier, action in zip(PERMISSION_TIERS, expected, strict=True):
         result = decision(tier, "bash", {"command": command})
         assert result.action == action
-        if writing and tier != "full":
+        if writing and tier not in ("full", "plan"):
             assert result.rule_id == "unbound-write"
 
 
@@ -3566,13 +3649,14 @@ def test_pi_tool_search_extension_and_non_local_do_not_inherit_builtin_read() ->
 
     untrusted_ext = pi_host(extension_tools={"tool_search": "untrusted"})
     assert adapt_tool_call("tool_search", {"query": "x"}, untrusted_ext).kind == ToolKind.UNKNOWN
-    assert decision("auto", "tool_search", {"query": "x"}, untrusted_ext).action == Verdict.DENY
+    assert decision("auto", "tool_search", {"query": "x"}, untrusted_ext).action == Verdict.ASK
+    assert decision("plan", "tool_search", {"query": "x"}, untrusted_ext).action == Verdict.DENY
 
     remote = pi_host(local_execution=False)
     intent = adapt_tool_call("tool_search", {"query": "x"}, remote)
     assert (intent.kind, intent.unseen_tool) == (ToolKind.UNKNOWN, False)
     assert decision("plan", "tool_search", {"query": "x"}, remote).action == Verdict.DENY
-    assert decision("auto", "tool_search", {"query": "x"}, remote).action == Verdict.DENY
+    assert decision("auto", "tool_search", {"query": "x"}, remote).action == Verdict.ASK
 
 
 @pytest.mark.parametrize(
@@ -3597,27 +3681,52 @@ def test_pi_bash_on_windows_uses_posix_dialect_for_shell_commands(command: str) 
 
 
 @pytest.mark.parametrize(
-    ("command", "expected_rule", "reason_fragment"),
+    ("command", "expected_action", "expected_rule", "reason_fragment"),
     [
-        ('printf "%s" "$label" > "$target"', None, "Unknown Windows path variable"),
-        ('printf "%s" "$label" > "report.txt:stream"', None, "Windows alternate data stream"),
-        ('for h in a b; do echo "$h" > "$target"; done', None, "Unknown Windows path variable"),
-        ("echo ok > C:/Windows/report.txt", "protected-path", r"C:\Windows\report.txt"),
-        ("printf ok > /c/Windows/report.txt", None, "Root-relative Windows path without drive"),
-        ("cat /c/work/control/tier", "control-path", "permission"),
-        ("cat install.sh | sh", None, "Shell script from standard input cannot be bound"),
-        ("Format-Volume -DriveLetter C", "disk-destroy", "Disk or volume"),
-        ("rm -rf C:/Windows", "protected-path", r"C:\Windows"),
-        ("rm -rf C:/", "critical-delete", "volume root"),
-        ("rm -rf /", None, "Root-relative Windows path without drive"),
+        (
+            'printf "%s" "$label" > "$target"',
+            Verdict.ASK,
+            "unbound-write",
+            "Windows path variable",
+        ),
+        (
+            'printf "%s" "$label" > "report.txt:stream"',
+            Verdict.DENY,
+            None,
+            "alternate data stream",
+        ),
+        (
+            'for h in a b; do echo "$h" > "$target"; done',
+            Verdict.ASK,
+            "unbound-write",
+            "Windows path variable",
+        ),
+        ("echo ok > C:/Windows/report.txt", Verdict.DENY, "protected-path", r"C:\Windows\report"),
+        (
+            "printf ok > /c/Windows/report.txt",
+            Verdict.ASK,
+            "unbound-write",
+            "Root-relative Windows path",
+        ),
+        ("cat /c/work/control/tier", Verdict.DENY, "control-path", "permission"),
+        (
+            "cat install.sh | sh",
+            Verdict.ASK,
+            None,
+            "Shell script from standard input cannot be bound",
+        ),
+        ("Format-Volume -DriveLetter C", Verdict.DENY, "disk-destroy", "Disk or volume"),
+        ("rm -rf C:/Windows", Verdict.DENY, "protected-path", r"C:\Windows"),
+        ("rm -rf C:/", Verdict.DENY, "critical-delete", "volume root"),
+        ("rm -rf /", Verdict.DENY, "critical-delete", "Root/system/home/credential delete"),
     ],
 )
 def test_pi_bash_on_windows_keeps_destructive_and_strict_guards(
-    command: str, expected_rule: str | None, reason_fragment: str
+    command: str, expected_action: Verdict, expected_rule: str | None, reason_fragment: str
 ) -> None:
     host = windows_host(shell="cmd")
     result = decision("auto", "bash", {"command": command}, host)
-    assert result.action == Verdict.DENY
+    assert result.action == expected_action
     assert result.rule_id == expected_rule, (command, result)
     assert reason_fragment in result.reason, (command, result.reason)
 
@@ -3629,13 +3738,13 @@ def test_pi_bash_on_windows_keeps_destructive_and_strict_guards(
         ("omni --version", Verdict.ALLOW, None),
         ("$PSVersionTable.PSVersion.ToString()", Verdict.ALLOW, None),
         ("git show HEAD:docs/readme.md", Verdict.ALLOW, None),
-        ("Get-ChildItem Env:", Verdict.ASK, None),
-        ('Get-ChildItem "Env:"', Verdict.ASK, None),
-        ("Get-ChildItem -Path 'Env:'", Verdict.ASK, None),
-        ("Get-ChildItem -Path:Env:", Verdict.ASK, None),
-        ('$a = Get-Location\n"$a"', Verdict.ASK, None),
-        ('Get-ChildItem | Where-Object { $_.Name -match "red|green" }', Verdict.ASK, None),
-        ("[Console]::OutputEncoding = [Text.Encoding]::UTF8; Get-Date", Verdict.ASK, None),
+        ("Get-ChildItem Env:", Verdict.ALLOW, None),
+        ('Get-ChildItem "Env:"', Verdict.ALLOW, None),
+        ("Get-ChildItem -Path 'Env:'", Verdict.ALLOW, None),
+        ("Get-ChildItem -Path:Env:", Verdict.ALLOW, None),
+        ('$a = Get-Location\n"$a"', Verdict.ALLOW, None),
+        ('Get-ChildItem | Where-Object { $_.Name -match "red|green" }', Verdict.ALLOW, None),
+        ("[Console]::OutputEncoding = [Text.Encoding]::UTF8; Get-Date", Verdict.ALLOW, None),
         ("Format-Volume -DriveLetter C", Verdict.DENY, "disk-destroy"),
         (r"Set-Content C:\Windows\report.txt x", Verdict.DENY, "protected-path"),
         (r"Clear-Content C:\Windows\report.txt", Verdict.DENY, "protected-path"),
@@ -3643,7 +3752,7 @@ def test_pi_bash_on_windows_keeps_destructive_and_strict_guards(
         (r"New-Item -Path C:\Windows -Name report.txt", Verdict.DENY, "protected-path"),
         (r"clc C:\work\control\tier", Verdict.DENY, "control-path"),
         (r"ri C:\Users\sample", Verdict.DENY, "critical-delete"),
-        ("Get-Content data.txt:stream", Verdict.DENY, None),
+        ("Get-Content data.txt:stream", Verdict.ALLOW, None),
         (r"Get-Content C:\work\control\tier", Verdict.DENY, "control-path"),
         (r"Remove-Item -LiteralPath:C:\Users\sample", Verdict.DENY, "critical-delete"),
     ],
@@ -3660,3 +3769,412 @@ def test_pi_powershell_on_windows_matches_powershell_tiers_and_guards(
         assert decision("ask", "powershell", {"command": command}, host).action == Verdict.ASK
         accept = decision("accept-edits", "powershell", {"command": command}, host)
         assert accept.action == Verdict.ASK
+
+
+# --- D1-D5 boundary invariants (27 scenarios) ---
+
+
+def test_binding_failures_never_turn_well_formed_calls_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.permission_tiers as pt
+
+    def boom(*_args, **_kwargs):
+        raise OSError(123, "simulated binding error")
+
+    # _command_paths failure -> command_opaque, not invalid
+    with monkeypatch.context() as patch:
+        patch.setattr(pt, "_command_paths", boom)
+        intent = adapt_tool_call("bash", {"command": "echo hi"}, posix_host())
+        assert intent.status == "ok"
+        assert intent.command_opaque is True
+        assert decide_tier("auto", intent, RULES).action == Verdict.ALLOW
+        assert decide_tier("ask", intent, RULES).action == Verdict.ASK
+        assert decide_tier("plan", intent, RULES).action == Verdict.DENY
+
+    # _shell_writes failure -> command_opaque, not invalid
+    with monkeypatch.context() as patch:
+        patch.setattr(pt, "_shell_writes", boom)
+        intent = adapt_tool_call("bash", {"command": "echo hi"}, posix_host())
+        assert intent.status == "ok"
+        assert intent.command_opaque is True
+        assert decide_tier("auto", intent, RULES).action == Verdict.ALLOW
+        assert decide_tier("ask", intent, RULES).action == Verdict.ASK
+
+    # _command_text failure -> command_opaque + hidden_script, not invalid
+    with monkeypatch.context() as patch:
+        patch.setattr(pt, "_command_text", boom)
+        intent = adapt_tool_call("bash", {"command": "echo hi"}, posix_host())
+        assert intent.status == "ok"
+        assert intent.command_opaque is True
+        assert intent.hidden_script is True
+
+    # File-tool _resolve failure -> target.kind == "unknown" (READ ALLOW, EDIT ASK)
+    def failing_file_resolve(path: str) -> ResolvedPath:
+        if path.endswith("weird*.txt"):
+            raise OSError(123, "bad syntax")
+        return ResolvedPath(path, "directory" if path == "/opt/work/project" else "new-file")
+
+    host = posix_host(resolver=failing_file_resolve)
+    read_intent = adapt_tool_call("read_file", {"Path": "weird*.txt"}, host)
+    assert read_intent.status == "ok"
+    assert read_intent.target == ResolvedPath("weird*.txt", "unknown")
+    assert decide_tier("auto", read_intent, RULES).action == Verdict.ALLOW
+    edit_intent = adapt_tool_call("write_file", {"Path": "weird*.txt", "Content": "x"}, host)
+    assert edit_intent.status == "ok"
+    assert edit_intent.target == ResolvedPath("weird*.txt", "unknown")
+    assert decide_tier("auto", edit_intent, RULES).action == Verdict.ASK
+    assert decide_tier("plan", edit_intent, RULES).action == Verdict.DENY
+
+    # run_command Cwd resolve failure -> command_opaque, not invalid
+    def failing_cwd_resolve(path: str) -> ResolvedPath:
+        if "bad-cwd" in path:
+            raise OSError("missing dir")
+        return ResolvedPath(path, "directory" if path == "/opt/work/project" else "new-file")
+
+    cwd_intent = adapt_tool_call(
+        "run_command",
+        {"CommandLine": "pwd", "Cwd": "/opt/work/bad-cwd"},
+        posix_host(resolver=failing_cwd_resolve),
+    )
+    assert cwd_intent.status == "ok"
+    assert cwd_intent.command_opaque is True
+    assert decide_tier("auto", cwd_intent, RULES).action == Verdict.ALLOW
+
+
+def test_gate_fact_failures_return_permission_check_unavailable() -> None:
+    def fail_workspace(path: str) -> ResolvedPath:
+        if path == "/opt/work/project":
+            raise OSError("workspace unreadable")
+        return ResolvedPath(path, "new-file")
+
+    intent = adapt_tool_call("read", {"path": "a.py"}, posix_host(resolver=fail_workspace))
+    assert intent.gate_fault
+    for tier in PERMISSION_TIERS:
+        res = decide_tier(tier, intent, RULES)
+        assert res.action == Verdict.DENY
+        assert res.reason.startswith("Permission check unavailable:")
+
+    # Scenario 26: Windows auto EXEC without SystemRoot -> Permission check unavailable.
+    no_sysroot = windows_host(environment={})
+    res = decision("auto", "run_command", {"CommandLine": "Get-Date"}, no_sysroot)
+    assert res.action == Verdict.DENY
+    assert res.reason.startswith("Permission check unavailable:")
+
+
+def test_per_segment_shell_writes_preserve_later_protected_and_critical_denials() -> None:
+    # Scenario 11: opaque segment + bound protected write -> DENY
+    win = windows_host(shell="pwsh")
+    s11 = decision(
+        "auto",
+        "run_command",
+        {"CommandLine": r'echo "*.log" && Set-Content C:\Windows\System32\x bad'},
+        win,
+    )
+    assert (s11.action, s11.rule_id) == (Verdict.DENY, "protected-path")
+
+    # Scenario 12: opaque PowerShell assignment + bound critical delete -> DENY
+    s12 = decision(
+        "auto",
+        "run_command",
+        {"CommandLine": r"$x='ok'; Remove-Item -Recurse -Force C:\Users\sample"},
+        win,
+    )
+    assert (s12.action, s12.rule_id) == (Verdict.DENY, "critical-delete")
+
+    # Scenario 13: critical delete next to unbound write -> DENY (D2 before D3)
+    s13 = decision("auto", "bash", {"command": "rm -rf / && echo x > $tmp"}, posix_host())
+    assert s13.action == Verdict.DENY
+    assert s13.rule_id in ("critical-delete", "root-delete")
+
+
+def test_opaque_control_mention_asks_without_key_and_denies_with_key() -> None:
+    # Scenario 14: opaque command names control path without bound write or key name -> ASK
+    bridge = r"C:\work\sample\.omnigent\antigravity-native\bridge01"
+    win = windows_host(shell="pwsh", control_paths=(bridge,))
+    s14 = decision(
+        "auto",
+        "run_command",
+        {"CommandLine": rf"$t='{bridge}\tier.json'; Set-Content $t x"},
+        win,
+    )
+    assert (s14.action, s14.rule_id) == (Verdict.ASK, "control-path")
+
+    # Scenario 15: opaque command naming auth.json next to control path -> DENY
+    s15 = decision(
+        "auto",
+        "run_command",
+        {"CommandLine": rf"$t='{bridge}\auth.json'; Get-Content $t"},
+        win,
+    )
+    assert (s15.action, s15.rule_id) == (Verdict.DENY, "control-path")
+
+
+def test_d4_target_scoped_readable_control_subtrees_and_escapes(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    bridge = tmp_path / "bridge"
+    brain_step = (
+        bridge
+        / "agy-home/.gemini/antigravity-cli/brain/conv1/.system_generated/steps/9/output.txt"
+    )
+    brain_step.parent.mkdir(parents=True)
+    brain_step.write_text("step output\n")
+    builtin_skill = (
+        bridge / "agy-home/.gemini/antigravity-cli/builtin/skills/run-workflow/SKILL.md"
+    )
+    builtin_skill.parent.mkdir(parents=True)
+    builtin_skill.write_text("# skill\n")
+    relay = bridge / "tool_relay.json"
+    relay.write_text('{"token":"live"}')
+    escape_link = brain_step.parent / "escape.txt"
+    escape_link.symlink_to(relay)
+
+    host = posix_host(
+        cwd=str(workspace),
+        workspace=str(workspace),
+        home=str(tmp_path),
+        control_paths=(str(bridge),),
+        readable_control_subtrees=(
+            str(bridge / "agy-home/.gemini/antigravity-cli/brain"),
+            str(bridge / "agy-home/.gemini/antigravity-cli/builtin"),
+        ),
+        resolver=resolve_local_path,
+    )
+    # Scenario 19: AG reads own step output and builtin skill -> ALLOW across all tiers
+    for target in (brain_step, builtin_skill):
+        for tier in PERMISSION_TIERS:
+            assert decision(tier, "read_file", {"Path": str(target)}, host).action == Verdict.ALLOW
+    # Shell read inside brain subtree -> ALLOW; shell read of tool_relay.json -> DENY
+    assert (
+        decision("auto", "run_command", {"CommandLine": f'cat "{brain_step}"'}, host).action
+        == Verdict.ALLOW
+    )
+    assert (
+        decision("auto", "run_command", {"CommandLine": f'cat "{relay}"'}, host).rule_id
+        == "control-path"
+    )
+    # Scenario 20: symlink escape inside brain/ and recursive grep over bridge dir -> DENY
+    for tier in NON_FULL_TIERS:
+        esc = decision(tier, "read_file", {"Path": str(escape_link)}, host)
+        assert (esc.action, esc.rule_id) == (Verdict.DENY, "control-path")
+        rec = decision(tier, "grep_search", {"SearchPath": str(bridge), "Query": "token"}, host)
+        assert (rec.action, rec.rule_id) == (Verdict.DENY, "control-path")
+        wrt = decision(tier, "write_file", {"Path": str(brain_step), "Content": "x"}, host)
+        assert (wrt.action, wrt.rule_id) == (Verdict.DENY, "control-path")
+
+
+def test_malformed_call_and_native_grant_invariants() -> None:
+    # Scenario 21: native grant tools denied in every non-full tier
+    for tool in ("ask_permission", "ask_custom_permission"):
+        for tier in NON_FULL_TIERS:
+            assert decision(tier, tool, {}).action == Verdict.DENY
+        assert decision("full", tool, {}).action == Verdict.ALLOW
+    # Scenario 25: malformed command type -> DENY "Malformed"
+    for tier in PERMISSION_TIERS:
+        res = decision(tier, "sys_os_shell", {"command": 5})
+        assert res.action == Verdict.DENY
+        assert "Malformed" in res.reason or "command" in res.reason.lower()
+
+
+def test_d4_symlinked_subtree_roots_and_installed_package_subtrees(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    relay = bridge / "tool_relay.json"
+    relay.write_text('{"token":"live"}')
+    agy_cli = bridge / "agy-home/.gemini/antigravity-cli"
+    agy_cli.mkdir(parents=True)
+    # Symlinked subtree root pointing at bridge dir or directly at a control file must be refused.
+    brain_link = agy_cli / "brain"
+    brain_link.symlink_to(bridge)
+    builtin_link = agy_cli / "builtin"
+    builtin_link.symlink_to(relay)
+
+    host = posix_host(
+        cwd=str(workspace),
+        workspace=str(workspace),
+        home=str(tmp_path),
+        control_paths=(str(bridge),),
+        readable_control_subtrees=(str(brain_link), str(builtin_link)),
+        resolver=resolve_local_path,
+    )
+    for target in (brain_link / "tool_relay.json", builtin_link):
+        for tier in NON_FULL_TIERS:
+            res = decision(tier, "read_file", {"Path": str(target)}, host)
+            assert (res.action, res.rule_id) == (Verdict.DENY, "control-path")
+
+    # Installed package root in readable_control_subtrees allows reads of package control paths,
+    # denies writes, and rejects a file inside the package symlinked outside it.
+    pkg = tmp_path / "site-packages" / "omnigent"
+    (pkg / "inner").mkdir(parents=True)
+    pi_exec = pkg / "inner" / "pi_executor.py"
+    pi_exec.write_text("# pkg\n")
+    escaped_exec = pkg / "inner" / "escaped.py"
+    escaped_exec.symlink_to(relay)
+    pkg_host = posix_host(
+        cwd=str(workspace),
+        workspace=str(workspace),
+        home=str(tmp_path),
+        control_paths=(str(bridge), str(pi_exec), str(escaped_exec)),
+        readable_control_subtrees=(str(pkg),),
+        resolver=resolve_local_path,
+    )
+    assert decision("auto", "read_file", {"Path": str(pi_exec)}, pkg_host).action == Verdict.ALLOW
+    assert (
+        decision("auto", "write_file", {"Path": str(pi_exec), "Content": "x"}, pkg_host).rule_id
+        == "control-path"
+    )
+    assert (
+        decision("auto", "read_file", {"Path": str(escaped_exec)}, pkg_host).rule_id
+        == "control-path"
+    )
+
+
+def test_per_token_command_path_binding_retains_later_control_denials() -> None:
+    def reject_long_component(path: str) -> ResolvedPath:
+        for part in path.split("/"):
+            if len(part.encode("utf-8")) > 255:
+                raise OSError(errno.ENAMETOOLONG, "File name too long", path)
+        return ResolvedPath(
+            path,
+            "directory"
+            if path in ("/opt/work/project", "/opt/work/control", "/opt/work/home")
+            else "file",
+        )
+
+    host = posix_host(resolver=reject_long_component)
+    res_var = decision(
+        "auto", "bash", {"command": "cat $MISSING && cat /opt/work/control/tier"}, host
+    )
+    assert (res_var.action, res_var.rule_id) == (Verdict.DENY, "control-path")
+    long_regex = "a" * 260
+    res_long = decision(
+        "auto",
+        "bash",
+        {"command": f'rg "{long_regex}" /opt/work/control/tier'},
+        host,
+    )
+    assert (res_long.action, res_long.rule_id) == (Verdict.DENY, "control-path")
+
+
+def test_windows_pi_literal_path_stays_guarded_when_env_expansion_fails() -> None:
+    def literal_to_control(path: str) -> ResolvedPath:
+        norm = ntpath.normpath(path)
+        if "%UNSET%" in norm:
+            return ResolvedPath(r"C:\work\control\tier", "file")
+        return ResolvedPath(norm, "directory" if norm.casefold() == r"c:\work\project" else "file")
+
+    host = windows_host(resolver=literal_to_control)
+    for tier in NON_FULL_TIERS:
+        res = decision(tier, "read", {"path": r"%UNSET%\tier"}, host)
+        assert (res.action, res.rule_id) == (Verdict.DENY, "control-path")
+
+
+def test_persistent_run_command_runs_d2_checks_before_d3_ask() -> None:
+    host = posix_host()
+    assert (
+        decision("auto", "run_command", {"CommandLine": 123, "RunPersistent": True}, host).action
+        == Verdict.DENY
+    )
+    rm_res = decision(
+        "auto", "run_command", {"CommandLine": "rm -rf /", "RunPersistent": True}, host
+    )
+    assert rm_res.action == Verdict.DENY
+    ctrl_res = decision(
+        "auto",
+        "run_command",
+        {"CommandLine": "echo x > /opt/work/control/tier", "RunPersistent": True},
+        host,
+    )
+    assert (ctrl_res.action, ctrl_res.rule_id) == (Verdict.DENY, "control-path")
+    assert (
+        decision("auto", "run_command", {"CommandLine": "pwd", "RunPersistent": True}, host).action
+        == Verdict.ASK
+    )
+    assert (
+        decision("plan", "run_command", {"CommandLine": "pwd", "RunPersistent": True}, host).action
+        == Verdict.DENY
+    )
+
+
+def test_windows_ads_provider_and_powershell_stream_flag_denials() -> None:
+    host = windows_host(shell="pwsh")
+    for tier in NON_FULL_TIERS:
+        assert (
+            decision(tier, "write", {"path": "env:foo", "content": "x"}, host).action
+            == Verdict.DENY
+        )
+        assert (
+            decision(
+                tier,
+                "sys_os_shell",
+                {"command": "Set-Content -Path a.txt -Stream secret -Value 1"},
+                host,
+            ).action
+            == Verdict.DENY
+        )
+    assert (
+        decision(
+            "auto",
+            "sys_os_shell",
+            {"command": "Set-Content -Path note.txt -Value '-Stream'"},
+            host,
+        ).action
+        == Verdict.ALLOW
+    )
+
+
+def test_r2_symlink_lexical_escape_windows_operand_fallback_and_persistent_cwd() -> None:
+    workspace = "/opt/demo/work"
+    original = "/var/demo/bridge"
+    brain = f"{original}/agy-home/.gemini/antigravity-cli/brain"
+
+    def resolve_alias(path: str) -> ResolvedPath:
+        if path == f"{brain}/escape.txt":
+            return ResolvedPath("/tmp/outside.txt", "file")
+        final = f"/private{path}" if path.startswith("/var/") else path
+        kind = (
+            "directory"
+            if final in {workspace, f"/private{original}", f"/private{brain}"}
+            else "file"
+        )
+        return ResolvedPath(final, kind)
+
+    alias_host = posix_host(
+        platform="darwin",
+        cwd=workspace,
+        workspace=workspace,
+        home="/opt/demo",
+        control_paths=(original,),
+        readable_control_subtrees=(brain,),
+        resolver=resolve_alias,
+    )
+    for tier in NON_FULL_TIERS:
+        esc = decision(tier, "read_file", {"Path": f"{brain}/escape.txt"}, alias_host)
+        assert (esc.action, esc.rule_id) == (Verdict.DENY, "control-path")
+
+    win = windows_host(shell="pwsh")
+    res_curl = decision(
+        "auto",
+        "sys_os_shell",
+        {"command": r"curl --unknown https://example.test/x; Get-Content C:\work\control\tier"},
+        win,
+    )
+    assert (res_curl.action, res_curl.rule_id) == (Verdict.DENY, "control-path")
+
+    host = posix_host()
+    assert (
+        decision(
+            "auto", "run_command", {"CommandLine": "pwd", "RunPersistent": True, "Cwd": 123}, host
+        ).action
+        == Verdict.DENY
+    )
+    rel_res = decision(
+        "auto",
+        "run_command",
+        {"CommandLine": "cat ../control/tier", "RunPersistent": True},
+        host,
+    )
+    assert rel_res.action == Verdict.ASK

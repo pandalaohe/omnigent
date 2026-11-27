@@ -50,6 +50,9 @@ def assert_pre_tool_reply(result):
     [
         ("auto", "run_command", {"CommandLine": "mkfs.ext4 /dev/disk4"}, "deny"),
         ("auto", "run_command", {"CommandLine": "rm -rf node_modules"}, "ask"),
+        ("auto", "run_command", {"CommandLine": "git reset --hard"}, "force_ask"),
+        ("auto", "run_command", {"CommandLine": "git push --force origin main"}, "force_ask"),
+        ("auto", "run_command", {"CommandLine": "printf '\\x73' | bash"}, "force_ask"),
         ("auto-standard", "run_command", {"CommandLine": "rm -rf node_modules"}, "ask"),
         ("auto-strict", "run_command", {"CommandLine": "rm -rf node_modules"}, "ask"),
         ("ask", "run_command", {"CommandLine": "echo safe"}, "force_ask"),
@@ -79,8 +82,10 @@ def assert_pre_tool_reply(result):
             "auto",
             "call_mcp_tool",
             {"ServerName": "other", "ToolName": "update_steps", "Arguments": {}},
-            "deny",
+            "force_ask",
         ),
+        ("auto", "ask_permission", {"Action": "command", "Target": "git"}, "deny"),
+        ("ask", "ask_permission", {"Action": "command", "Target": "git"}, "deny"),
         ("auto", "run_command", {}, "deny"),
     ],
 )
@@ -110,6 +115,47 @@ def test_control_writes_cannot_be_approved(state, tier):
     )
     assert result["decision"] == "deny"
     assert "[control-path]" in result["reason"]
+
+
+def test_native_guard_allows_ag_brain_and_builtin_reads_only(tmp_path, state):
+    bridge_dir = tmp_path / "bridge"
+    brain_file = (
+        bridge_dir
+        / "agy-home/.gemini/antigravity-cli/brain/conv-1/.system_generated/steps/9/output.txt"
+    )
+    brain_file.parent.mkdir(parents=True)
+    brain_file.write_text("spilled output\n")
+    builtin_file = (
+        bridge_dir / "agy-home/.gemini/antigravity-cli/builtin/skills/run-workflow/SKILL.md"
+    )
+    builtin_file.parent.mkdir(parents=True)
+    builtin_file.write_text("# skill\n")
+    relay_file = bridge_dir / "tool_relay.json"
+    relay_file.write_text('{"token":"secret"}')
+    escape = brain_file.parent / "escape.txt"
+    escape.symlink_to(relay_file)
+    context = local_host_context(
+        state,
+        control_paths=(str(bridge_dir),),
+        readable_control_subtrees=(
+            str(bridge_dir / "agy-home/.gemini/antigravity-cli/brain"),
+            str(bridge_dir / "agy-home/.gemini/antigravity-cli/builtin"),
+        ),
+    )
+    for target in (brain_file, builtin_file):
+        allowed = guard.decide(
+            payload("read_file", {"Path": str(target)}), "auto", load_rules(), context
+        )
+        assert allowed["decision"] == "ask", target
+    for denied_call in (
+        payload("read_file", {"Path": str(relay_file)}),
+        payload("read_file", {"Path": str(escape)}),
+        payload("grep_search", {"SearchPath": str(bridge_dir), "Query": "token"}),
+        payload("write_file", {"Path": str(brain_file), "Content": "tamper"}),
+    ):
+        denied = guard.decide(denied_call, "auto", load_rules(), context)
+        assert denied["decision"] == "deny", denied_call
+        assert "[control-path]" in denied["reason"]
 
 
 @pytest.mark.parametrize("tier", ["ask", "plan", "accept-edits", "auto"])
