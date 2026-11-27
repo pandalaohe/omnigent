@@ -637,8 +637,8 @@ async def test_same_text_mirrors_keep_legacy_ids_only_for_co_queued_source_less_
     if attached:
         content.insert(0, {"type": "input_image", "file_id": "file_x", "filename": "x.png"})
         mirror_text = "[Attached: /tmp/x.png]\n\nship it"
-    pending_inputs.record(conv.id, content, stable_id=_WEB_ID)
-    pending_inputs.record(conv.id, content, stable_id=_OTHER_WEB_ID)
+    first_pending_id = pending_inputs.record(conv.id, content, stable_id=_WEB_ID)
+    second_pending_id = pending_inputs.record(conv.id, content, stable_id=_OTHER_WEB_ID)
 
     try:
         first_id, replay = await _persist_external_conversation_item(
@@ -655,15 +655,24 @@ async def test_same_text_mirrors_keep_legacy_ids_only_for_co_queued_source_less_
         for item_id in (first_id, second_id):
             item = store.get_item(conv.id, item_id)
             assert item is not None
+            assert item.status == "completed"
             assert "web_stable_id" not in item.to_api_dict()
-        receipts = [
-            call.args[1]["data"]
-            for call in publish.call_args_list
-            if call.args[1]["type"] == "session.input.consumed"
-        ]
+        frames = [call.args[1] for call in publish.call_args_list]
+        receipts = [frame["data"] for frame in frames if frame["type"] == "session.input.consumed"]
         assert [receipt["item_id"] for receipt in receipts] == [first_id, second_id]
+        assert [receipt["cleared_pending_id"] for receipt in receipts] == [
+            first_pending_id,
+            second_pending_id,
+        ]
         assert all("web_stable_id" not in receipt["data"] for receipt in receipts)
-        assert all(receipt["data"].get("delivery_confirmed") is not False for receipt in receipts)
+        # Queue order settles the bubbles without proving which send made each echo.
+        assert all(receipt["data"].get("delivery_confirmed") is False for receipt in receipts)
+        assert not any(
+            frame["type"] == "response.error"
+            or (frame["type"] == "response.output_item.done" and frame["item"]["type"] == "error")
+            for frame in frames
+        )
+        assert store.list_items(conv.id, type="error").data == []
         assert not pending_inputs.snapshot_for(conv.id)
     finally:
         for pending in pending_inputs.snapshot_for(conv.id):
