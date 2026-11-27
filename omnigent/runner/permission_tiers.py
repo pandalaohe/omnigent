@@ -872,8 +872,9 @@ class PermissionTierRuntime:
             agy_delegation_status=agy_delegation,
             registry_tool_name=name if registry_tool else None,
             readable_control_file=readable_control_file,
-            auto_approval_floor=harness in ("pi", "pi-native")
-            or is_acp_permission_harness(harness),
+            auto_approval_floor=(
+                "narrow" if harness in ("pi", "pi-native") else is_acp_permission_harness(harness)
+            ),
             acp_bridge_tool_name=acp_bridge_tool_name,
         )
 

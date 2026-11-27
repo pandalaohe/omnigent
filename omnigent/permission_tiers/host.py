@@ -157,7 +157,7 @@ def evaluate_host_tool(
     agy_delegation_status: Literal["proven", "missing", "failed"] = "missing",
     registry_tool_name: str | None = None,
     readable_control_file: tuple[str, str] | None = None,
-    auto_approval_floor: bool = False,
+    auto_approval_floor: bool | Literal["narrow"] = False,
     acp_bridge_tool_name: str | None = None,
 ) -> TierDecision:
     """Adapt with local filesystem facts immediately before requesting approval."""
@@ -196,10 +196,17 @@ def evaluate_host_tool(
         ):
             return TierDecision(Verdict.ASK, "Writing outside the workspace requires approval")
         if intent.kind == ToolKind.EXEC and name in ("bash", "sys_os_shell"):
-            from omnigent.server.child_approvals import floor
+            if auto_approval_floor == "narrow":
+                from omnigent.server.child_approvals import auto_floor_asks
 
-            if floor({"tool_name": name, "command": arguments.get("command")}) == "user_only":
-                return TierDecision(Verdict.ASK, "Command requires user approval")
+                command = arguments.get("command")
+                if isinstance(command, str) and auto_floor_asks(command):
+                    return TierDecision(Verdict.ASK, "Command requires user approval")
+            else:
+                from omnigent.server.child_approvals import floor
+
+                if floor({"tool_name": name, "command": arguments.get("command")}) == "user_only":
+                    return TierDecision(Verdict.ASK, "Command requires user approval")
         return decision
     except Exception as exc:  # noqa: BLE001 - failures never become execution permission
         return TierDecision(Verdict.DENY, f"Permission check unavailable: {type(exc).__name__}")
