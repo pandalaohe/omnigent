@@ -12412,18 +12412,25 @@ def host_load(json_output: bool) -> None:
     from omnigent.process_logging import data_dir
 
     payload, fresh = read_local_load(data_dir() / "run" / "host-load.json", now=time.time())
-    if json_output:
-        click.echo(json.dumps(payload))
-    else:
-        load = payload["load_per_core"]
-        click.echo(
-            f"level: {payload['level']}  load/core: {load if load is not None else 'unknown'}"
-        )
-        click.echo(
-            f"lines: heavy {payload['lines']['heavy']} / "
-            f"new session {payload['lines']['new_session']}"
-        )
-        click.echo(f"path: {payload['path']}")
+    try:
+        if json_output:
+            click.echo(json.dumps(payload))
+        else:
+            load = payload["load_per_core"]
+            click.echo(
+                f"level: {payload['level']}  load/core: {load if load is not None else 'unknown'}"
+            )
+            click.echo(
+                f"lines: heavy {payload['lines']['heavy']} / "
+                f"new session {payload['lines']['new_session']}"
+            )
+            click.echo(f"path: {payload['path']}")
+    except BrokenPipeError:
+        raise SystemExit(1) from None
+    except OSError as exc:
+        if exc.errno in (errno.EINVAL, errno.EPIPE):
+            raise SystemExit(1) from None
+        raise
     if not fresh:
         raise SystemExit(3)
 
