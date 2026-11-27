@@ -6,7 +6,7 @@ const net = require("node:net");
 
 const privateKeys = new Set(["pi_origin_receipt","permission_tier_binding","scope_credential","attestor_credential","process_capability"]);
 function publicValue(value) {
-  if(typeof value === "string") return value.replace(/\bpi_(?:scope|receipt|attestor)_[A-Za-z0-9_-]{32,256}/g,"[private Pi authority]")
+  if(typeof value === "string") return value.replace(/pi_(?:scope|receipt|attestor)_[A-Za-z0-9_-]{32,}/g,"[private Pi authority]")
     .replace(/(\b(?:pi_origin_receipt|scope_credential|attestor_credential|process_capability)["']?\s*[:=]\s*["']?)[A-Za-z0-9_-]+/g,"$1[private Pi authority]");
   if(Array.isArray(value)) return value.map(publicValue);
   if(value && typeof value === "object") return Object.fromEntries(Object.entries(value).filter(([key])=>!privateKeys.has(key)).map(([key,item])=>[key,publicValue(item)]));
@@ -15,6 +15,18 @@ function publicValue(value) {
 const denied = cause => ({block:true,reason:"Scoped Pi authority is unavailable"+(cause?
   ` (${cause}). ${["state_not_ready","revision_changed"].includes(cause)?"Wait for the permission update; if it persists, restart the Pi session.":"Restart the Pi session to establish fresh scoped authority."}`:"")});
 const failedResult = () => ({isError:true,content:[{type:"text",text:"Scoped Pi execution is unavailable"}]});
+function toolErrorResult(error) {
+  let text="";
+  try {
+    const raw=typeof error==="string"?error:
+      error&&typeof error==="object"&&typeof error.message==="string"?error.message:
+      error==null?"":String(error);
+    text=typeof raw==="string"&&!raw.includes("permission_tier_binding")?publicValue(raw):"";
+  } catch (_) {
+    text="";
+  }
+  return {isError:true,content:[{type:"text",text:text.trim()?text:"Tool execution failed"}],details:{}};
+}
 const fingerprint = event => JSON.stringify([event.toolName,event.input]);
 // Only fixed codes and elapsed time cross this boundary; never pass an event,
 // state, scope, response or exception (even through publicValue) to diagnostics.
@@ -116,8 +128,8 @@ function createScopedClient({scope, transport, readState, recheck, report=diagno
           // Enter the actual definition in this ACK dispatch, never retain a start permit.
           if(ack?.executed!==true || !current(call.revision) || call.phase!=="checking") {resolve(failedResult());return;}
           call.phase="executing";
-          try {Promise.resolve(start()).then(value=>resolve(publicValue(value)),()=>resolve(failedResult()));}
-          catch (_) {resolve(failedResult());}
+          try {Promise.resolve(start()).then(value=>resolve(publicValue(value)),error=>resolve(toolErrorResult(error)));}
+          catch (error) {resolve(toolErrorResult(error));}
         }).catch(()=>resolve(failedResult()));
       });
     } catch (_) {return failedResult();}
