@@ -425,6 +425,9 @@ def write_extension_files(
             plan_visible_tool_names(
                 [
                     "read",
+                    "grep",
+                    "find",
+                    "ls",
                     "manage_todo_list",
                     *(
                         tool.get("name")

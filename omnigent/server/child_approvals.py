@@ -28,6 +28,7 @@ from omnigent.policies.builtins._shell import (
     _FLAG_WRAPPERS,
     SHELL_TOOLS,
     _skip_flag_wrapper_args,
+    shell_command,
 )
 from omnigent.policies.builtins.orchestration import (
     _RM_CRITICAL_DIRS,
@@ -249,7 +250,23 @@ def _normal_path(path: str) -> str:
     return "/" + normalized.lstrip("/") if normalized.startswith("/") else normalized
 
 
+_WINDOWS_CRITICAL_PARENTS = frozenset(
+    {
+        "windows",
+        "program files",
+        "program files (x86)",
+        "programdata",
+        "boot",
+        "system32",
+    }
+)
+
+
 def _critical_target(path: str) -> bool:
+    if re.match(r"^[A-Za-z]:[/\\]", path):
+        drive_rest = posixpath.normpath("/" + path[2:].replace("\\", "/")).lstrip("/").casefold()
+        head = drive_rest.split("/", 1)[0]
+        return not drive_rest or head in _WINDOWS_CRITICAL_PARENTS or drive_rest == "users"
     normalized = _normal_path(path)
     return (
         path.startswith("~")
@@ -470,6 +487,130 @@ _FLOOR_CLASSES: dict[
     "git config injection and discards": (frozenset({"git"}), (), _git_user_only),
 }
 
+_POWERSHELL_USER_ONLY_CMDLETS = frozenset(
+    {
+        "remove-item",
+        "ri",
+        "del",
+        "erase",
+        "rd",
+        "rmdir",
+        "clear-content",
+        "clc",
+        "set-executionpolicy",
+        "invoke-expression",
+        "iex",
+        "invoke-command",
+        "icm",
+        "set-acl",
+        "set-itemproperty",
+        "sp",
+        "clear-itemproperty",
+        "clp",
+        "remove-itemproperty",
+        "rp",
+        "new-itemproperty",
+    }
+)
+_POWERSHELL_WRITE_CMDLETS = frozenset(
+    {
+        "set-content",
+        "sc",
+        "add-content",
+        "ac",
+        "out-file",
+        "new-item",
+        "ni",
+        "copy-item",
+        "cpi",
+        "move-item",
+        "mi",
+        "move",
+        "rename-item",
+        "rni",
+        "ren",
+        "set-item",
+        "si",
+        "clear-item",
+        "cli",
+    }
+)
+_POWERSHELL_MOVE_CMDLETS = frozenset({"move-item", "mi", "move", "rename-item", "rni", "ren"})
+_POWERSHELL_COPY_CMDLETS = frozenset({"copy-item", "cpi"})
+_POWERSHELL_PATH_FLAGS = frozenset({"-path", "-literalpath", "-filepath", "-destination"})
+_POWERSHELL_NON_PATH_VALUE_FLAGS = frozenset(
+    {
+        "-value",
+        "-encoding",
+        "-itemtype",
+        "-type",
+        "-newname",
+        "-filter",
+        "-include",
+        "-exclude",
+        "-stream",
+        "-width",
+        "-credential",
+    }
+)
+
+
+def _start_process_user_only(args: list[str]) -> bool:
+    index = 0
+    while index < len(args):
+        lower = args[index].casefold()
+        if lower == "-verb" and index + 1 < len(args):
+            if args[index + 1].casefold() == "runas":
+                return True
+            index += 2
+            continue
+        if lower.startswith(("-verb:", "-verb=")):
+            if lower.split(lower[5], 1)[1] == "runas":
+                return True
+        index += 1
+    return False
+
+
+def _powershell_write_user_only(lower_name: str, args: list[str]) -> bool:
+    named_targets: list[str] = []
+    destinations: list[str] = []
+    positionals: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        lower = arg.casefold()
+        if lower in _POWERSHELL_PATH_FLAGS and index + 1 < len(args):
+            value = args[index + 1]
+            if lower == "-destination":
+                destinations.append(value)
+            else:
+                named_targets.append(value)
+            index += 2
+            continue
+        if lower in _POWERSHELL_NON_PATH_VALUE_FLAGS and index + 1 < len(args):
+            index += 2
+            continue
+        matched_colon = re.fullmatch(
+            r"-(path|literalpath|filepath|destination)[:=](.+)", arg, re.I
+        )
+        if matched_colon:
+            if matched_colon.group(1).casefold() == "destination":
+                destinations.append(matched_colon.group(2))
+            else:
+                named_targets.append(matched_colon.group(2))
+            index += 1
+            continue
+        if not arg.startswith("-"):
+            positionals.append(arg)
+        index += 1
+    if lower_name in _POWERSHELL_COPY_CMDLETS:
+        targets = destinations or (positionals[-1:] if len(positionals) >= 2 else positionals)
+    elif lower_name in _POWERSHELL_MOVE_CMDLETS:
+        targets = [*named_targets, *destinations, *positionals]
+    else:
+        targets = [*named_targets, *destinations, *(positionals[:1] if not named_targets else [])]
+    return any(_critical_target(target) for target in targets)
+
 
 def _command_is_user_only(command: str) -> bool:
     if "$" in command or "`" in command:
@@ -483,7 +624,16 @@ def _command_is_user_only(command: str) -> bool:
             if index >= len(argv):
                 return True
             name = (PurePosixPath(argv[index]).name or argv[index]).removesuffix(".exe")
+            lower_name = name.casefold()
             args = argv[index + 1 :]
+            if lower_name in _POWERSHELL_USER_ONLY_CMDLETS:
+                return True
+            if lower_name in {"start-process", "saps"} and _start_process_user_only(args):
+                return True
+            if lower_name in _POWERSHELL_WRITE_CMDLETS and _powershell_write_user_only(
+                lower_name, args
+            ):
+                return True
             if any(
                 check(name, args, piped)
                 for names, prefixes, check in _FLOOR_CLASSES.values()
@@ -526,7 +676,7 @@ def _shell_action(params: Mapping[str, Any]) -> tuple[bool, str | None]:
             arguments = json.loads(preview)
         except ValueError:
             return True, None
-        return True, arguments.get("command") if isinstance(arguments, dict) else None
+        return True, shell_command(_tool_name(tool), arguments)
     return True, params.get("command")
 
 

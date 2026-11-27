@@ -271,3 +271,88 @@ def test_pi_auto_approval_floor_keeps_outside_workspace_edit_and_strict_acp_floo
         auto_approval_floor=True,
     )
     assert strict_acp.action == Verdict.ASK
+
+
+def test_windows_pi_bash_and_powershell_select_their_own_executors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(host.sys, "platform", "win32")
+    monkeypatch.setattr(host.Path, "home", lambda: Path("C:/work/sample"))
+    monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
+    monkeypatch.setenv("SystemRoot", r"C:\Windows")
+    monkeypatch.setattr(
+        host,
+        "resolve_local_path",
+        lambda value: ResolvedPath(value, "directory" if value == r"C:\work" else "new-file"),
+    )
+    state = host.HostPermissionState("s", "h", r"C:\work", "auto", 1, "ready")
+    controls = (r"C:\control",)
+
+    assert (
+        host.evaluate_host_tool(
+            state, "bash", {"command": "printf '%b' 'ok\\n'"}, control_paths=controls
+        ).action
+        == Verdict.ALLOW
+    )
+    assert (
+        host.evaluate_host_tool(
+            state, "bash", {"command": "collab long-run status 85.86cf"}, control_paths=controls
+        ).action
+        == Verdict.ALLOW
+    )
+    assert (
+        host.evaluate_host_tool(
+            state, "bash", {"command": "ls /c/work"}, control_paths=controls
+        ).action
+        == Verdict.ALLOW
+    )
+    assert (
+        host.evaluate_host_tool(
+            state,
+            "powershell",
+            {"command": "$PSVersionTable.PSVersion.ToString()"},
+            control_paths=controls,
+            auto_approval_floor=True,
+        ).action
+        == Verdict.ALLOW
+    )
+    assert (
+        host.evaluate_host_tool(
+            state,
+            "powershell",
+            {"command": "Get-Date"},
+            control_paths=controls,
+            auto_approval_floor=True,
+        ).action
+        == Verdict.ALLOW
+    )
+    for command in (
+        "git reset --hard",
+        "Clear-Content local.txt",
+        "Set-ExecutionPolicy Bypass",
+        "Get-ChildItem Env:",
+        'Get-ChildItem "Env:"',
+    ):
+        assert (
+            host.evaluate_host_tool(
+                state,
+                "powershell",
+                {"command": command},
+                control_paths=controls,
+                auto_approval_floor=True,
+            ).action
+            == Verdict.ASK
+        ), command
+    for command, expected_rule in (
+        ("Format-Volume -DriveLetter C", "disk-destroy"),
+        (r"Clear-Content C:\Windows\report.txt", "protected-path"),
+        ("Invoke-Expression 'Get-Date'", "remote-exec"),
+    ):
+        denied = host.evaluate_host_tool(
+            state,
+            "powershell",
+            {"command": command},
+            control_paths=controls,
+            auto_approval_floor=True,
+        )
+        assert (denied.action, denied.rule_id) == (Verdict.DENY, expected_rule), command

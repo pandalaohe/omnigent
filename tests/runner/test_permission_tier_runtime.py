@@ -2953,6 +2953,15 @@ async def test_acp_managed_flag_survives_initialization(monkeypatch, tmp_path, t
         ("bash", {"command": "cd src && ls"}, True, Verdict.ALLOW),
         ("bash", {"command": "git reset --hard"}, True, Verdict.ASK),
         ("bash", {"command": "echo x > ~/.bashrc"}, True, Verdict.ASK),
+        ("powershell", {"command": "Get-Date"}, True, Verdict.ALLOW),
+        ("powershell", {"command": "git reset --hard"}, True, Verdict.ASK),
+        ("powershell", {"command": "Format-Volume -DriveLetter C"}, True, Verdict.DENY),
+        ("grep", {"pattern": "TODO"}, True, Verdict.ALLOW),
+        ("find", {"pattern": "*.py"}, True, Verdict.ALLOW),
+        ("ls", {}, True, Verdict.ALLOW),
+        ("tool_search", {"query": "session"}, True, Verdict.ALLOW),
+        ("write", {"path": "../note.txt", "content": "fixture"}, True, Verdict.ALLOW),
+        ("edit", {"path": "../note.txt", "oldText": "a", "newText": "b"}, True, Verdict.ALLOW),
         ("write", {"path": "../../outside.txt", "content": "fixture"}, True, Verdict.ASK),
         ("sys_os_shell", {"command": "omni --version"}, False, Verdict.ALLOW),
         ("sys_os_shell", {"command": "echo $HOME"}, False, Verdict.ALLOW),
@@ -2960,6 +2969,9 @@ async def test_acp_managed_flag_survives_initialization(monkeypatch, tmp_path, t
         ("sys_os_shell", {"command": "rm -rf /"}, False, Verdict.DENY),
         ("sys_os_write", {"path": "../../outside.txt", "content": "fixture"}, False, Verdict.ASK),
         ("sys_os_write", {"path": "../note.txt", "content": "fixture"}, False, Verdict.ALLOW),
+        # Bridged non-local tools reusing Pi built-in names must not inherit builtin READ.
+        ("tool_search", {"query": "session"}, False, Verdict.DENY),
+        ("grep", {"pattern": "TODO"}, False, Verdict.DENY),
     ],
 )
 def test_scoped_pi_auto_classifies_native_and_bridged_calls(
@@ -2977,8 +2989,9 @@ def test_scoped_pi_auto_classifies_native_and_bridged_calls(
     _publish_scope(runtime, parent, registry["tools"])
     child = runtime.open_pi_child_scope("session-a")
     assert child.principal.canonical_cwd == str(cwd.resolve())
+    builtin_path = "builtin:tool-search" if name == "tool_search" else f"builtin:{name}"
     source = (
-        {"source": "builtin", "path": f"builtin:{name}"}
+        {"source": "builtin", "path": builtin_path}
         if local
         else {"source": "inline", "path": "<inline:omnigent-permission>"}
     )
@@ -3001,6 +3014,39 @@ def test_scoped_pi_auto_classifies_native_and_bridged_calls(
         origin_receipt=receipt.token,
     )
     assert decision.action == expected, decision.reason
+
+
+def test_legacy_pi_inspect_rejects_bridge_collision_with_builtin_name(tmp_path: Path) -> None:
+    runtime, _source, registry = _extension_runtime(tmp_path, "auto")
+    registry["tools"] = [
+        {
+            "name": "grep",
+            "sourceInfo": {"source": "inline", "path": "<inline:omnigent-permission>"},
+        },
+        {
+            "name": "tool_search",
+            "sourceInfo": {"source": "builtin", "path": "builtin:tool-search"},
+        },
+    ]
+    (runtime.path("session-a").parent / "permission_tools.json").write_text(json.dumps(registry))
+    _, spoofed = runtime.inspect(
+        "session-a",
+        call_id="legacy-spoof",
+        name="grep",
+        arguments={"pattern": "TODO"},
+        expected_revision=3,
+        local_execution=True,
+    )
+    assert spoofed.action == Verdict.DENY
+    _, genuine = runtime.inspect(
+        "session-a",
+        call_id="legacy-builtin",
+        name="tool_search",
+        arguments={"query": "session"},
+        expected_revision=3,
+        local_execution=True,
+    )
+    assert genuine.action == Verdict.ALLOW
 
 
 def test_pi_scope_unlisted_bridged_tool_is_denied_in_auto(tmp_path):
