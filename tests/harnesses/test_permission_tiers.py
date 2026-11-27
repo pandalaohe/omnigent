@@ -3090,3 +3090,361 @@ def test_denial_source_formatting_names_every_layer_and_prevents_spoofing() -> N
     assert format_denial_reason("sandbox", "Write access is blocked") == (
         "Denied by sandbox: Write access is blocked"
     )
+
+
+@pytest.mark.parametrize(
+    ("name", "args"),
+    [
+        ("grep", {"pattern": "TODO"}),
+        ("grep", {"pattern": "TODO", "path": "src", "glob": "*.py", "context": 2, "limit": 20}),
+        ("find", {"pattern": "*.py"}),
+        ("find", {"pattern": "*.py", "path": "src", "limit": 50}),
+        ("ls", {}),
+        ("ls", {"path": "src", "limit": 50}),
+        ("tool_search", {"query": "session"}),
+        ("tool_search", {"query": "session", "limit": 5}),
+    ],
+)
+def test_pi_builtin_read_tools_follow_read_tier_and_plan_visibility(
+    name: str, args: dict[str, object]
+) -> None:
+    windows_pi = windows_host(
+        control_paths=(
+            r"C:\work\control",
+            r"C:\work\sample\.pi",
+            r"C:\work\sample\.agents",
+            r"C:\work\project\.pi",
+            r"C:\work\project\.agents",
+        )
+    )
+    for host in (pi_host(), windows_pi):
+        assert adapt_tool_call(name, args, host).kind == ToolKind.READ
+        for tier in PERMISSION_TIERS:
+            expected = Verdict.DENY if name == "tool_search" and tier == "plan" else Verdict.ALLOW
+            result = decision(tier, name, args, host)
+            assert result.action == expected, (name, tier, result.reason)
+    assert plan_visible_tool_names(
+        ("grep", "find", "ls", "tool_search", "read", "write", "edit", "bash", "powershell")
+    ) == ("grep", "find", "ls", "read")
+
+
+@pytest.mark.parametrize(
+    ("name", "args"),
+    [
+        ("grep", {}),
+        ("grep", {"pattern": ""}),
+        ("grep", {"pattern": 1}),
+        ("grep", {"pattern": "x", "path": 1}),
+        ("grep", {"pattern": "x", "path": None}),
+        ("grep", {"pattern": "x", "glob": 1}),
+        ("grep", {"pattern": "x", "glob": None}),
+        ("grep", {"pattern": "x", "ignoreCase": "yes"}),
+        ("grep", {"pattern": "x", "ignoreCase": None}),
+        ("grep", {"pattern": "x", "literal": 1}),
+        ("grep", {"pattern": "x", "context": -1}),
+        ("grep", {"pattern": "x", "context": True}),
+        ("grep", {"pattern": "x", "limit": 0}),
+        ("grep", {"pattern": "x", "limit": None}),
+        ("find", {}),
+        ("find", {"pattern": ""}),
+        ("find", {"pattern": "x", "path": 1}),
+        ("find", {"pattern": "x", "limit": -5}),
+        ("ls", {"path": 1}),
+        ("ls", {"path": None}),
+        ("ls", {"path": "@"}),
+        ("ls", {"path": "file:///opt/work/project"}),
+        ("ls", {"limit": 0}),
+        ("tool_search", {}),
+        ("tool_search", {"query": ""}),
+        ("tool_search", {"query": "   "}),
+        ("tool_search", {"query": "\ufeff"}),
+        ("tool_search", {"query": 1}),
+        ("tool_search", {"query": "x", "limit": True}),
+        ("tool_search", {"query": "x", "limit": None}),
+        ("tool_search", {"query": "x", "limit": "5"}),
+        ("tool_search", {"query": "x", "limit": 0}),
+        ("tool_search", {"query": "x", "limit": -2}),
+        ("tool_search", {"query": "x", "limit": 1.5}),
+    ],
+)
+def test_pi_builtin_read_tools_validate_schema(name: str, args: dict[str, object]) -> None:
+    for tier in PERMISSION_TIERS:
+        assert decision(tier, name, args, pi_host()).action == Verdict.DENY
+
+
+def test_pi_recursive_reads_keep_control_and_credential_boundaries() -> None:
+    # Workspace-root scans are allowed when workspace-local .pi/.agents do not exist.
+    for name, args in (
+        ("grep", {"pattern": "token"}),
+        ("find", {"pattern": "*.py"}),
+        ("grep", {"pattern": "x", "path": SKILLS}),
+        ("find", {"pattern": "*.md", "path": "/opt/work/project/.agents/skills"}),
+    ):
+        for tier in PERMISSION_TIERS:
+            assert decision(tier, name, args, pi_host()).action == Verdict.ALLOW
+
+    # When workspace-local .pi exists on disk, workspace-root recursive scans stay refused
+    # while non-overlapping subdirs and skills subtrees stay allowed.
+    existing_pi_host = posix_host(
+        control_paths=PI_CONTROLS,
+        resolver=lambda p: ResolvedPath(
+            p,
+            "directory"
+            if p in ("/opt/work/project", "/opt/work/project/.pi", "/opt/work/project/src")
+            else "new-file",
+        ),
+    )
+    for name, args in (("grep", {"pattern": "x"}), ("find", {"pattern": "*"})):
+        for tier in NON_FULL_TIERS:
+            result = decision(tier, name, args, existing_pi_host)
+            assert (result.action, result.rule_id) == (Verdict.DENY, "control-path")
+        assert decision("full", name, args, existing_pi_host).action == Verdict.ALLOW
+    for name, args in (
+        ("grep", {"pattern": "x", "path": "src"}),
+        ("find", {"pattern": "*.py", "path": "src"}),
+        ("grep", {"pattern": "x", "path": "/opt/work/project/.agents/skills"}),
+    ):
+        assert decision("auto", name, args, existing_pi_host).action == Verdict.ALLOW
+
+    # Direct agent roots, parent dirs covering home/bridge, and key files stay refused.
+    for name, args in (
+        ("grep", {"pattern": "x", "path": ".pi"}),
+        ("find", {"pattern": "*", "path": "/opt/work/project/.pi"}),
+        ("grep", {"pattern": "x", "path": "/opt/home/.pi"}),
+        ("find", {"pattern": "*", "path": "/opt/home/.agents"}),
+        ("grep", {"pattern": "x", "path": "/opt/home"}),
+        ("find", {"pattern": "*", "path": "/opt/work"}),
+        ("grep", {"pattern": "x", "path": SKILLS + "/x/models.json"}),
+        ("ls", {"path": "/opt/home/.pi/agent/auth.json"}),
+    ):
+        for tier in NON_FULL_TIERS:
+            result = decision(tier, name, args, pi_host())
+            assert (result.action, result.rule_id) == (Verdict.DENY, "control-path")
+        assert decision("full", name, args, pi_host()).action == Verdict.ALLOW
+
+    # Non-readable control directory inside workspace stays refused for workspace-root scans.
+    bridge_host = posix_host(control_paths=("/opt/work/project/bridge",))
+    for name, args in (("grep", {"pattern": "x"}), ("find", {"pattern": "*"})):
+        for tier in NON_FULL_TIERS:
+            result = decision(tier, name, args, bridge_host)
+            assert (result.action, result.rule_id) == (Verdict.DENY, "control-path")
+
+    # Home agent root is never waived even when workspace equals home.
+    home_workspace = posix_host(
+        cwd="/opt/home",
+        workspace="/opt/home",
+        home="/opt/home",
+        control_paths=("/opt/work/control", "/opt/home/.pi"),
+        resolver=lambda p: ResolvedPath(p, "directory" if p == "/opt/home" else "new-file"),
+    )
+    for name, args in (("grep", {"pattern": "x"}), ("find", {"pattern": "*"})):
+        for tier in NON_FULL_TIERS:
+            result = decision(tier, name, args, home_workspace)
+            assert (result.action, result.rule_id) == (Verdict.DENY, "control-path")
+
+
+def test_pi_path_normalization_cannot_bypass_boundaries() -> None:
+    # POSIX: @ prefix, Unicode spaces, and file:// URIs.
+    for name, args in (
+        ("read", {"path": "@/opt/home/.pi/agent/auth.json"}),
+        ("grep", {"pattern": "x", "path": "@/opt/home/.pi/agent"}),
+        ("ls", {"path": "@/opt/home/.pi/agent/auth.json"}),
+    ):
+        result = decision("auto", name, args, pi_host())
+        assert (result.action, result.rule_id) == (Verdict.DENY, "control-path")
+
+    for name, args in (
+        ("write", {"path": "@/etc/hosts", "content": "x"}),
+        ("edit", {"path": "@/etc/hosts", "oldText": "a", "newText": "b"}),
+    ):
+        result = decision("auto", name, args, pi_host())
+        assert (result.action, result.rule_id) == (Verdict.DENY, "protected-path")
+
+    for uri in ("file:///opt/home/.pi/agent/auth.json", "@file:///etc/hosts"):
+        assert decision("auto", "read", {"path": uri}, pi_host()).action == Verdict.DENY
+        assert (
+            decision("auto", "write", {"path": uri, "content": "x"}, pi_host()).action
+            == Verdict.DENY
+        )
+
+    assert (
+        decision("auto", "read", {"path": "docs/my\u00a0note.md"}, pi_host()).action
+        == Verdict.ALLOW
+    )
+
+    # Lexical dot-segment collapse matches Node path.resolve before symlink traversal.
+    def lexical_symlink(path: str) -> ResolvedPath:
+        if path == "/opt/home/.pi/agent/skills/link/../../auth.json":
+            return ResolvedPath("/opt/work/project/safe.txt", "file")
+        kind = "directory" if path == "/opt/work/project" else "file"
+        return ResolvedPath(path, kind)
+
+    symlink_host = posix_host(control_paths=PI_CONTROLS, resolver=lexical_symlink)
+    lex_result = decision(
+        "auto", "read", {"path": "/opt/home/.pi/agent/skills/link/../../auth.json"}, symlink_host
+    )
+    assert (lex_result.action, lex_result.rule_id) == (Verdict.DENY, "control-path")
+
+    # Pi read fallback variants (curly quote, NFD, AM/PM) bind the fallback target when absent.
+    def fallback_alias(path: str) -> ResolvedPath:
+        if path == "/opt/work/project":
+            return ResolvedPath(path, "directory")
+        if path == "/opt/work/project/user\u2019s.txt":
+            return ResolvedPath("/opt/home/.pi/agent/auth.json", "file")
+        if path == "/opt/work/project/cafe\u0301.txt":
+            return ResolvedPath("/opt/home/.pi/agent/models.json", "file")
+        return ResolvedPath(path, "new-file")
+
+    fallback_host = posix_host(control_paths=PI_CONTROLS, resolver=fallback_alias)
+    for alias in ("user's.txt", "caf\u00e9.txt"):
+        fb_result = decision("auto", "read", {"path": alias}, fallback_host)
+        assert (fb_result.action, fb_result.rule_id) == (Verdict.DENY, "control-path"), alias
+
+    # Windows: Git Bash / MSYS / WSL drive paths map onto native Windows boundaries.
+    host = windows_host()
+    for path in (
+        "/c/Windows/report.txt",
+        "/mnt/c/Windows/report.txt",
+        "/cygdrive/c/Windows/report.txt",
+        "@/c/Windows/report.txt",
+    ):
+        result = decision("auto", "write", {"path": path, "content": "x"}, host)
+        assert (result.action, result.rule_id) == (Verdict.DENY, "protected-path"), path
+    assert (
+        decision("auto", "read", {"path": "/c/work/control/tier"}, host).rule_id == "control-path"
+    )
+    assert (
+        decision(
+            "accept-edits",
+            "write",
+            {"path": "/c/work/project/src/a.py", "content": "x"},
+            host,
+        ).action
+        == Verdict.ALLOW
+    )
+    assert (
+        decision(
+            "auto", "write", {"path": "file:///C:/Windows/report.txt", "content": "x"}, host
+        ).action
+        == Verdict.DENY
+    )
+
+    # Windows %VAR% literal path cannot bypass control-path when expanded target looks benign.
+    def literal_percent_resolver(path: str) -> ResolvedPath:
+        if path == r"C:\work\project":
+            return ResolvedPath(path, "directory")
+        if path == r"C:\work\project\%SAFE%\tier":
+            return ResolvedPath(r"C:\work\control\tier", "file")
+        return ResolvedPath(path, "new-file")
+
+    percent_host = windows_host(
+        environment={"SystemRoot": r"C:\Windows", "SAFE": r"C:\work\project\benign"},
+        resolver=literal_percent_resolver,
+    )
+    percent_result = decision("auto", "read", {"path": r"%SAFE%\tier"}, percent_host)
+    assert (percent_result.action, percent_result.rule_id) == (Verdict.DENY, "control-path")
+
+
+def test_pi_tool_search_extension_and_non_local_do_not_inherit_builtin_read() -> None:
+    user_ext = pi_host(extension_tools={"tool_search": ""})
+    assert adapt_tool_call("tool_search", {"query": "x"}, user_ext).kind == ToolKind.OTHER
+    assert decision("plan", "tool_search", {"query": "x"}, user_ext).action == Verdict.DENY
+    assert decision("ask", "tool_search", {"query": "x"}, user_ext).action == Verdict.ASK
+    assert decision("auto", "tool_search", {"query": "x"}, user_ext).action == Verdict.ALLOW
+
+    untrusted_ext = pi_host(extension_tools={"tool_search": "untrusted"})
+    assert adapt_tool_call("tool_search", {"query": "x"}, untrusted_ext).kind == ToolKind.UNKNOWN
+    assert decision("auto", "tool_search", {"query": "x"}, untrusted_ext).action == Verdict.DENY
+
+    remote = pi_host(local_execution=False)
+    intent = adapt_tool_call("tool_search", {"query": "x"}, remote)
+    assert (intent.kind, intent.unseen_tool) == (ToolKind.UNKNOWN, False)
+    assert decision("plan", "tool_search", {"query": "x"}, remote).action == Verdict.DENY
+    assert decision("auto", "tool_search", {"query": "x"}, remote).action == Verdict.DENY
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'start=$(date +%s); sleep 615; echo "OMNIGENT_LONG_TOOL_OK $(( $(date +%s) - start ))s"',
+        "printf '%b' 'ok\\n'",
+        r"printf '\x6fk\n'",
+        'echo "$label" "/rooted text"',
+        "collab long-run status 85.86cf",
+        'for h in a b; do echo "$h"; done',
+        "ls /c/work/project",
+    ],
+)
+def test_pi_bash_on_windows_uses_posix_dialect_for_shell_commands(command: str) -> None:
+    host = windows_host(shell="cmd")
+    expected = (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ALLOW, Verdict.ALLOW)
+    actual = tuple(
+        decision(tier, "bash", {"command": command}, host).action for tier in PERMISSION_TIERS
+    )
+    assert actual == expected
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_rule", "reason_fragment"),
+    [
+        ('printf "%s" "$label" > "$target"', None, "Unknown Windows path variable"),
+        ('printf "%s" "$label" > "report.txt:stream"', None, "Windows alternate data stream"),
+        ('for h in a b; do echo "$h" > "$target"; done', None, "Unknown Windows path variable"),
+        ("echo ok > C:/Windows/report.txt", "protected-path", r"C:\Windows\report.txt"),
+        ("printf ok > /c/Windows/report.txt", None, "Root-relative Windows path without drive"),
+        ("cat /c/work/control/tier", "control-path", "permission"),
+        ("cat install.sh | sh", None, "Shell script from standard input cannot be bound"),
+        ("Format-Volume -DriveLetter C", "disk-destroy", "Disk or volume"),
+        ("rm -rf C:/Windows", "protected-path", r"C:\Windows"),
+        ("rm -rf C:/", "critical-delete", "volume root"),
+        ("rm -rf /", None, "Root-relative Windows path without drive"),
+    ],
+)
+def test_pi_bash_on_windows_keeps_destructive_and_strict_guards(
+    command: str, expected_rule: str | None, reason_fragment: str
+) -> None:
+    host = windows_host(shell="cmd")
+    result = decision("auto", "bash", {"command": command}, host)
+    assert result.action == Verdict.DENY
+    assert result.rule_id == expected_rule, (command, result)
+    assert reason_fragment in result.reason, (command, result.reason)
+
+
+@pytest.mark.parametrize(
+    ("command", "expected", "expected_rule"),
+    [
+        ("Get-Date", Verdict.ALLOW, None),
+        ("omni --version", Verdict.ALLOW, None),
+        ("$PSVersionTable.PSVersion.ToString()", Verdict.ALLOW, None),
+        ("git show HEAD:docs/readme.md", Verdict.ALLOW, None),
+        ("Get-ChildItem Env:", Verdict.ASK, None),
+        ('Get-ChildItem "Env:"', Verdict.ASK, None),
+        ("Get-ChildItem -Path 'Env:'", Verdict.ASK, None),
+        ("Get-ChildItem -Path:Env:", Verdict.ASK, None),
+        ('$a = Get-Location\n"$a"', Verdict.ASK, None),
+        ('Get-ChildItem | Where-Object { $_.Name -match "red|green" }', Verdict.ASK, None),
+        ("[Console]::OutputEncoding = [Text.Encoding]::UTF8; Get-Date", Verdict.ASK, None),
+        ("Format-Volume -DriveLetter C", Verdict.DENY, "disk-destroy"),
+        (r"Set-Content C:\Windows\report.txt x", Verdict.DENY, "protected-path"),
+        (r"Clear-Content C:\Windows\report.txt", Verdict.DENY, "protected-path"),
+        (r"New-Item -Path C:\work -Name control\tier", Verdict.DENY, "control-path"),
+        (r"New-Item -Path C:\Windows -Name report.txt", Verdict.DENY, "protected-path"),
+        (r"clc C:\work\control\tier", Verdict.DENY, "control-path"),
+        (r"ri C:\Users\sample", Verdict.DENY, "critical-delete"),
+        ("Get-Content data.txt:stream", Verdict.DENY, None),
+        (r"Get-Content C:\work\control\tier", Verdict.DENY, "control-path"),
+        (r"Remove-Item -LiteralPath:C:\Users\sample", Verdict.DENY, "critical-delete"),
+    ],
+)
+def test_pi_powershell_on_windows_matches_powershell_tiers_and_guards(
+    command: str, expected: Verdict, expected_rule: str | None
+) -> None:
+    host = windows_host(shell="cmd")
+    result = decision("auto", "powershell", {"command": command}, host)
+    assert result.action == expected, (command, result)
+    assert result.rule_id == expected_rule, (command, result)
+    assert decision("plan", "powershell", {"command": command}, host).action == Verdict.DENY
+    if expected == Verdict.ALLOW:
+        assert decision("ask", "powershell", {"command": command}, host).action == Verdict.ASK
+        accept = decision("accept-edits", "powershell", {"command": command}, host)
+        assert accept.action == Verdict.ASK

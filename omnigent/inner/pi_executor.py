@@ -1598,7 +1598,11 @@ def _generate_extension_js(
         _rpc_permission_extension_setup(
             permission_bridge_dir,
             session_id,
-            list(plan_visible_tool_names(["read", *(tool["name"] for tool in descriptors)])),
+            list(
+                plan_visible_tool_names(
+                    ["read", "grep", "find", "ls", *(tool["name"] for tool in descriptors)]
+                )
+            ),
         )
         if permission_bridge_dir is not None and session_id is not None
         else ""
@@ -1659,7 +1663,9 @@ const net = require("net");
 
 const TOOLS = {tools_json};
 const BRIDGED = new Set();
-const PI_NATIVE_TOOLS = new Set(["read", "bash", "write", "edit"]);
+const PI_NATIVE_TOOLS = new Set([
+  "read", "bash", "powershell", "write", "edit", "grep", "find", "ls", "tool_search",
+]);
 const PORT = {port};
 const TOKEN = {token_json};
 const SCOPED_BOOTSTRAP = {json.dumps(scoped_bootstrap)};
@@ -1819,7 +1825,7 @@ module.exports = function(pi) {{
   for (const tool of TOOLS) {{
     // Pi passes tool.parameters directly to the LLM as JSON Schema, so we
     // can use the Omnigent schema as-is without TypeBox conversion.
-    if (typeof pi.registerTool !== "function") continue;
+    if (typeof pi.registerTool !== "function" || PI_NATIVE_TOOLS.has(tool.name)) continue;
     pi.registerTool({{
       name: tool.name,
       label: tool.name,

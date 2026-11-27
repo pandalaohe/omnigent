@@ -17,6 +17,7 @@ import os
 import re
 import shlex
 import stat
+import unicodedata
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
@@ -139,6 +140,7 @@ class ToolIntent:
     detail: str = ""
     workspace_path: ResolvedPath | None = None
     resolved_control_paths: tuple[str, ...] = ()
+    resolved_control_kinds: tuple[str, ...] = ()
     protected_exact_paths: tuple[str, ...] = ()
     protected_prefix_paths: tuple[str, ...] = ()
     command_paths: tuple[str, ...] = ()
@@ -192,7 +194,40 @@ _READABLE_CONTROL_DIRECTORIES = (".pi", ".agents")
 _AGENT_ROOT_PARTS = ((".pi",), (".pi", "agent"), (".agents",))
 # A file name carrying one of these can hold a key wherever it sits.
 _KEY_NAME_WORDS = ("auth", "credential", "secret", "token", "apikey", "accounts", "models")
-_RECURSIVE_READS = ("grep_search", "find_by_name")
+_RECURSIVE_READS = ("grep_search", "find_by_name", "grep", "find")
+_PI_OPTIONAL_READ_PATH = frozenset(("grep", "find", "ls"))
+_PI_PATH_TOOLS = frozenset(("read", "write", "edit", "grep", "find", "ls"))
+_PI_BUILTIN_TOOLS = frozenset(
+    ("read", "write", "edit", "bash", "powershell", "grep", "find", "ls", "tool_search")
+)
+_PI_UNICODE_SPACES = re.compile(r"[\u00A0\u2000-\u200A\u202F\u205F\u3000]")
+_PI_WINDOWS_SHELL_PATH = re.compile(r"^/(?:mnt/|cygdrive/)?([a-z])(?:/(.*))?$", re.IGNORECASE)
+_PI_AM_PM_SPACE = re.compile(r" (AM|PM)\.", re.IGNORECASE)
+_POWERSHELL_PROVIDER_PATH = re.compile(r"^(?:env|variable|function|alias):[^:]*$", re.IGNORECASE)
+_POWERSHELL_WRITE_CMDLETS = frozenset(
+    (
+        "set-content",
+        "sc",
+        "add-content",
+        "ac",
+        "out-file",
+        "clear-content",
+        "clc",
+        "new-item",
+        "ni",
+        "set-item",
+        "si",
+        "clear-item",
+        "cli",
+        "set-acl",
+        "set-itemproperty",
+        "sp",
+        "clear-itemproperty",
+        "clp",
+        "remove-itemproperty",
+        "rp",
+    )
+)
 # Shell words that read every file under their operand.
 _RECURSIVE_SHELL_READS = ("rg", "ag", "ack", "grep", "egrep", "fgrep", "find")
 _TRUSTED_VARIABLES = ("HOME", "TMPDIR")
@@ -200,7 +235,7 @@ _TRUSTED_VARIABLES = ("HOME", "TMPDIR")
 _MAX_CWDS = 4
 _COMMAND_WORDS = re.compile(r"[^\s'\"|;&()<>]+")
 # A delete stays refused while its target cannot be bound; other writes proceed.
-_DELETE_COMMANDS = ("rm", "rmdir", "unlink", "del", "erase", "rd", "remove-item", "srm")
+_DELETE_COMMANDS = ("rm", "rmdir", "unlink", "del", "erase", "rd", "remove-item", "ri", "srm")
 _FIND_ACTIONS = (
     "-delete",
     "-exec",
@@ -278,7 +313,12 @@ _EDIT_PATH = {
     "replace_file_content": "TargetFile",
     "multi_replace_file_content": "TargetFile",
 }
-_EXEC_COMMAND = {"bash": "command", "sys_os_shell": "command", "run_command": "CommandLine"}
+_EXEC_COMMAND = {
+    "bash": "command",
+    "powershell": "command",
+    "sys_os_shell": "command",
+    "run_command": "CommandLine",
+}
 _READ_NO_PATH = frozenset(
     (
         "sys_session_list",
@@ -481,6 +521,7 @@ def plan_visible_tool_names(names: Iterable[str]) -> tuple[str, ...]:
     """
     allowed = {
         *_READ_PATH,
+        *_PI_OPTIONAL_READ_PATH,
         *_READ_NO_PATH,
         *_QUESTION_TOOLS,
         *_CONTROL_TOOLS,
@@ -703,6 +744,128 @@ def _required_text(arguments: Mapping[str, object], key: str) -> str:
     return value
 
 
+def _map_windows_shell_path(path: str) -> str:
+    """Convert Git Bash / MSYS / Cygwin / WSL drive paths to Windows drive paths."""
+    if not path.startswith("/") or path.startswith("//") or "\\" in path:
+        return path
+    match = _PI_WINDOWS_SHELL_PATH.match(path)
+    if not match:
+        return path
+    drive = match.group(1).upper()
+    suffix = (match.group(2) or "").replace("/", "\\")
+    return f"{drive}:\\{suffix}"
+
+
+def _normalize_pi_path(path: str, *, windows: bool) -> str:
+    """Mirror Pi's resolveToCwd preprocessing before host path binding."""
+    normalized = _PI_UNICODE_SPACES.sub(" ", path).removeprefix("@")
+    if windows:
+        normalized = _map_windows_shell_path(normalized)
+    if normalized.lower().startswith("file://"):
+        raise ValueError("File URI paths are not supported")
+    if not normalized:
+        raise ValueError("Missing path")
+    return normalized
+
+
+def _lexical_pi_path(path: str, context: TrustedHostContext) -> str:
+    """Match Node path.resolve lexical dot-segment collapse before symlink resolution."""
+    windows = context.platform == "windows"
+    normalized = _normalize_pi_path(path, windows=windows)
+    absolute = _absolute(normalized, context)
+    if windows:
+        return ntpath.normpath(absolute)
+    collapsed = os.path.normpath(absolute)
+    return "/" + collapsed.lstrip("/") if collapsed.startswith("//") else collapsed
+
+
+def _pi_read_fallback_variants(path: str) -> tuple[str, ...]:
+    """Mirror Pi's resolveReadPath fallback order when the initial spelling is absent."""
+    nfd = unicodedata.normalize("NFD", path)
+    candidates = (
+        _PI_AM_PM_SPACE.sub("\u202f\\1.", path),
+        nfd,
+        path.replace("'", "\u2019"),
+        nfd.replace("'", "\u2019"),
+    )
+    return tuple(dict.fromkeys(variant for variant in candidates if variant != path))
+
+
+def _resolve_literal_windows_pi_path(normalized: str, context: TrustedHostContext) -> ResolvedPath:
+    """Resolve a Windows Pi path literally (without %VAR% expansion), matching Pi 1.5.0."""
+    path = normalized.replace("/", "\\")
+    if path == "~" or path.startswith("~\\"):
+        path = ntpath.join(context.home, path[2:] if path != "~" else "")
+    drive, tail = ntpath.splitdrive(path)
+    if drive and len(drive) == 2 and not tail.startswith("\\"):
+        current = context.drive_cwds.get(drive.upper())
+        if not current:
+            raise ValueError("Missing drive cwd")
+        path = ntpath.join(current, tail)
+    elif not drive and not path.startswith("\\\\"):
+        path = ntpath.join(context.cwd, path)
+    literal = ntpath.normpath(path)
+    result = context.resolver(literal)
+    if not isinstance(result, ResolvedPath) or result.kind not in (
+        "file",
+        "new-file",
+        "directory",
+        "unknown",
+    ):
+        raise ValueError("Invalid host path resolution")
+    if not ntpath.isabs(result.path):
+        raise ValueError("Host resolution returned a relative path")
+    return ResolvedPath(ntpath.normpath(result.path), result.kind)
+
+
+def _resolve_pi_path(
+    path: str, context: TrustedHostContext, *, read_fallbacks: bool = False
+) -> tuple[ResolvedPath, str, ResolvedPath | None]:
+    """Bind both OS and Pi lexical/fallback targets so neither resolution can bypass a guard."""
+    windows = context.platform == "windows"
+    normalized = _normalize_pi_path(path, windows=windows)
+    physical = _resolve(normalized, context)
+    lexical = _lexical_pi_path(path, context)
+    lexical_resolved = _resolve(lexical, context)
+    if windows and "%" in normalized:
+        literal_resolved = _resolve_literal_windows_pi_path(normalized, context)
+        if literal_resolved != physical:
+            lexical_resolved = literal_resolved
+            lexical = literal_resolved.path
+    if read_fallbacks and lexical_resolved.kind == "new-file":
+        for variant in _pi_read_fallback_variants(lexical):
+            candidate = _resolve(variant, context)
+            if candidate.kind != "new-file":
+                lexical_resolved = candidate
+                lexical = variant
+                break
+    alternate = lexical_resolved if lexical_resolved != physical else None
+    return physical, lexical, alternate
+
+
+def _validate_optional_number(
+    arguments: Mapping[str, object],
+    key: str,
+    *,
+    allow_zero: bool = False,
+    integer_only: bool = False,
+) -> None:
+    if key not in arguments:
+        return
+    value = arguments[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"Invalid {key}")
+    if (value < 0 if allow_zero else value <= 0) or (
+        integer_only and isinstance(value, float) and not value.is_integer()
+    ):
+        raise ValueError(f"Invalid {key}")
+
+
+def _validate_optional_bool(arguments: Mapping[str, object], key: str) -> None:
+    if key in arguments and not isinstance(arguments[key], bool):
+        raise ValueError(f"Invalid {key}")
+
+
 def _command_text(command: str) -> str:
     chunks = [command]
     current = [command]
@@ -858,14 +1021,52 @@ def _adapt_unbound_call(
             )
         if name in _READ_PATH:
             path = _required_text(arguments, _READ_PATH[name])
+            if name in _PI_PATH_TOOLS:
+                target, bound_text, alternate = _resolve_pi_path(
+                    path, context, read_fallbacks=(name == "read")
+                )
+            else:
+                target, bound_text, alternate = _resolve(path, context), path, None
             return ToolIntent(
                 ToolKind.READ,
                 name,
                 digest,
                 context,
-                target=_resolve(path, context),
-                target_text=path,
+                target=target,
+                source=alternate,
+                target_text=bound_text,
             )
+        if name in _PI_OPTIONAL_READ_PATH:
+            if name in ("grep", "find"):
+                _required_text(arguments, "pattern")
+            if name == "grep":
+                if "glob" in arguments and not isinstance(arguments["glob"], str):
+                    raise ValueError("Invalid glob")
+                _validate_optional_bool(arguments, "ignoreCase")
+                _validate_optional_bool(arguments, "literal")
+                _validate_optional_number(arguments, "context", allow_zero=True)
+            _validate_optional_number(arguments, "limit")
+            if "path" not in arguments or arguments["path"] == "":
+                path = "."
+            elif isinstance(arguments["path"], str):
+                path = arguments["path"]
+            else:
+                raise ValueError("Invalid path")
+            target, bound_text, alternate = _resolve_pi_path(path, context)
+            return ToolIntent(
+                ToolKind.READ,
+                name,
+                digest,
+                context,
+                target=target,
+                source=alternate,
+                target_text=bound_text,
+            )
+        if name == "tool_search":
+            if not re.sub(r"[\s\ufeff]+", "", _required_text(arguments, "query")):
+                raise ValueError("Empty tool_search query")
+            _validate_optional_number(arguments, "limit", integer_only=True)
+            return ToolIntent(ToolKind.READ, name, digest, context, detail="tool-search")
         if name in _EDIT_PATH:
             if name in ("write", "sys_os_write") and not isinstance(arguments.get("content"), str):
                 raise ValueError("Missing content")
@@ -883,16 +1084,26 @@ def _adapt_unbound_call(
                     raise ValueError("Missing or malformed edit content")
                 if edits is not None and not batch:
                     raise ValueError("Malformed batch edit content")
+            path = _required_text(arguments, _EDIT_PATH[name])
+            if name in _PI_PATH_TOOLS:
+                target, _, alternate = _resolve_pi_path(path, context)
+            else:
+                target, alternate = _resolve(path, context), None
             return ToolIntent(
                 ToolKind.EDIT,
                 name,
                 digest,
                 context,
-                target=_resolve(_required_text(arguments, _EDIT_PATH[name]), context),
+                target=target,
+                source=alternate,
             )
         if name in _EXEC_COMMAND:
             target = None
-            if name == "run_command":
+            if name == "bash" and context.platform == "windows" and not _windows_posix(context):
+                context = replace(context, shell="bash")
+            elif name == "powershell" and context.platform == "windows":
+                context = replace(context, shell="pwsh")
+            elif name == "run_command":
                 if context.platform == "windows":
                     context = replace(context, shell="pwsh")
                 if arguments.get("RunPersistent") or arguments.get("RequestedTerminalID"):
@@ -1025,14 +1236,24 @@ def adapt_tool_call(
         workspace = _resolve(context.workspace, context)
         if workspace.kind != "directory":
             raise ValueError("Workspace cannot be confirmed")
-        controls = tuple(_resolve(path, context).path for path in context.control_paths)
+        resolved_controls = tuple(_resolve(path, context) for path in context.control_paths)
+        controls = tuple(item.path for item in resolved_controls)
+        control_kinds = tuple(item.kind for item in resolved_controls)
         exact, prefixes = _protected_paths(context)
-        agy_powershell = bool(
-            intent.command and intent.name == "run_command" and context.platform == "windows"
+        powershell_command = bool(
+            intent.command
+            and intent.name in ("run_command", "powershell")
+            and context.platform == "windows"
         )
-        version_query = agy_powershell and is_powershell_version_query(intent.command)
+        version_query = powershell_command and is_powershell_version_query(intent.command)
+        provider_seen: list[bool] = []
         paths, recursive_paths = (
-            _command_paths(intent.command, intent.context, agy_powershell=agy_powershell)
+            _command_paths(
+                intent.command,
+                intent.context,
+                agy_powershell=powershell_command,
+                provider_seen=provider_seen,
+            )
             if intent.command and not version_query
             else ((), ())
         )
@@ -1040,13 +1261,14 @@ def adapt_tool_call(
             intent,
             workspace_path=workspace,
             resolved_control_paths=controls,
+            resolved_control_kinds=control_kinds,
             protected_exact_paths=tuple(_resolve(path, context).path for path in exact),
             protected_prefix_paths=tuple(_resolve(path, context).path for path in prefixes),
             command_paths=paths,
             recursive_read_paths=recursive_paths,
-            command_uncertain=agy_powershell
+            command_uncertain=powershell_command
             and not version_query
-            and bool(re.search(r"[$`]|\[[\w.]+\]::", intent.command)),
+            and (bool(re.search(r"[$`]|\[[\w.]+\]::", intent.command)) or bool(provider_seen)),
         )
         if not intent.command:
             return bound
@@ -1690,6 +1912,30 @@ def _sed_script_writes(script: str) -> bool:
     return False
 
 
+def _posix_raw_has_escape(raw: str) -> bool:
+    """True when a POSIX token uses a backslash that changes shell lexing."""
+    quote = ""
+    index = 0
+    while index < len(raw):
+        char = raw[index]
+        if quote == "'":
+            if char == "'":
+                quote = ""
+        elif quote == '"':
+            if char == "\\":
+                if index + 1 >= len(raw) or raw[index + 1] in ("\\", '"', "$", "`", "\n"):
+                    return True
+                index += 1
+            elif char == '"':
+                quote = ""
+        elif char == "\\":
+            return True
+        elif char in ("'", '"'):
+            quote = char
+        index += 1
+    return False
+
+
 def _windows_path_operands(
     tokens: list[str], raw_tokens: list[str], shell: str, *, posix_executor: bool
 ) -> list[str]:
@@ -1697,8 +1943,9 @@ def _windows_path_operands(
     dialect = _command_name(shell)
     if posix_executor and dialect in _HEREDOC_SHELLS:
         offset = 0
-        while offset < len(raw_tokens) and re.match(
-            r"[A-Za-z_][A-Za-z0-9_]*=", raw_tokens[offset]
+        while offset < len(raw_tokens) and (
+            raw_tokens[offset] in _COMMAND_LEADS
+            or re.match(r"[A-Za-z_][A-Za-z0-9_]*=", raw_tokens[offset])
         ):
             offset += 1
         tokens, raw_tokens = tokens[offset:], raw_tokens[offset:]
@@ -1720,7 +1967,7 @@ def _windows_path_operands(
     if dialect not in ("pwsh", "powershell", "cmd", *_HEREDOC_SHELLS) or any(
         any(char in raw for char in "$`^!{}\r\n")
         or (dialect == "cmd" and any(char in raw for char in "%'"))
-        or (dialect in _HEREDOC_SHELLS and "\\" in raw)
+        or (dialect in _HEREDOC_SHELLS and _posix_raw_has_escape(raw))
         for raw in raw_tokens
     ):
         return conservative
@@ -1889,6 +2136,7 @@ def _windows_command_paths(
     posix_executor: bool,
     assigned: frozenset[str] = frozenset(),
     agy_powershell: bool = False,
+    provider_seen: list[bool] | None = None,
 ) -> tuple[str, ...]:
     if depth > 3:
         raise ValueError("Shell wrapper nesting cannot be checked")
@@ -1925,7 +2173,8 @@ def _windows_command_paths(
     ]
     segments: list[list[str]] = [[]]
     raw_segments: list[list[str]] = [[]]
-    candidates = []
+    candidates: list[str] = []
+    redirect_candidates: list[str] = []
     index = 0
     while index < len(tokens):
         raw = raw_tokens[index]
@@ -1937,7 +2186,7 @@ def _windows_command_paths(
             index += 1
             if index == len(tokens) or re.fullmatch(r"[;&|<>()\n]+", raw_tokens[index]):
                 raise ValueError("Missing shell redirection target")
-            candidates.append(tokens[index])
+            redirect_candidates.append(tokens[index])
         else:
             segments[-1].append(tokens[index])
             raw_segments[-1].append(raw)
@@ -1978,6 +2227,8 @@ def _windows_command_paths(
                     depth + 1,
                     posix_executor=posix_executor,
                     assigned=assigned,
+                    agy_powershell=agy_powershell and shell in ("powershell", "pwsh"),
+                    provider_seen=provider_seen,
                 )
             )
             candidates.extend(
@@ -2032,8 +2283,10 @@ def _windows_command_paths(
                     segment, raw_segment, context.shell, posix_executor=posix_executor
                 )
             )
-    for token in candidates:
-        if token:
+    for is_redirect, group in ((True, redirect_candidates), (False, candidates)):
+        for token in group:
+            if not token:
+                continue
             try:
                 expanded = _expand_trusted(token, context, assigned)
             except _UnresolvedWindowsVariable:
@@ -2052,6 +2305,13 @@ def _windows_command_paths(
                     continue
                 raise _UnresolvedWindowsVariable(f"Unresolved Windows path variable: {token}")
             token = expanded
+            if not is_redirect:
+                if agy_powershell and _POWERSHELL_PROVIDER_PATH.match(token):
+                    if provider_seen is not None:
+                        provider_seen.append(True)
+                    continue
+                if windows_posix:
+                    token = _map_windows_shell_path(token)
             paths.append(_resolve(token, context).path)
     return tuple(paths)
 
@@ -2231,6 +2491,7 @@ def _command_paths(
     powershell: bool = False,
     depth: int = 0,
     agy_powershell: bool = False,
+    provider_seen: list[bool] | None = None,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Bind direct path operands; this does not interpret scripts or terminal state."""
     if depth > 3:
@@ -2242,6 +2503,7 @@ def _command_paths(
             depth,
             posix_executor=_windows_posix(context),
             agy_powershell=agy_powershell,
+            provider_seen=provider_seen,
         ), ()
     command = command.replace("\\\n", "")
     tokens, _raw = _write_tokens(command, windows=powershell)
@@ -2904,7 +3166,7 @@ def _write_operands(
                     conservative[index] = attached[1]
                     arguments[index - offset - 1] = "-t" + attached[1]
         operands = [value for value in arguments if value and not value.startswith("-")]
-        if command in ("cp", "copy", "copy-item", "install", "ln"):
+        if command in ("cp", "copy", "copy-item", "cpi", "install", "ln"):
             if offset and command not in ("install", "ln"):
                 return conservative
             options = arguments
@@ -2916,13 +3178,13 @@ def _write_operands(
             for index, value in enumerate(options):
                 if (
                     command in ("cp", "install", "ln") and value in ("-t", "--target-directory")
-                ) or (command == "copy-item" and value.lower() == "-destination"):
+                ) or (command in ("copy-item", "cpi") and value.lower() == "-destination"):
                     return options[index + 1 : index + 2] or conservative
                 if command in ("cp", "install", "ln") and value.startswith("--target-directory="):
                     return [value.split("=", 1)[1]]
                 if command in ("cp", "install", "ln") and value.startswith("-t") and value != "-t":
                     return [value[2:]]
-                if command == "copy-item" and value.lower().startswith("-destination:"):
+                if command in ("copy-item", "cpi") and value.lower().startswith("-destination:"):
                     return [value.split(":", 1)[1]]
             if any(
                 value.startswith("-") and value not in ("-T", "--no-target-directory", "--")
@@ -2930,14 +3192,37 @@ def _write_operands(
             ):
                 return conservative
             return operands[-1:]
-        if command in ("set-content", "add-content", "out-file"):
+        if command in _POWERSHELL_WRITE_CMDLETS:
             if offset:
                 return conservative
+            base_target: str | None = None
+            item_name: str | None = None
             for index, value in enumerate(arguments):
-                if value.lower() in ("-path", "-literalpath", "-filepath"):
-                    return arguments[index + 1 : index + 2] or conservative
-                if value.lower().startswith(("-path:", "-literalpath:", "-filepath:")):
-                    return [value.split(":", 1)[1]]
+                lowered = value.lower()
+                if lowered in ("-path", "-literalpath", "-filepath"):
+                    if index + 1 >= len(arguments):
+                        return conservative
+                    base_target = arguments[index + 1]
+                elif lowered.startswith(("-path:", "-literalpath:", "-filepath:")):
+                    base_target = value.split(":", 1)[1]
+                elif command in ("new-item", "ni") and lowered == "-name":
+                    if index + 1 >= len(arguments):
+                        return conservative
+                    item_name = arguments[index + 1]
+                elif command in ("new-item", "ni") and lowered.startswith("-name:"):
+                    item_name = value.split(":", 1)[1]
+            if command in ("new-item", "ni") and item_name is not None:
+                if base_target is None:
+                    base_target = operands[0] if operands else "."
+                sep = "\\" if "\\" in base_target or "\\" in item_name else "/"
+                combined = (
+                    item_name
+                    if ntpath.isabs(item_name) or item_name.startswith("/")
+                    else base_target.rstrip("/\\") + sep + item_name.lstrip("/\\")
+                )
+                return [combined, base_target]
+            if base_target is not None:
+                return [base_target]
             return (
                 conservative if any(value.startswith("-") for value in arguments) else operands[:1]
             )
@@ -2980,7 +3265,13 @@ def _write_operands(
             "rmdir",
             "unlink",
             "remove-item",
+            "ri",
             "move-item",
+            "mi",
+            "move",
+            "rename-item",
+            "rni",
+            "ren",
         ):
             # The program name and options are not operands; after -- everything is.
             operands = conservative[offset + 1 :]
@@ -3146,6 +3437,8 @@ def _control_refusal(
     context: TrustedHostContext,
     windows: bool,
     reasons: tuple[str, str],
+    *,
+    control_kind: str = "",
 ) -> str:
     """Refuse writes and key-bearing reads; allow skills, notes and extensions."""
     control_reason, credential_reason = reasons
@@ -3173,20 +3466,37 @@ def _control_refusal(
             typed = _absolute(intent.target_text, context) if intent.target_text else ""
         except ValueError:
             typed = ""
-        for path in dict.fromkeys((typed or target.path, target.path)):
-            if not (
-                _under(path, control, windows) or (recursive and _under(control, path, windows))
-            ):
+        home_control = any(
+            _under(control, joined(context.home, name), windows)
+            for name in _READABLE_CONTROL_DIRECTORIES
+        )
+        workspace = intent.workspace_path.path if intent.workspace_path is not None else ""
+        check_paths = [typed or target.path, target.path]
+        if intent.source is not None:
+            check_paths.append(intent.source.path)
+        for path in dict.fromkeys(check_paths):
+            under_control = _under(path, control, windows)
+            covers_control = recursive and _under(control, path, windows)
+            if not (under_control or covers_control):
                 continue
             if not readable:
                 return control_reason
+            if (
+                intent.name in ("grep", "find")
+                and control_kind == "new-file"
+                and not under_control
+                and not home_control
+                and workspace
+                and _under(control, workspace, windows)
+                and _under(path, workspace, windows)
+            ):
+                continue
             if _key_read(path, roots, windows, covers=recursive):
                 return _credential_refusal(credential_reason, path)
         return ""
     if not intent.command:
-        return (
-            control_reason if target is not None and _under(target.path, control, windows) else ""
-        )
+        targets = [p.path for p in (target, intent.source) if p is not None]
+        return control_reason if any(_under(p, control, windows) for p in targets) else ""
     mentioned = any(
         _mentions_path(intent.command, form, context)
         for form in (control, _absolute(original, context))
@@ -3368,28 +3678,43 @@ def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -
         ):
             raise ValueError("Missing trusted Windows system root")
         target = intent.target
-        if target is not None and target.kind == "unknown":
+        if (target is not None and target.kind == "unknown") or (
+            intent.source is not None and intent.source.kind == "unknown"
+        ):
             return TierDecision(Verdict.DENY, "Target type or final path cannot be confirmed")
         if intent.workspace_path is None or not intent.resolved_control_paths:
             raise ValueError("Missing bound host paths")
-        for original, path in zip(
-            context.control_paths, intent.resolved_control_paths, strict=True
+        control_kinds = (
+            intent.resolved_control_kinds
+            if len(intent.resolved_control_kinds) == len(intent.resolved_control_paths)
+            else ("",) * len(intent.resolved_control_paths)
+        )
+        for original, path, control_kind in zip(
+            context.control_paths, intent.resolved_control_paths, control_kinds, strict=True
         ):
             refusal = _control_refusal(
-                intent, path, original, context, windows, (control_reason, credential_reason)
+                intent,
+                path,
+                original,
+                context,
+                windows,
+                (control_reason, credential_reason),
+                control_kind=control_kind,
             )
             if refusal:
                 return TierDecision(Verdict.DENY, refusal, "control-path")
         if intent.unbound_write:
             return TierDecision(Verdict.DENY, intent.detail, "unbound-write")
         if intent.kind == ToolKind.EDIT and target is not None:
-            is_protected = target.path in intent.protected_exact_paths or any(
-                _under(target.path, value, windows) for value in intent.protected_prefix_paths
-            )
-            if is_protected and tier == "auto":
-                return TierDecision(
-                    Verdict.DENY, f"{protected_reason}: {target.path}", "protected-path"
+            for bound_target in (p for p in (target, intent.source) if p is not None):
+                is_protected = bound_target.path in intent.protected_exact_paths or any(
+                    _under(bound_target.path, value, windows)
+                    for value in intent.protected_prefix_paths
                 )
+                if is_protected and tier == "auto":
+                    return TierDecision(
+                        Verdict.DENY, f"{protected_reason}: {bound_target.path}", "protected-path"
+                    )
         if intent.kind == ToolKind.EXEC and tier == "auto":
             for candidate in intent.command_write_paths:
                 if any(
@@ -3407,6 +3732,8 @@ def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -
                 if pattern.search(intent.command):
                     explanation = _explanation(intent.command, context.platform, rules.signatures)
                     return TierDecision(Verdict.DENY, f"{name}: {explanation or reason}", rule_id)
+        if intent.detail == "tool-search" and tier == "plan":
+            return TierDecision(Verdict.DENY, "Plan tier cannot activate deferred tools")
         if intent.kind in (ToolKind.READ, ToolKind.DELEGATE) or intent.detail in (
             "framework-question",
             "framework-control",
@@ -3431,11 +3758,15 @@ def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -
         if tier == "ask":
             return TierDecision(Verdict.ASK, "This tool call needs one-time approval")
         if tier == "accept-edits":
+            bound_targets = tuple(p for p in (target, intent.source) if p is not None)
             if (
                 intent.kind == ToolKind.EDIT
                 and target
-                and target.kind in ("file", "new-file")
-                and _under(target.path, intent.workspace_path.path, windows)
+                and all(
+                    item.kind in ("file", "new-file")
+                    and _under(item.path, intent.workspace_path.path, windows)
+                    for item in bound_targets
+                )
             ):
                 return TierDecision(Verdict.ALLOW)
             return TierDecision(Verdict.ASK, "This tool call needs one-time approval")

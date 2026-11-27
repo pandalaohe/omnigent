@@ -23,6 +23,7 @@ from omnigent.permission_tiers import (
     _under,
     adapt_tool_call,
     decide_tier,
+    is_powershell_version_query,
     load_rules,
     normalize_permission_tier,
     resolve_local_path,
@@ -167,8 +168,13 @@ def evaluate_host_tool(
         if state.tier == "full":
             return TierDecision(Verdict.ALLOW)
         context = local_host_context(state, control_paths=control_paths)
-        if name == "sys_os_shell" and context.platform == "windows" and local_execution:
-            context = replace(context, shell=windows_os_env_shell_path())
+        if context.platform == "windows" and local_execution:
+            if name == "sys_os_shell":
+                context = replace(context, shell=windows_os_env_shell_path())
+            elif name == "bash":
+                context = replace(context, shell="bash")
+            elif name == "powershell":
+                context = replace(context, shell="pwsh")
         if extension_tools is not None:
             context = replace(context, extension_tools=extension_tools)
         context = replace(
@@ -190,15 +196,26 @@ def evaluate_host_tool(
             intent.kind == ToolKind.EDIT
             and intent.target is not None
             and intent.workspace_path is not None
-            and not _under(
-                intent.target.path, intent.workspace_path.path, context.platform == "windows"
+            and any(
+                not _under(bound.path, intent.workspace_path.path, context.platform == "windows")
+                for bound in (intent.target, intent.source)
+                if bound is not None
             )
         ):
             return TierDecision(Verdict.ASK, "Writing outside the workspace requires approval")
-        if intent.kind == ToolKind.EXEC and name in ("bash", "sys_os_shell"):
+        if intent.kind == ToolKind.EXEC and name in ("bash", "powershell", "sys_os_shell"):
             from omnigent.server.child_approvals import floor
 
-            if floor({"tool_name": name, "command": arguments.get("command")}) == "user_only":
+            command = arguments.get("command")
+            if (
+                not (
+                    name == "powershell"
+                    and context.platform == "windows"
+                    and isinstance(command, str)
+                    and is_powershell_version_query(command)
+                )
+                and floor({"tool_name": name, "command": command}) == "user_only"
+            ):
                 return TierDecision(Verdict.ASK, "Command requires user approval")
         return decision
     except Exception as exc:  # noqa: BLE001 - failures never become execution permission

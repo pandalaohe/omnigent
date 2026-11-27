@@ -25,6 +25,7 @@ class PiToolRegistry:
     registration_digest: str | None = None
     native_tools: dict[str, str] = field(default_factory=dict)
     bridge_tools: frozenset[str] = frozenset()
+    builtin_tools: frozenset[str] = frozenset()
     unsupported_tools: frozenset[str] = frozenset()
 
 
@@ -201,6 +202,7 @@ def read_pi_tool_registry(
         invalid: set[str] = set()
         native_tools: dict[str, str] = {}
         bridge_tools: set[str] = set()
+        builtin_tools: set[str] = set()
         unsupported: set[str] = set()
         native_packages: dict[str, str] = {}
         for tool in tools:
@@ -226,6 +228,7 @@ def read_pi_tool_registry(
                     path == f"builtin:{name}"
                     or (name, path) == ("tool_search", "builtin:tool-search")
                 ):
+                    builtin_tools.add(name)
                     continue
                 if path in (str(guard), "<inline:omnigent-permission>"):
                     bridge_tools.add(name)
@@ -392,6 +395,7 @@ def read_pi_tool_registry(
             ),
             native_tools=native_tools,
             bridge_tools=frozenset(bridge_tools),
+            builtin_tools=frozenset(builtin_tools),
             unsupported_tools=frozenset(unsupported),
         )
     except (OSError, ValueError, KeyError, TypeError, RuntimeError):

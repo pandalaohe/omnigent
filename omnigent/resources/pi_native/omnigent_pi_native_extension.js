@@ -2406,7 +2406,7 @@ module.exports = function (pi) {
   // policies, double-prompt. Pi's OWN built-in tools (read/shell/etc) are not
   // in this set and stay gated by the hook below.
   const bridgedTools = new Set();
-  const piNativeTools = new Set(["read", "bash", "write", "edit"]);
+  const piNativeTools = new Set(["read", "bash", "powershell", "write", "edit", "grep", "find", "ls", "tool_search"]);
   const permittedNativeCalls = new Map();
   async function finishNativePermissionCall(callId, event) {
     if (typeof callId !== "string") return;
@@ -2427,7 +2427,7 @@ module.exports = function (pi) {
     for (const tool of config.tools) {
       if (!tool || typeof tool !== "object") continue;
       const name = typeof tool.name === "string" ? tool.name : "";
-      if (!name) continue;
+      if (!name || piNativeTools.has(name)) continue;
       const description =
         typeof tool.description === "string" ? tool.description : "";
       const parameters =

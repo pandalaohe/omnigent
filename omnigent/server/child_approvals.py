@@ -463,6 +463,48 @@ _FLOOR_CLASSES: dict[
     "git config injection and discards": (frozenset({"git"}), (), _git_user_only),
 }
 
+_POWERSHELL_USER_ONLY_CMDLETS = frozenset(
+    {
+        "clear-content",
+        "clc",
+        "set-content",
+        "sc",
+        "add-content",
+        "ac",
+        "out-file",
+        "remove-item",
+        "ri",
+        "move-item",
+        "mi",
+        "move",
+        "copy-item",
+        "cpi",
+        "rename-item",
+        "rni",
+        "ren",
+        "new-item",
+        "ni",
+        "set-item",
+        "si",
+        "clear-item",
+        "cli",
+        "set-acl",
+        "set-itemproperty",
+        "sp",
+        "clear-itemproperty",
+        "clp",
+        "remove-itemproperty",
+        "rp",
+        "invoke-expression",
+        "iex",
+        "start-process",
+        "saps",
+        "invoke-command",
+        "icm",
+        "set-executionpolicy",
+    }
+)
+
 
 def _command_is_user_only(command: str) -> bool:
     if "$" in command or "`" in command:
@@ -476,6 +518,8 @@ def _command_is_user_only(command: str) -> bool:
             if index >= len(argv):
                 return True
             name = (PurePosixPath(argv[index]).name or argv[index]).removesuffix(".exe")
+            if name.lower() in _POWERSHELL_USER_ONLY_CMDLETS:
+                return True
             args = argv[index + 1 :]
             if any(
                 check(name, args, piped)

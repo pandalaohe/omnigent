@@ -29,6 +29,7 @@ SHELL_TOOLS: frozenset[str] = frozenset(
         "sys_os_shell",  # Omnigent built-in (SDK harnesses)
         "Bash",  # Claude Code / Codex native
         "bash",  # pi / opencode native
+        "powershell",  # pi native on Windows
         "Shell",  # Cursor
         "terminal",  # Hermes
         "developer__shell",  # Goose
