@@ -1,5 +1,10 @@
-import type { ConnectionState } from "@/components/blocks/TerminalSession";
-import type { TerminalInfo } from "@/hooks/useTerminals";
+import {
+  type ConnectionState,
+  isTerminalProcessExitedClose,
+  isUnexpectedTerminalClose,
+  WS_CLOSE_WRONG_REPLICA,
+} from "@/lib/terminalCloseCodes";
+import { terminalLaunchMode, type TerminalInfo } from "@/lib/terminals";
 import { cn } from "@/lib/utils";
 
 /**
@@ -9,13 +14,24 @@ import { cn } from "@/lib/utils";
  * WebSocket bridge state and activity timestamps are only known for
  * mounted terminals.
  */
-export type TerminalStatus = "active" | "idle" | "connecting" | "error" | "closed";
+export type TerminalStatus =
+  | "active"
+  | "idle"
+  | "connecting"
+  | "reconnecting"
+  | "disconnected"
+  | "error"
+  | "exited"
+  | "closed";
 
 export const STATUS_CONFIG: Record<TerminalStatus, { label: string; className: string }> = {
   active: { label: "Active", className: "bg-emerald-500" },
   idle: { label: "Idle", className: "bg-muted-foreground/55" },
   connecting: { label: "Connecting", className: "bg-amber-500 animate-pulse" },
+  reconnecting: { label: "Reconnecting", className: "bg-amber-500 animate-pulse" },
+  disconnected: { label: "Disconnected", className: "bg-amber-500" },
   error: { label: "Error", className: "bg-red-500" },
+  exited: { label: "Exited", className: "bg-black dark:bg-white" },
   closed: { label: "Closed", className: "bg-black dark:bg-white" },
 };
 
@@ -52,10 +68,24 @@ export function deriveTerminalStatus(
   connectionState: ConnectionState | null,
   isActive = false,
 ): TerminalStatus {
-  if (connectionState?.kind === "closed") return "closed";
+  const launching = terminalLaunchMode(terminal.id) !== null;
+  if (!terminal.running && !launching) return "exited";
+  if (connectionState?.kind === "closed") {
+    if (launching && isTerminalProcessExitedClose(connectionState.code)) return "connecting";
+    if (isTerminalProcessExitedClose(connectionState.code)) return "exited";
+    if (connectionState.reconnecting) return "reconnecting";
+    if (
+      isUnexpectedTerminalClose(connectionState.code) ||
+      connectionState.code === WS_CLOSE_WRONG_REPLICA
+    ) {
+      return "disconnected";
+    }
+    return "closed";
+  }
   if (connectionState?.kind === "error") return "error";
-  if (connectionState?.kind === "connecting") return "connecting";
-  if (!terminal.running) return "closed";
+  if (connectionState?.kind === "connecting") {
+    return connectionState.reconnecting ? "reconnecting" : "connecting";
+  }
   if (isActive) return "active";
   return "idle";
 }

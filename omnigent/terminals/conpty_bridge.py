@@ -19,6 +19,7 @@ from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_NOT_FOUND,
     _coalesce_limit_after_input,
     _forward_terminal_to_ws,
+    make_terminal_pong_frame,
 )
 
 if TYPE_CHECKING:
@@ -130,6 +131,11 @@ async def bridge_conpty_to_websocket(
                     continue
                 if not isinstance(frame, dict):
                     continue
+                pong = make_terminal_pong_frame(frame)
+                if pong is not None:
+                    async with send_lock:
+                        await websocket.send_text(pong)
+                    continue
                 if frame.get("type") == "host-clipboard-read":
                     await host_clipboard.handle(frame)
                     continue
@@ -172,5 +178,6 @@ async def bridge_conpty_to_websocket(
             if instance._exit_done.is_set()
             else 1000
         )
+        reason = "terminal process exited" if code == WS_CLOSE_TERMINAL_NOT_FOUND else ""
         with contextlib.suppress(RuntimeError, WebSocketDisconnect):
-            await websocket.close(code=code)
+            await websocket.close(code=code, reason=reason)

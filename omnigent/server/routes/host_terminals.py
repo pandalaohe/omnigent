@@ -46,7 +46,9 @@ def create_host_terminals_router(
 ) -> APIRouter:
     router = APIRouter(route_class=TerminalRefusalRoute)
 
-    async def authorize(connection: Request | WebSocket) -> tuple[Host, HostConnection]:
+    async def authorize(
+        connection: Request | WebSocket, *, for_attach: bool = False
+    ) -> tuple[Host, HostConnection]:
         user = require_user(connection, auth_provider)
         try:
             require_terminal_browser_session(connection, auth_provider)
@@ -70,7 +72,12 @@ def create_host_terminals_router(
             raise OmnigentError("host is on another replica", code=ErrorCode.WRONG_REPLICA)
         conn = service.hosts.get(host.host_id)
         if conn is None:
-            raise host_absent_error(host)
+            err = host_absent_error(host)
+            if for_attach and err.code == ErrorCode.CONFLICT:
+                raise OmnigentError(
+                    "host daemon is reconnecting", code=ErrorCode.RUNNER_UNAVAILABLE
+                ) from err
+            raise err
         if CAP_HOST_TERMINALS not in conn.hello.capabilities:
             raise OmnigentError("host terminals are not supported", code=ErrorCode.CONFLICT)
         return host, conn
@@ -153,15 +160,19 @@ def create_host_terminals_router(
     @router.websocket("/hosts/{host_id}/terminals/{terminal_id}/attach")
     async def attach(websocket: WebSocket, terminal_id: str) -> None:
         try:
-            host, conn = await authorize(websocket)
+            host, conn = await authorize(websocket, for_attach=True)
             if websocket.query_params.get("read_only", "false").lower() != "false":
                 raise TerminalAccessDenied(
                     "admin_not_allowed", "host terminal watchers are not supported"
                 )
             runner_id = await service.runner(host, conn, launch=False)
-            session = service.tunnels.get(runner_id) if runner_id is not None else None
-            if session is None:
+            if runner_id is None:
                 raise OmnigentError("terminal not found", code=ErrorCode.NOT_FOUND)
+            session = service.tunnels.get(runner_id)
+            if session is None:
+                raise OmnigentError(
+                    "terminal runner is reconnecting", code=ErrorCode.RUNNER_UNAVAILABLE
+                )
         except (OmnigentError, HTTPException) as exc:
             if isinstance(exc, HTTPException) or exc.code in (
                 ErrorCode.FORBIDDEN,
@@ -173,6 +184,7 @@ def create_host_terminals_router(
             code = {
                 ErrorCode.WRONG_REPLICA: 4400,
                 ErrorCode.NOT_FOUND: 4404,
+                ErrorCode.RUNNER_UNAVAILABLE: 1013,
                 ErrorCode.FORBIDDEN: 4403,
                 ErrorCode.UNAUTHORIZED: 4403,
             }.get(exc.code, 4500)
@@ -193,6 +205,6 @@ def create_host_terminals_router(
                 await websocket.close(code=exc.code or 4500, reason=exc.reason or "")
         except (ConnectionError, RuntimeError):
             with contextlib.suppress(RuntimeError):
-                await websocket.close(code=4500, reason="terminal runner is reconnecting")
+                await websocket.close(code=1013, reason="terminal runner is reconnecting")
 
     return router

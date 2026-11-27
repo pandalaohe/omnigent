@@ -112,6 +112,7 @@ from omnigent.terminals.ws_common import (
     WS_CLOSE_INTERNAL_ERROR,
     WS_CLOSE_TERMINAL_NOT_FOUND,
     WS_CLOSE_WRONG_REPLICA,
+    parse_terminal_ping_reply,
 )
 from omnigent.util.websocket_logging import websocket_protocol_logger
 
@@ -562,6 +563,8 @@ async def _shuttle_ws_frames(
     """
     from websockets.exceptions import ConnectionClosed
 
+    browser_send_lock = asyncio.Lock()
+
     async def _browser_to_runner() -> None:
         try:
             while True:
@@ -572,10 +575,15 @@ async def _shuttle_ws_frames(
                 text = msg.get("text")
                 data = msg.get("bytes")
                 if text is not None:
+                    pong = parse_terminal_ping_reply(text)
+                    if pong is not None:
+                        async with browser_send_lock:
+                            await browser_ws.send_text(pong)
+                        continue
                     await runner_ws.send(text)  # type: ignore[attr-defined]
                 elif data is not None:
                     await runner_ws.send(data)  # type: ignore[attr-defined]
-        except WebSocketDisconnect:
+        except (WebSocketDisconnect, RuntimeError):
             return
         except ConnectionClosed:
             return
@@ -587,14 +595,16 @@ async def _shuttle_ws_frames(
                 msg = await runner_ws.recv()  # type: ignore[attr-defined]
                 if isinstance(msg, bytes | bytearray | memoryview):
                     data = bytes(msg)
-                    await browser_ws.send_bytes(data)
+                    async with browser_send_lock:
+                        await browser_ws.send_bytes(data)
                     # Binary frames carry pane output; text frames are control
                     # JSON (e.g. tmux replies sent before any output).
                     if data and first_output_callback is not None:
                         first_output_callback()
                         first_output_callback = None
                 else:
-                    await browser_ws.send_text(msg)
+                    async with browser_send_lock:
+                        await browser_ws.send_text(msg)
         except ConnectionClosed as cc:
             # Surface the runner-side close code so the browser
             # mirrors it (4404 for missing terminal, etc.). Use

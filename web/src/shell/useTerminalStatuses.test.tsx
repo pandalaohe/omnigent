@@ -63,4 +63,40 @@ describe("useTerminalStatuses", () => {
 
     expect(result.current.getStatus).toBe(firstGetStatus);
   });
+
+  it("updates derived status when a closed state changes close code", () => {
+    const t = terminal();
+    const { result } = renderHook(({ terminals }) => useTerminalStatuses(terminals), {
+      initialProps: { terminals: [t] },
+    });
+
+    act(() =>
+      result.current.setTerminalConnectionState(t.id, {
+        kind: "closed",
+        code: 1006,
+        reason: "code 1006",
+        reconnecting: true,
+      }),
+    );
+    expect(result.current.getStatus(t)).toBe("reconnecting");
+
+    act(() =>
+      result.current.setTerminalConnectionState(t.id, {
+        kind: "closed",
+        code: 1006,
+        reason: "code 1006",
+        reconnecting: false,
+      }),
+    );
+    expect(result.current.getStatus(t)).toBe("disconnected");
+
+    act(() =>
+      result.current.setTerminalConnectionState(t.id, {
+        kind: "closed",
+        code: 4404,
+        reason: "terminal session ended",
+      }),
+    );
+    expect(result.current.getStatus(t)).toBe("exited");
+  });
 });

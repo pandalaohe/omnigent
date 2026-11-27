@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { ConnectionState } from "@/components/blocks/TerminalSession";
+import type { ConnectionState } from "@/lib/terminalCloseCodes";
 import type { TerminalInfo } from "@/hooks/useTerminals";
 import { useTerminalActivityStore } from "@/store/terminalActivity";
 import { deriveTerminalStatus, type TerminalStatus } from "./terminalStatus";
@@ -31,7 +31,18 @@ export function useTerminalStatuses(terminals: TerminalInfo[]) {
           return next;
         }
         const previous = prev.get(terminalId);
-        if (previous?.kind === state.kind) return prev;
+        if (
+          previous?.kind === state.kind &&
+          (state.kind !== "connecting" ||
+            (previous.kind === "connecting" &&
+              Boolean(previous.reconnecting) === Boolean(state.reconnecting))) &&
+          (state.kind !== "closed" ||
+            (previous.kind === "closed" &&
+              previous.code === state.code &&
+              Boolean(previous.reconnecting) === Boolean(state.reconnecting)))
+        ) {
+          return prev;
+        }
         const next = new Map(prev);
         next.set(terminalId, state);
         return next;
