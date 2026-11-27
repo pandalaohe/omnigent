@@ -17983,12 +17983,25 @@ async def _create_session_from_existing_agent_impl(
             "permission_tier is only supported by Pi and Antigravity sessions",
             code=ErrorCode.INVALID_INPUT,
         )
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+    from omnigent.server.routes.sessions.routes_peer import _runner_authorized_for_sender
+
+    runner_bound_for_parent = _parent_for_routing is not None and (
+        _runner_authorized_for_sender(
+            request,
+            _parent_for_routing,
+            getattr(request.app.state, "runner_tunnel_tokens", None),
+        )
+        if RUNNER_TUNNEL_TOKEN_HEADER in request.headers
+        else getattr(request.state, "auth_purpose", None) == "runner"
+    )
     is_runner_subagent = bool(
         body.sub_agent_name
         and body.sub_agent_name.strip()
         and body.parent_session_id is not None
         and _parent_for_routing is not None
         and _parent_for_routing.agent_id == agent.id
+        and runner_bound_for_parent
     )
     if not is_runner_subagent:
         effective_project_id = project_id or child_project_id

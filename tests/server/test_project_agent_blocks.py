@@ -119,12 +119,14 @@ def test_check_default_agents_not_blocked_invariant() -> None:
         )
     assert exc3.value.code == ErrorCode.INVALID_INPUT
 
-    # Different UUID spellings for the same agent or host still trigger D5
+    # Different UUID spellings for the same agent or host still trigger D5, even with a
+    # non-blocked legacy agent_id present on the project.
     dashed_host = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
     dashed_agent = "187b7cb7-ac30-abf4-debf-aa578d052ec7"
     with pytest.raises(OmnigentError) as exc4:
         check_default_agents_not_blocked(
             {
+                "agent_id": AGENT_B,
                 "calling_defaults": {f"host_{'a' * 32}": {"agent_id": AGENT_CLAUDE}},
                 "blocked_agents": {dashed_host: [dashed_agent]},
             }
@@ -207,6 +209,13 @@ def rework_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
     artifacts.put("agent/codex", _bundle("codex-native"))
     app.state.agent_store.create(AGENT_CLAUDE, "Claude Code", "agent/claude")
     app.state.agent_store.create(AGENT_ID, "Codex", "agent/codex")
+
+    @app.middleware("http")
+    async def _tag_runner_purpose(request: Any, call_next: Any) -> Any:
+        if request.headers.get("x-test-runner-purpose") == "1":
+            request.state.auth_purpose = "runner"
+        return await call_next(request)
+
     return app
 
 
@@ -305,18 +314,36 @@ async def test_patch_project_validation_d5_d1_and_agent_tool_guard(rework_app: F
         assert r31_tunnel.status_code == 403
 
         # auth_purpose="runner" (minted runner JWT) is also rejected on protected keys
-        @rework_app.middleware("http")
-        async def _tag_runner_purpose(request: Any, call_next: Any) -> Any:
-            if request.headers.get("x-test-runner-purpose") == "1":
-                request.state.auth_purpose = "runner"
-            return await call_next(request)
-
         r31_jwt = await client.patch(
             f"/v1/projects/{project_id}",
             headers={"x-test-runner-purpose": "1"},
             json={"config": {**stored_cfg, "orchestration": {"child_cap": 3}}},
         )
         assert r31_jwt.status_code == 403
+
+        # Verify UnifiedAuthProvider sets request.state.auth_purpose == "runner" for runner JWTs
+        from omnigent.server.accounts_config import AccountsConfig
+        from omnigent.server.auth import UnifiedAuthProvider
+
+        accounts_cfg = AccountsConfig(
+            cookie_secret=b"k" * 32,
+            session_ttl_hours=1,
+            base_url="http://localhost:8000",
+            init_admin_password=None,
+            invite_ttl_seconds=300,
+            magic_ttl_seconds=300,
+        )
+        auth = UnifiedAuthProvider(source="accounts", accounts_config=accounts_cfg)
+        runner_jwt = auth.mint_runner_token("alice@example.com", ttl_seconds=60)
+        assert runner_jwt is not None
+        fake_req = SimpleNamespace(
+            cookies={},
+            headers={"authorization": f"Bearer {runner_jwt}"},
+            state=SimpleNamespace(),
+            scope={"type": "http"},
+        )
+        assert auth.get_user_id(fake_req) == "alice@example.com"  # type: ignore[arg-type]
+        assert fake_req.state.auth_purpose == "runner"
 
 
 @pytest.mark.asyncio
@@ -582,6 +609,8 @@ async def test_first_bind_refuses_switched_fork_and_allows_same_agent_fork() -> 
         project_id="proj_bind",
         host_id="host_old",
     )
+    from omnigent.project_agent_blocks import FORK_SAME_AGENT_LABEL_KEY
+
     same_agent_fork = Conversation(
         id="conv_fork_same",
         created_at=1,
@@ -591,12 +620,26 @@ async def test_first_bind_refuses_switched_fork_and_allows_same_agent_fork() -> 
         project_id="proj_bind",
         host_id=None,
         runner_id=None,
+        labels={FORK_SOURCE_LABEL_KEY: "conv_src", FORK_SAME_AGENT_LABEL_KEY: "1"},
+    )
+    unmarked_fork = Conversation(
+        id="conv_fork_unmarked",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_fork_unmarked",
+        agent_id="ag_blocked",
+        project_id="proj_bind",
+        host_id=None,
+        runner_id=None,
         labels={FORK_SOURCE_LABEL_KEY: "conv_src"},
     )
 
     class _ConvStore:
         def __init__(self) -> None:
-            self.convs = {c.id: c for c in (src_conv, src_other, switched_fork, same_agent_fork)}
+            self.convs = {
+                c.id: c
+                for c in (src_conv, src_other, switched_fork, same_agent_fork, unmarked_fork)
+            }
 
         def get_conversation(self, cid: str) -> Conversation | None:
             return self.convs.get(cid)
@@ -689,7 +732,15 @@ async def test_first_bind_refuses_switched_fork_and_allows_same_agent_fork() -> 
         assert r_blocked.json()["error"]["code"] == "agent_blocked_for_project"
         assert admission.queued == []
 
-        # Same-agent fork bound to host_tmb → passes block check and reaches admission
+        # Unmarked FORK_SOURCE_LABEL_KEY without server FORK_SAME_AGENT_LABEL_KEY → 409
+        r_unmarked = await client.post(
+            "/v1/hosts/host_tmb/runners",
+            json={"session_id": "conv_fork_unmarked", "workspace": "/opt/work/repo"},
+        )
+        assert r_unmarked.status_code == 409, r_unmarked.text
+        assert admission.queued == []
+
+        # Same-agent fork with server-stamped FORK_SAME_AGENT_LABEL_KEY → passes block check
         r_same = await client.post(
             "/v1/hosts/host_tmb/runners",
             json={"session_id": "conv_fork_same", "workspace": "/opt/work/repo"},

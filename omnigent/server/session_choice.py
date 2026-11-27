@@ -1575,7 +1575,9 @@ def _filter_link(
     link = resolved_link(settings, link, request)
     product = request.products.get(link.agent_id, link.agent_id)
     pool = pool_of(settings, link, product, request.provider_groups)
-    if link.agent_id in request.blocked:
+    from omnigent.project_agent_blocks import normalize_block_id
+
+    if link.agent_id in request.blocked or normalize_block_id(link.agent_id) in request.blocked:
         return Skipped(link, "blocked_for_project")
     if link.agent_id in request.unavailable:
         return Skipped(link, "unavailable")

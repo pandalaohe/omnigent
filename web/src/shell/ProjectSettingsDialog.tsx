@@ -1453,11 +1453,12 @@ export function ProjectSettingsDialog({
     const sourceAgent =
       source.config?.calling_defaults?.[sourceHost]?.agent_id ?? source.config?.agent_id ?? null;
     if (sourceAgent && projectBlockedAgents(target.config, sourceHost).has(sourceAgent)) {
+      const blockedReason = { label: "default agent is blocked on this host" }.label;
       return {
         fields,
         skipped,
         copyAgent: false,
-        blocked: "default agent is blocked on this host",
+        blocked: blockedReason,
       };
     }
     const copyAgent = sourceAgent !== null;
@@ -1468,11 +1469,12 @@ export function ProjectSettingsDialog({
         selectedHarnessFor(selected) !== harness ||
         !agentUsableOnHost(selected, targetHost)
       ) {
+        const unavailableReason = { label: "Agent unavailable" }.label;
         return {
           fields: {},
-          skipped: ["Agent unavailable"],
+          skipped: [unavailableReason],
           copyAgent: false,
-          blocked: "Agent unavailable",
+          blocked: unavailableReason,
         };
       }
     }
@@ -1795,18 +1797,13 @@ export function ProjectSettingsDialog({
   const renderEntryOutcome = (row: HostRowDraft) => {
     const rowOutcome = entryHookOutcomes.get(row.hostId);
     const rowOutcomeWarning = rowOutcome ? WARNING_HOOK_STATUSES.has(rowOutcome.status) : false;
-    const savedEntryOutcome = (collaboration?.setup_outcomes ?? []).find(
-      (outcome) => outcome.host_id === row.hostId && outcome.kind === "entry",
-    );
-    const activeOutcome = rowOutcome ?? savedEntryOutcome;
     const savedPath = savedEntries.get(row.hostId);
     const canRerun =
+      rowOutcomeWarning &&
       projectId !== null &&
       savedPath !== undefined &&
       savedPath === row.path.trim() &&
-      hostsById.get(row.hostId)?.status === "online" &&
-      activeOutcome !== undefined &&
-      activeOutcome.status !== "not_configured";
+      hostsById.get(row.hostId)?.status === "online";
     const rowError = entriesError?.hostId === row.hostId ? entriesError : null;
     if (!rowOutcomeWarning && !rowError && !canRerun) return null;
     return (
@@ -1825,14 +1822,12 @@ export function ProjectSettingsDialog({
             ) : null}
           </div>
         )}
-        {canRerun && savedPath && (
+        {canRerun && savedPath && rowOutcome && (
           <div
             className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground"
             data-testid={`project-settings-entry-setup-${row.hostId}`}
           >
-            <span>
-              Host setup command: {hookStatusLabel((rowOutcome ?? savedEntryOutcome)!.status)}
-            </span>
+            <span>Host setup command: {hookStatusLabel(rowOutcome.status)}</span>
             <Button
               type="button"
               variant="outline"

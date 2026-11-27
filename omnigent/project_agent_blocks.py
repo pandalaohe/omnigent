@@ -10,7 +10,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from omnigent.calling_defaults import default_agent_for_host_or_legacy
 from omnigent.entities import Project
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.util.uuid import normalize_uuid
@@ -33,11 +32,14 @@ def _setting(value: object) -> str | None:
     return None
 
 
-def _norm_id(value: str) -> str:
+def normalize_block_id(value: str) -> str:
     """Normalize supported UUID spellings while preserving unknown ids."""
     if value == RESERVED_ALL_HOSTS or value.startswith(_LIBRARY_AGENT_ID_PREFIX):
         return value
     return normalize_uuid(value) or value
+
+
+_norm_id = normalize_block_id
 
 
 def validate_blocked_agents(value: object) -> dict[str, list[str]]:
@@ -133,14 +135,20 @@ def check_default_agents_not_blocked(config: Mapping[str, Any]) -> None:
     if isinstance(raw_blocked, Mapping):
         host_keys.update(k for k in raw_blocked if isinstance(k, str) and k != RESERVED_ALL_HOSTS)
     for host_id in sorted(host_keys):
-        default_agent = default_agent_for_host_or_legacy(config, host_id)
-        if default_agent is None and isinstance(raw_defaults, Mapping):
-            norm_h = _norm_id(host_id)
-            for dk, dv in raw_defaults.items():
-                if isinstance(dk, str) and _norm_id(dk) == norm_h and isinstance(dv, Mapping):
-                    default_agent = _setting(dv.get("agent_id"))
-                    if default_agent is not None:
-                        break
+        default_agent: str | None = None
+        if isinstance(raw_defaults, Mapping):
+            exact = raw_defaults.get(host_id)
+            if isinstance(exact, Mapping):
+                default_agent = _setting(exact.get("agent_id"))
+            if default_agent is None:
+                norm_h = _norm_id(host_id)
+                for dk, dv in raw_defaults.items():
+                    if isinstance(dk, str) and _norm_id(dk) == norm_h and isinstance(dv, Mapping):
+                        default_agent = _setting(dv.get("agent_id"))
+                        if default_agent is not None:
+                            break
+        if default_agent is None:
+            default_agent = legacy_agent
         if default_agent is not None and _norm_id(default_agent) in blocked_agents(
             config, host_id
         ):

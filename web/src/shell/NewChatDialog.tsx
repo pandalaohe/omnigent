@@ -4300,6 +4300,10 @@ function NewChatLandingContent({
     pickedAgentId !== null &&
     pickedAgentId !== PENDING_AGENT_ID &&
     !agentList.some((agent) => agent.id === pickedAgentId);
+  const blocklistRejectedTheRememberedPick =
+    pickedAgentId !== null &&
+    pickedAgentId !== PENDING_AGENT_ID &&
+    projectBlockedIds.has(pickedAgentId);
   const selectedAgent = useMemo(
     () =>
       effectiveAgentId === PENDING_AGENT_ID && pendingAgent
@@ -6256,6 +6260,18 @@ function NewChatLandingContent({
     setPickedHarness(inherited);
     _setCostControlMode(isAutoHarness(inherited) ? "on" : null);
   }, [curationRejectedTheRememberedPick, effectiveAgentId]);
+  // Project blocklist replaced the remembered agent: clear stale overrides so
+  // the fallback agent does not inherit a blocked agent's harness or model.
+  useEffect(() => {
+    if (!blocklistRejectedTheRememberedPick) return;
+    setPickedAgentId(effectiveAgentId);
+    const remembered = effectiveAgentId !== null ? readLastHarness(effectiveAgentId) : null;
+    const inherited = remembered === AUTO_NATIVE_HARNESS_ID ? null : remembered;
+    setPickedHarness(inherited);
+    _setPickedModel("");
+    setPickedEffort("");
+    setPickedSpeed("");
+  }, [blocklistRejectedTheRememberedPick, effectiveAgentId]);
   const workspaceTrimmed = workspace.trim();
   const workspaceValid = isValidWorkspace(workspace);
   const isCloudHost =
@@ -8148,12 +8164,14 @@ function NewChatLandingContent({
           // on a project visit a knob the user touched and cleared must ride
           // as an explicit null, or the server refills it from the project's
           // defaults.
-          model_override:
-            normalizedModelOverride ??
-            (createProjectId !== null && modelTouchedRef.current ? null : undefined),
-          reasoning_effort:
-            normalizedReasoningEffort ??
-            (createProjectId !== null && effortTouchedRef.current ? null : undefined),
+          model_override: blocklistRejectedTheRememberedPick
+            ? undefined
+            : (normalizedModelOverride ??
+              (createProjectId !== null && modelTouchedRef.current ? null : undefined)),
+          reasoning_effort: blocklistRejectedTheRememberedPick
+            ? undefined
+            : (normalizedReasoningEffort ??
+              (createProjectId !== null && effortTouchedRef.current ? null : undefined)),
           ...(hasGenericPermissionMode &&
           acpHarness !== null &&
           permissionMode.startsWith("host-tier:")
@@ -8172,9 +8190,11 @@ function NewChatLandingContent({
           // with the row, so there is no first message to wait for). The
           // message text rides along for routing only — the client still
           // delivers the real message after navigation.
-          harness_override: smartRoutingHarnessSelected
-            ? AUTO_HARNESS_ID
-            : (pickedHarness ?? undefined),
+          harness_override: blocklistRejectedTheRememberedPick
+            ? undefined
+            : smartRoutingHarnessSelected
+              ? AUTO_HARNESS_ID
+              : (pickedHarness ?? undefined),
           smart_routing_message:
             smartRoutingHarnessSelected || pinnedNativeRoutes ? initialPrompt : undefined,
           session_prompt: sessionPrompt || undefined,

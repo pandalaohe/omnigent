@@ -347,6 +347,21 @@ def create_projects_router(
                 existing = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
                 if existing is None:
                     raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+                if body.name is not None:
+                    candidate_name = body.name.strip()
+                    if not candidate_name:
+                        raise OmnigentError(
+                            "Project name must not be empty", code=ErrorCode.INVALID_INPUT
+                        )
+                    if candidate_name != existing.name:
+                        siblings = await asyncio.to_thread(project_store.list, user_id=user_id)
+                        if any(
+                            row.id != project_id and row.name == candidate_name for row in siblings
+                        ):
+                            raise OmnigentError(
+                                f"Project {candidate_name!r} already exists",
+                                code=ErrorCode.CONFLICT,
+                            )
                 expected_rev = project_config_revision(existing.config)
 
                 def _guarded_config_write(live_config: dict[str, Any]) -> dict[str, Any]:
@@ -377,13 +392,17 @@ def create_projects_router(
                 if project is None:
                     raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
                 if body.name is not None:
-                    project = await asyncio.to_thread(
-                        project_store.update,
-                        project_id,
-                        user_id=user_id,
-                        name=body.name,
-                        config=None,
-                    )
+                    try:
+                        project = await asyncio.to_thread(
+                            project_store.update,
+                            project_id,
+                            user_id=user_id,
+                            name=body.name,
+                            config=None,
+                        )
+                    except Exception:
+                        announce_projects_changed(user_id)
+                        raise
         if project is None:
             project = await asyncio.to_thread(
                 project_store.update,
