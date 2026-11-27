@@ -16455,9 +16455,21 @@ async def test_patch_collaboration_mode_rejects_non_codex_session(
     assert "collaboration_mode is only supported" in resp.text
 
 
+@pytest.mark.parametrize(
+    ("native_result", "legacy_mode"),
+    [
+        ("missing", None),
+        ("matching", None),
+        ("mismatched", None),
+        ("malformed", None),
+        pytest.param("matching", "read-only", id="readback-wins-over-legacy-scalar"),
+    ],
+)
 async def test_patch_approval_mode_forwards_and_persists_label(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    native_result: str,
+    legacy_mode: str | None,
 ) -> None:
     """
     PATCH ``approval_mode`` drives the Codex ``/permissions`` popup and records it.
@@ -16481,10 +16493,30 @@ async def test_patch_approval_mode_forwards_and_persists_label(
         if request.content:
             body = json.loads(request.content)
         captured.append(_ForwardedEffort(url=str(request.url), body=body))
-        return httpx.Response(200, json={"approval_mode": "full-access"})
+        payload: dict[str, Any] = {"approval_mode": "full-access"}
+        if native_result == "malformed":
+            payload["permission_observation"] = {}
+        elif native_result != "missing":
+            settings = (
+                {"approvalPolicy": "never", "sandbox": {"type": "dangerFullAccess"}}
+                if native_result == "matching"
+                else {
+                    "approvalPolicy": "on-request",
+                    "approvalsReviewer": "user",
+                    "sandbox": {"type": "workspaceWrite"},
+                }
+            )
+            payload["permission_observation"] = (
+                codex_permissions.codex_permission_observation_from_thread_settings(
+                    settings, origin="resume"
+                ).to_payload()
+            )
+        return httpx.Response(200, json=payload)
 
     async with _runtime_runner(_handler):
-        agent = await create_test_agent(client)
+        agent = await create_test_agent(
+            client, executor={"type": "omnigent", "config": {"harness": "codex-native"}}
+        )
         session = await _create_session(
             client,
             agent["id"],
@@ -16492,27 +16524,36 @@ async def test_patch_approval_mode_forwards_and_persists_label(
                 "omnigent.ui": "terminal",
                 "omnigent.wrapper": "codex-native-ui",
             },
-            terminal_launch_args=["--model", "gpt-5-codex"],
+            terminal_launch_args=["--sandbox", "read-only"],
         )
         captured.clear()
 
+        patch = {"approval_mode": "full-access"}
+        if legacy_mode is not None:
+            patch["labels"] = {"omnigent.codex_native.approval_mode": legacy_mode}
         resp = await client.patch(
             f"/v1/sessions/{session['id']}",
-            json={"approval_mode": "full-access"},
+            json=patch,
         )
 
     assert resp.status_code == 200, resp.text
-    assert resp.json()["labels"]["omnigent.codex_native.approval_mode"] == "unknown"
+    mode = "full-access" if native_result == "matching" else "unknown"
+    assert resp.json()["labels"]["omnigent.codex_native.approval_mode"] == mode
     observed = codex_permissions.decode_codex_permission_observation(
         resp.json()["labels"]["omnigent.codex_native.permission_observation"]
     )
-    assert observed.source == "application-receipt" and observed.requested_mode == "full-access"
-    assert (observed.approval, observed.reviewer, observed.sandbox, observed.profile) == (
-        None,
-    ) * 4
+    if native_result == "matching":
+        assert observed.source == "native-settings" and observed.sandbox == "danger-full-access"
+    else:
+        assert (
+            observed.source == "application-receipt" and observed.requested_mode == "full-access"
+        )
+        assert (observed.approval, observed.reviewer, observed.sandbox, observed.profile) == (
+            None,
+        ) * 4
     # Runtime approval rides the /permissions popup, not launch args: the caller's
     # existing args are left untouched.
-    assert resp.json()["terminal_launch_args"] == ["--model", "gpt-5-codex"]
+    assert resp.json()["terminal_launch_args"] == ["--sandbox", "read-only"]
     forwards = [f for f in captured if f.url.endswith(f"/v1/sessions/{session['id']}/events")]
     assert len(forwards) == 1, f"Expected one runner forward, got {captured!r}"
     assert forwards[0].body == {
@@ -16523,8 +16564,10 @@ async def test_patch_approval_mode_forwards_and_persists_label(
         event for _, event in published if event["type"] == "session.codex_approval_mode"
     ]
     assert len(mode_events) == 1
-    assert mode_events[0]["approval_mode"] == "unknown"
+    assert mode_events[0]["approval_mode"] == mode
     assert mode_events[0]["permission_observation"] == observed.to_dict()
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["permission_mode"] == mode
 
 
 @pytest.mark.parametrize(

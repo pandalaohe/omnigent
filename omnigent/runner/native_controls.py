@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import json
 import logging
 import threading
 import time
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
+    from omnigent.codex_approval_modes import CodexPermissionObservation
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
     from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer
     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
@@ -26,6 +28,7 @@ if TYPE_CHECKING:
 import httpx
 import psutil
 from fastapi.responses import JSONResponse, Response
+from websockets.exceptions import WebSocketException
 
 from omnigent.debug_logging import debug_event
 from omnigent.errors import OmnigentError
@@ -89,10 +92,38 @@ _CODEX_HELPER_STOP_TIMEOUT_S = 10.0
 _CODEX_HELPER_STOP_POLL_S = 0.05
 _CODEX_HELPER_CLOSE_TIMEOUT_S = 5.0
 _CODEX_HELPER_PROCESS_GRACE_S = 2.0
+_CODEX_PERMISSION_READBACK_TIMEOUT_S = 2.0
 
 
 class _CodexPermissionSwitchRefused(RuntimeError):
     """An expected refusal with fixed, client-safe guidance."""
+
+
+async def _read_codex_native_permission_observation(
+    state: CodexNativeBridgeState,
+) -> CodexPermissionObservation | None:
+    from omnigent.codex_approval_modes import codex_permission_observation_from_thread_settings
+    from omnigent.harnesses.codex_native.app_server import client_for_transport
+
+    client = client_for_transport(state.socket_path, client_name="omnigent-codex-native-runner")
+    try:
+        async with asyncio.timeout(_CODEX_PERMISSION_READBACK_TIMEOUT_S):
+            await client.connect()
+            response = await client.request(
+                "thread/resume", {"threadId": state.thread_id, "excludeTurns": True}
+            )
+    except (OSError, RuntimeError, WebSocketException) as exc:
+        # Codex cannot resume a fresh thread until its first rollout is written.
+        _logger.debug("Codex permission readback unavailable (%s)", type(exc).__name__)
+        return None
+    finally:
+        with contextlib.suppress(OSError, RuntimeError, WebSocketException, json.JSONDecodeError):
+            await asyncio.wait_for(client.close(), timeout=_CODEX_PERMISSION_READBACK_TIMEOUT_S)
+    settings = response.get("result")
+    thread = settings.get("thread") if isinstance(settings, dict) else None
+    if not isinstance(thread, dict) or thread.get("id") != state.thread_id:
+        return None
+    return codex_permission_observation_from_thread_settings(settings, origin="resume")
 
 
 # A session woken for a control may still be booting its TUI, so typing waits for
@@ -1273,7 +1304,12 @@ def build_native_controls(
                         ),
                     },
                 )
-        return JSONResponse(status_code=200, content={"approval_mode": preset.value})
+        payload: _JsonObject = {"approval_mode": preset.value}
+        if state is not None:
+            observed = await _read_codex_native_permission_observation(state)
+            if observed is not None and observed.mode == preset.value:
+                payload["permission_observation"] = observed.to_payload()
+        return JSONResponse(status_code=200, content=payload)
 
     async def _codex_native_model_options(
         conv_id: str, *, retry_unreachable: bool = True

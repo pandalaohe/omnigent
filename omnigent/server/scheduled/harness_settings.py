@@ -7,6 +7,7 @@ import logging
 from collections.abc import Sequence
 from typing import Any
 
+from omnigent.codex_approval_modes import decode_codex_permission_observation
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
@@ -22,7 +23,10 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY,
 )
 from omnigent.session_default_modes import mode_set, mode_values, valid_mode
-from omnigent.stores.conversation_store import CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+    CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -218,16 +222,25 @@ def _launch_permission_mode(session: Conversation, harness: str) -> str | None:
 def session_permission_mode(session: Conversation, harness: str) -> str | None:
     """The permission mode *session* runs in, in *harness*'s vocabulary, or ``None``.
 
-    A reported mode that keeps approval wins, since launch args can lag a switch made
-    while the session runs; any session can already ask for such a mode for a session
-    it starts. A mode that skips approval comes only from the launch settings.
-
-    :param session: A session running *harness*.
-    :param harness: Its canonical harness, e.g. ``"codex-native"``.
-    :returns: A mode of :data:`PERMISSION_LAUNCH_ARGS` for *harness*, e.g.
-        ``"full-access"``, or ``None`` when it cannot be told.
+    An explicit Codex observation takes precedence over launch args, including
+    ``"unknown"`` while a switch has no native confirmation.
     """
+    if harness == "codex-native" and (
+        encoded := session.labels.get(CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY)
+    ):
+        try:
+            observed = decode_codex_permission_observation(encoded)
+        except ValueError:
+            return "unknown"
+        return observed.mode if observed.runner_id == session.runner_id else "unknown"
+    return _inheritable_permission_mode(session, harness)
+
+
+def _inheritable_permission_mode(session: Conversation, harness: str) -> str | None:
+    """Read presets for child launch. Only launch settings can carry a mode that skips approval."""
     reported = session.labels.get(_REPORTED_PERMISSION_MODE_LABEL_KEYS.get(harness, ""))
+    if harness == "codex-native" and reported in {"unknown", "custom"}:
+        return None
     if (
         reported in PERMISSION_LAUNCH_ARGS.get(harness, {})
         and reported not in APPROVAL_SKIPPING_PERMISSION_MODES
@@ -264,7 +277,7 @@ def creator_session_launch_options(
         or harness != (canonicalize_harness(creator_harness) or creator_harness)
     ):
         return None
-    mode = session_permission_mode(creator, harness)
+    mode = _inheritable_permission_mode(creator, harness)
     if mode is None or (mode in APPROVAL_SKIPPING_PERMISSION_MODES and not on_creator_host):
         return None
     return permission_mode_launch_options(harness, mode)

@@ -2821,9 +2821,9 @@ class SessionResponse(BaseModel):
     :param permission_mode: The permission mode the session is in, in its
         harness's vocabulary, e.g. ``"auto"`` or ``"approve-for-me"`` (the
         names ``sys_session_create`` takes). Follows a switch made while it
-        runs to a mode that keeps approval; a mode that skips approval shows
-        only when the session's launch settings select it. ``None`` when the
-        harness has no permission modes or the mode cannot be told.
+        runs. Codex native readback reports ``"custom"`` for non-preset
+        settings or ``"unknown"`` while a mode is unconfirmed. ``None`` when
+        the harness has no permission modes or there is no mode to report.
     :param model_override: Per-session LLM model override,
         e.g. ``"claude-opus-4-7"``. ``None`` means no override is
         active (the agent's ``llm_model`` applies). Set via
