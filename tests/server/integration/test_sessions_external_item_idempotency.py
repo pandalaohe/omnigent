@@ -224,6 +224,44 @@ async def test_mirror_of_a_runtime_notice_keeps_the_mark(
         (item["content"][0]["text"], item.get("runtime_notice") is True) for item in items
     ] == [(notice, True), ("typed by hand", False)]
 
+    # A transcript poster cannot set the mark itself; only a matched notice entry does.
+    await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "claimed"}],
+                    "runtime_notice": True,
+                },
+                "response_id": "resp_claude_echo",
+                "source_id": "rec-3:0:message",
+            },
+        },
+    )
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    assert items[-1]["content"][0]["text"] == "claimed"
+    assert items[-1].get("runtime_notice") is not True
+
+
+def test_notice_mark_does_not_change_stable_id_retry_identity() -> None:
+    from omnigent.entities import ConversationItem, MessageData, NewConversationItem
+    from omnigent.server.routes._sessions.helpers import _stable_id_reuse_is_exact_retry
+
+    data = MessageData(role="user", content=[{"type": "input_text", "text": "[System: x]"}])
+    persisted = ConversationItem(
+        id="i1", status="completed", response_id="r1", created_at=1, type="message", data=data
+    )
+    retry = NewConversationItem(
+        type="message",
+        response_id="r1",
+        data=data.model_copy(update={"runtime_notice": True}),
+        stable_id="ab" * 16,
+    )
+    assert _stable_id_reuse_is_exact_retry(persisted, retry)
+
 
 async def test_bad_source_id_is_rejected(client: httpx.AsyncClient) -> None:
     session_id = await _create_session(client, "idem-bad")

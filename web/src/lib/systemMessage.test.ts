@@ -327,6 +327,10 @@ describe("isSystemUserContent", () => {
     expect(isSystemUserContent(text("what's the weather?"))).toBe(false);
   });
 
+  it("treats a server-marked runtime notice as a system message whatever its text", () => {
+    expect(isSystemUserContent(text("Host load is high"), true)).toBe(true);
+  });
+
   it("still sees the marker after stripping an [Attached: …] prefix", () => {
     // The bubble render strips attachment markers before showing text, so the
     // predicate must too — otherwise the leading marker would hide the header.

@@ -620,7 +620,7 @@ export function liveCandidateAssistantIndex(bubbles: readonly Bubble[]): number 
   const idx = lastRenderableAssistantIndex(bubbles);
   for (let i = idx + 1; i < bubbles.length; i += 1) {
     const b = bubbles[i]!;
-    if (b.kind === "user" && !isSystemUserContent(b.content)) return -1;
+    if (b.kind === "user" && !isSystemUserContent(b.content, b.runtimeNotice)) return -1;
   }
   return idx;
 }
@@ -700,7 +700,8 @@ function hasAssistantContinuation(bubbles: Bubble[], from: number): boolean {
     const next = bubbles[i]!;
     if (next.kind === "assistant") return true;
     // A real user turn ends this one; system markers do not.
-    if (next.kind === "user" && !isSystemUserContent(next.content)) return false;
+    if (next.kind === "user" && !isSystemUserContent(next.content, next.runtimeNotice))
+      return false;
     // Compaction / routing markers are mid-turn events — keep scanning.
   }
   return false;
@@ -1721,7 +1722,7 @@ function midResponseUserMessageId(blocks: AnyBlock[], index: number): string | n
   if (
     user?.type !== "user_message" ||
     isAnonymousRid(user.ctx.responseId) ||
-    isSystemUserContent(user.content)
+    isSystemUserContent(user.content, user.runtimeNotice)
   ) {
     return null;
   }
@@ -1729,7 +1730,12 @@ function midResponseUserMessageId(blocks: AnyBlock[], index: number): string | n
     const previous = blocks[previousIndex]!;
     if (isNonRenderingBlock(previous)) return null;
     if (isSubagentActivityBlock(previous) || isHandoverRowBlock(previous)) continue;
-    if (previous.type === "user_message" && isSystemUserContent(previous.content)) continue;
+    if (
+      previous.type === "user_message" &&
+      isSystemUserContent(previous.content, previous.runtimeNotice)
+    ) {
+      continue;
+    }
     return isAssistantSideBlock(previous) && previous.ctx.responseId === user.ctx.responseId
       ? user.ctx.responseId
       : null;

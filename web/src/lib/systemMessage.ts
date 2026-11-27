@@ -444,9 +444,14 @@ export function withoutAttachedMarkers(text: string): string {
  * (loader counting markers the rail drops) can wedge the rail hidden.
  *
  * :param content: A user message block's content array.
+ * :param runtimeNotice: The server marked the message as a runtime notice.
  * :returns: ``true`` for a system marker, ``false`` for a real user message.
  */
-export function isSystemUserContent(content: MessageContentBlock[]): boolean {
+export function isSystemUserContent(
+  content: MessageContentBlock[],
+  runtimeNotice = false,
+): boolean {
+  if (runtimeNotice) return true;
   const hasAttachments = content.some((c) => c.type === "input_image" || c.type === "input_file");
   if (hasAttachments) return false;
   const text = withoutAttachedMarkers(
