@@ -338,7 +338,7 @@ async def test_patch_project_validation_d5_d1_and_agent_tool_guard(rework_app: F
         assert runner_jwt is not None
         fake_req = SimpleNamespace(
             cookies={},
-            headers={"authorization": f"Bearer {runner_jwt}"},
+            headers={"Authorization": f"Bearer {runner_jwt}"},
             state=SimpleNamespace(),
             scope={"type": "http"},
         )

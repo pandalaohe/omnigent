@@ -6451,6 +6451,7 @@ async def test_fire_refuses_blocked_agent_on_continued_sandbox_reuse(
     from omnigent.server.routes import sessions
 
     task = _sandbox_continue_task(
+        user_id="alice@example.com",
         last_run_conversation_id="conv_prev",
         project_id="proj_1",
         agent_id="ag_1",

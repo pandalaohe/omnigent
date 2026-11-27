@@ -3747,6 +3747,8 @@ async def project_choice_env(runtime_init, db_uri, tmp_path, mock_llm, monkeypat
         user_preferences_store=prefs,
     )
     app.state.host_store = host_store
+    app.state.host_registry = None
+    app.state.startup_admission = None
     from omnigent.server.routes import _session_create_validation, _workspace_validation
     from omnigent.server.routes._sessions import orchestration as orch_mod
 
@@ -3928,11 +3930,31 @@ async def test_project_blocked_agents_enforced_at_funnel_choice_routing_and_suba
     assert r30_spoof.status_code == 409, r30_spoof.text
     assert r30_spoof.json()["error"]["code"] == "agent_blocked_for_project"
 
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+
     parent_a = env.store.create_conversation(
         agent_id=agent_a, host_id=HOST, project_id=proj_id, workspace="/opt/work/project"
     )
+    # Without runner authentication, sub_agent_name does NOT bypass the project blocklist.
+    r30_unauth_sub = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent_a,
+            "host_id": HOST,
+            "workspace": "/opt/work/project",
+            "project_id": proj_id,
+            "parent_session_id": parent_a.id,
+            "sub_agent_name": "helper-worker",
+        },
+    )
+    assert r30_unauth_sub.status_code == 409, r30_unauth_sub.text
+
+    monkeypatch.setattr(
+        env.app.state, "runner_tunnel_tokens", frozenset({"tok-sub"}), raising=False
+    )
     r30_sub = await env.client.post(
         "/v1/sessions",
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: "tok-sub"},
         json={
             "agent_id": agent_a,
             "host_id": HOST,

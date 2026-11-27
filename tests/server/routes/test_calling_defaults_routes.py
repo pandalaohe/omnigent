@@ -628,6 +628,7 @@ async def test_resolve_project_default_keeps_catalog_miss_unknown_and_warns(
 ) -> None:
     """A catalog miss warns and keeps the saved model; an errored catalog is unknown."""
     stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    _seed_agent(stores, AGENT_ID, harness="codex")
     project = (
         await client.post(
             "/v1/projects",
@@ -635,7 +636,10 @@ async def test_resolve_project_default_keeps_catalog_miss_unknown_and_warns(
                 "name": "P",
                 "config": {
                     "calling_defaults": {
-                        HOST_A: {"harnesses": {"codex": {"model": "gpt-6-sol", "effort": "high"}}}
+                        HOST_A: {
+                            "agent_id": AGENT_ID,
+                            "harnesses": {"codex": {"model": "gpt-6-sol", "effort": "high"}},
+                        }
                     }
                 },
             },
@@ -648,7 +652,12 @@ async def test_resolve_project_default_keeps_catalog_miss_unknown_and_warns(
         1700000000,
     )
 
-    params = {"project_id": project["id"], "host_id": HOST_A, "harness": "codex"}
+    params = {
+        "project_id": project["id"],
+        "host_id": HOST_A,
+        "agent_id": AGENT_ID,
+        "harness": "codex",
+    }
     body = (await client.get("/v1/calling-defaults/resolve", params=params)).json()
     assert body["model"] == "gpt-6-sol"
     assert body["sources"]["model"] == "project_host"
