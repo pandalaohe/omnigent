@@ -932,6 +932,32 @@ async def test_attach_terminal_proxy_forwards_browser_bytes_to_runner(
     )
 
 
+async def test_attach_terminal_proxy_answers_ping_without_forwarding_to_runner(
+    app: FastAPI,
+) -> None:
+    """Liveness pings are answered by the proxy and never forwarded to the runner."""
+    conn = _FakeRunnerWSConn(wait_close_after=3)
+    factory = _FakeRunnerWSFactory(conn)
+    set_runner_ws_factory(factory)
+
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/conv_ws/resources/terminals/terminal_bash_s1/attach"
+    ) as ws:
+        ws.send_text('{"type":"ping","id":"init"}')
+        assert ws.receive_text() == '{"type":"pong","id":"init"}'
+        ws.send_text('{"type":"ping","id":"probe-7"}')
+        assert ws.receive_text() == '{"type":"pong","id":"probe-7"}'
+        # Invalid ping IDs (empty, non-ASCII, over 64 chars) never produce a pong.
+        ws.send_text('{"type":"ping","id":""}')
+        ws.send_text('{"type":"ping","id":"' + "a" * 65 + '"}')
+        ws.send_bytes(b"ok\n")
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_bytes()
+
+    assert b"ok\n" in conn.received
+    assert not any(isinstance(frame, str) and '"probe-7"' in frame for frame in conn.received)
+
+
 async def test_attach_terminal_runner_close_propagates_close_code(
     app: FastAPI,
 ) -> None:

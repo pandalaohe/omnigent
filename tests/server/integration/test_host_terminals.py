@@ -462,3 +462,55 @@ async def test_two_replicas_readdress_http_and_ws_to_host_owner(setup, tmp_path)
         await host.stop()
         await wrong.stop()
         await right.stop()
+
+
+async def test_host_terminal_attach_returns_1013_when_runner_tunnel_is_missing(setup, tmp_path):
+    """Transient runner tunnel loss closes with 1013 (retryable), never 4404 (exited)."""
+    make_server, owner_headers, _, _owner = setup
+    server = make_server()
+    host = FakeHost(server, tmp_path, owner_headers)
+    await server.start()
+    try:
+        await host.start()
+        async with httpx.AsyncClient(base_url=server.url, headers=owner_headers) as client:
+            created = await client.post(f"/v1/hosts/{_HOST}/terminals", json={})
+            assert created.status_code == 201, created.text
+            terminal_id = created.json()["terminal_id"]
+        # Drop the runner tunnel while the host daemon still reports the runner alive.
+        server.app.state.host_terminals.reconnect_timeout_s = 0.05
+        server.app.state.tunnel_registry._sessions.clear()
+        async with websockets.connect(
+            server.url.replace("http:", "ws:")
+            + f"/v1/hosts/{_HOST}/terminals/{terminal_id}/attach",
+            additional_headers=owner_headers,
+        ) as ws:
+            with pytest.raises(websockets.exceptions.ConnectionClosed) as closed:
+                await ws.recv()
+            assert closed.value.rcvd.code == 1013
+        # While sharded, a missing local host daemon still re-addresses with 4400.
+        server.app.state.host_terminals.hosts._hosts.clear()
+        async with websockets.connect(
+            server.url.replace("http:", "ws:")
+            + f"/v1/hosts/{_HOST}/terminals/{terminal_id}/attach",
+            additional_headers=owner_headers,
+        ) as ws:
+            with pytest.raises(websockets.exceptions.ConnectionClosed) as closed:
+                await ws.recv()
+            assert closed.value.rcvd.code == 4400
+        # Once the host is offline (or on a single replica), transient host daemon
+        # absence closes attach with 1013 while HTTP list still reports 409 CONFLICT.
+        server.app.state.host_terminals.host_store.set_offline(_HOST)
+        async with websockets.connect(
+            server.url.replace("http:", "ws:")
+            + f"/v1/hosts/{_HOST}/terminals/{terminal_id}/attach",
+            additional_headers=owner_headers,
+        ) as ws:
+            with pytest.raises(websockets.exceptions.ConnectionClosed) as closed:
+                await ws.recv()
+            assert closed.value.rcvd.code == 1013
+        async with httpx.AsyncClient(base_url=server.url, headers=owner_headers) as client:
+            listed = await client.get(f"/v1/hosts/{_HOST}/terminals")
+            assert listed.status_code == 409
+    finally:
+        await host.stop()
+        await server.stop()

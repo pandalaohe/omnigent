@@ -71,6 +71,7 @@ from omnigent.terminals.ws_common import (
     _forward_terminal_to_ws,
     _monotonic,
     _tmux_session_alive,
+    make_terminal_pong_frame,
 )
 
 _logger = logging.getLogger(__name__)
@@ -1334,8 +1335,6 @@ async def bridge_tmux_control_to_websocket(
             await host_clipboard.advertise()
             while True:
                 msg = await websocket.receive()
-                if on_client_interaction is not None:
-                    on_client_interaction()
                 if msg.get("type") == "websocket.disconnect":
                     return
                 text = msg.get("text")
@@ -1347,6 +1346,13 @@ async def bridge_tmux_control_to_websocket(
                         continue
                     if not isinstance(ctl, dict):
                         continue
+                    pong = make_terminal_pong_frame(ctl)
+                    if pong is not None:
+                        async with ws_send_lock:
+                            await websocket.send_text(pong)
+                        continue
+                    if on_client_interaction is not None:
+                        on_client_interaction()
                     if ctl.get("type") == "host-clipboard-read":
                         await host_clipboard.handle(ctl)
                     elif ctl.get("type") == "resize":
@@ -1372,6 +1378,8 @@ async def bridge_tmux_control_to_websocket(
                         pending_browser_sizes.add(requested_size)
                         await _send_command(f"refresh-client -C {requested_size}\n".encode())
                 elif data is not None and not read_only:
+                    if on_client_interaction is not None:
+                        on_client_interaction()
                     if data and on_input is not None:
                         on_input()
                     # Stamp before sending so the next %output (the echo) takes

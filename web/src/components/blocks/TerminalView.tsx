@@ -75,10 +75,13 @@ import {
 import { resolveTerminalKeys, type KeySurface } from "@/lib/terminalKeys";
 import {
   type ConnectionState,
+  type LivenessProbeResult,
   type TerminalActivityListener,
   type TerminalInputListener,
   applyTerminalCopy,
+  isTerminalProcessExitedClose,
   isUnexpectedTerminalClose,
+  LIVENESS_PROBE_TIMEOUT_MS,
   resolveTerminalWorkspaceFileLink,
   TerminalSession,
   terminalTheme,
@@ -133,6 +136,18 @@ const TERMINAL_REFUSAL_MESSAGES: Readonly<Record<string, string>> = {
   admin_not_allowed: "Administrator terminal access is not allowed.",
   access_denied: "Terminal access was denied.",
 };
+
+function withReconnectContext(state: ConnectionState, reconnecting: boolean): ConnectionState {
+  if (state.kind === "connecting") {
+    return reconnecting ? { kind: "connecting", reconnecting: true } : { kind: "connecting" };
+  }
+  if (state.kind === "closed") {
+    return reconnecting
+      ? { kind: "closed", reason: state.reason, code: state.code, reconnecting: true }
+      : { kind: "closed", reason: state.reason, code: state.code };
+  }
+  return state;
+}
 
 function isReconnectableTerminalClose(code: number): boolean {
   return (
@@ -254,6 +269,8 @@ export function TerminalView({
   const draft = commandDrafts?.drafts[draftKey];
   const pastedCommandRef = useRef<string | null>(null);
   const setDraft = commandDrafts?.setDraft;
+  const stateRef = useRef(state);
+  stateRef.current = state;
   const [connectAttempt, setConnectAttempt] = useState(0);
   const [resumeError, setResumeError] = useState<string | null>(null);
   const clipboardServerIdentity = getOmnigentServerIdentity();
@@ -333,6 +350,7 @@ export function TerminalView({
   // the overlay reads "Reconnecting…" instead of the dead-end
   // "Bridge closed" message during automatic recovery.
   const [reconnectPending, setReconnectPending] = useState(false);
+  const reconnectPendingRef = useRef(false);
   // Consecutive re-dial attempts in the current outage. A ref, not
   // state: it only feeds the scheduling effect, never the render.
   const reconnectAttemptsRef = useRef(0);
@@ -343,6 +361,14 @@ export function TerminalView({
   // Lets the close handler tell "stable connection finally dropped"
   // (reset the budget) from "re-dial died straight away" (burn it).
   const connectedAtRef = useRef<number | null>(null);
+  // Monotonic dial sequence and hide-snapshot so foreground recovery can tell
+  // whether a connecting dial predates the hide without same-millisecond ties,
+  // plus a short wake-burst guard so one return never bypasses backoff twice.
+  const dialSeqRef = useRef(0);
+  const connectStartedAtRef = useRef(0);
+  const hiddenAtDialSeqRef = useRef<number | null>(null);
+  const wakeRecoveredAtRef = useRef<number | null>(null);
+  const reconnectTimerRef = useRef<number | null>(null);
   // A Settings change re-themes a live terminal through the setTheme effect below.
   const isDark = useTerminalIsDark();
   const terminalBackground = terminalTheme(isDark).background;
@@ -468,11 +494,22 @@ export function TerminalView({
   // Stable dispatcher: updates local state and notifies the parent.
   const notifyState = useCallback(
     (next: ConnectionState) => {
+      // Update stateRef synchronously so microtask continuations (e.g. an
+      // in-flight liveness probe) never act on a stale "connected" state.
+      stateRef.current = next;
       if (next.kind !== "connected") cancelPaste(next.kind === "closed" || next.kind === "error");
       setState(next);
-      onStateChangeRef.current?.(next);
+      const earlyLaunchRefusal =
+        terminalLaunchMode(terminalId) === "attach" &&
+        next.kind === "closed" &&
+        LAUNCH_REFUSAL_CODES.has(next.code);
+      onStateChangeRef.current?.(
+        earlyLaunchRefusal
+          ? { kind: "connecting" }
+          : withReconnectContext(next, reconnectPendingRef.current),
+      );
     },
-    [cancelPaste],
+    [cancelPaste, terminalId],
   );
 
   const notifyActivity = useCallback(() => {
@@ -781,6 +818,8 @@ export function TerminalView({
       // to ``connected``.
       notifyState({ kind: "connecting" });
       if (waitingForCreate) return;
+      dialSeqRef.current += 1;
+      connectStartedAtRef.current = Date.now();
 
       // Defer the actual session construction by one microtask so
       // React 19 StrictMode's synchronous attach → cleanup → attach
@@ -857,6 +896,7 @@ export function TerminalView({
           (...args) => {
             if (!superseded()) onClipboardActionRef.current(...args);
           },
+          url === relayUrl,
         );
         sessionRef.current = terminalSession;
         // Relay-connected with a direct URL on offer: negotiate the
@@ -906,9 +946,6 @@ export function TerminalView({
     sessionRef.current?.setClipboardEnabled(!readOnly && active);
   }, [readOnly, active]);
 
-  const stateRef = useRef(state);
-  stateRef.current = state;
-
   // An early attach can be refused before its shell exists (4404 before
   // registration, 4500 while the runner is being rebound). After the create
   // succeeds, retry once without ``await_launch``. Deliberate closes (e.g.
@@ -935,6 +972,56 @@ export function TerminalView({
     setConnectAttempt((attempt) => attempt + 1);
   }, [resumeGeneration, disposeActiveSession]);
 
+  const setReconnectPendingState = useCallback((next: boolean) => {
+    const changed = reconnectPendingRef.current !== next;
+    reconnectPendingRef.current = next;
+    setReconnectPending(next);
+    if (changed && mountedRef.current) {
+      const current = stateRef.current;
+      if (current.kind === "closed" || current.kind === "connecting") {
+        onStateChangeRef.current?.(withReconnectContext(current, next));
+      }
+    }
+  }, []);
+
+  // Single redial owner shared by backoff timers, foreground recovery, and
+  // manual retry so concurrent wake events cannot stack duplicate dials.
+  const startRedial = useCallback(
+    (resetAttempts: boolean) => {
+      if (reconnectTimerRef.current !== null) {
+        window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+      if (resetAttempts) reconnectAttemptsRef.current = 0;
+      reconnectPendingRef.current = true;
+      setReconnectPending(true);
+      dialSeqRef.current += 1;
+      connectStartedAtRef.current = Date.now();
+      stateRef.current = { kind: "connecting" };
+      disposeActiveSession();
+      setConnectAttempt((attempt) => attempt + 1);
+    },
+    [disposeActiveSession],
+  );
+
+  const triggerReconnect = useCallback(() => startRedial(true), [startRedial]);
+
+  const probeActiveSession = useCallback(() => {
+    const session = sessionRef.current;
+    if (!session || typeof session.probeLiveness !== "function") return;
+    void session.probeLiveness(LIVENESS_PROBE_TIMEOUT_MS).then((result: LivenessProbeResult) => {
+      if (
+        result !== "dead" ||
+        !mountedRef.current ||
+        sessionRef.current !== session ||
+        stateRef.current.kind !== "connected"
+      ) {
+        return;
+      }
+      startRedial(true);
+    });
+  }, [startRedial]);
+
   // On the hidden→visible edge of a pre-warmed surface: focus the
   // terminal (the session's WS-open focus is a no-op while the element is
   // hidden — visibility:hidden elements aren't focusable), and if the
@@ -949,13 +1036,98 @@ export function TerminalView({
       if (!isPhoneRef.current) sessionRef.current?.focus();
       const current = stateRef.current;
       if (current.kind === "closed" && isReconnectableTerminalClose(current.code)) {
-        reconnectAttemptsRef.current = 0;
-        disposeActiveSession();
-        setConnectAttempt((attempt) => attempt + 1);
+        startRedial(true);
+      } else if (current.kind === "connected") {
+        probeActiveSession();
       }
     }
     wasActiveRef.current = active;
-  }, [active, disposeActiveSession]);
+  }, [active, startRedial, probeActiveSession]);
+
+  // Returning to foreground on mobile (lock/unlock, app switch, bfcache
+  // restore, or regaining network): probe a seemingly-connected socket for a
+  // half-open drop, redial a disconnected bridge immediately with a fresh
+  // budget, and restart a dial that stalled across sleep. Deliberate closes
+  // (process exited 4404, detached 4405, refused 4403) are never resurrected.
+  useEffect(() => {
+    if (waitingForCreate) return;
+    const recoverOnForeground = (
+      trigger: "visibility" | "pageshow" | "online",
+      hiddenAtDialSeq: number | null,
+    ) => {
+      if (!mountedRef.current) return;
+      const now = Date.now();
+      if (
+        wakeRecoveredAtRef.current !== null &&
+        now - wakeRecoveredAtRef.current < LIVENESS_PROBE_TIMEOUT_MS
+      ) {
+        return;
+      }
+      const current = stateRef.current;
+      if (current.kind === "closed") {
+        const canRedial =
+          isReconnectableTerminalClose(current.code) ||
+          (current.code === WS_CLOSE_WRONG_REPLICA &&
+            isDatabricksWorkspace() &&
+            !keylessRef.current);
+        if (canRedial) {
+          wakeRecoveredAtRef.current = now;
+          startRedial(true);
+        }
+        return;
+      }
+      if (!activeRef.current) return;
+      if (current.kind === "connected") {
+        probeActiveSession();
+        return;
+      }
+      const stalledAcrossHide = hiddenAtDialSeq !== null && dialSeqRef.current <= hiddenAtDialSeq;
+      const stalledAge =
+        (trigger === "pageshow" || trigger === "online") &&
+        now - connectStartedAtRef.current >= LIVENESS_PROBE_TIMEOUT_MS;
+      if (stalledAcrossHide || stalledAge) {
+        wakeRecoveredAtRef.current = now;
+        startRedial(true);
+      }
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") {
+        hiddenAtDialSeqRef.current = dialSeqRef.current;
+        wakeRecoveredAtRef.current = null;
+        return;
+      }
+      if (document.visibilityState === "visible") {
+        const hiddenAtDialSeq = hiddenAtDialSeqRef.current;
+        hiddenAtDialSeqRef.current = null;
+        recoverOnForeground("visibility", hiddenAtDialSeq);
+      }
+    };
+    const onPageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) {
+        const hiddenAtDialSeq = hiddenAtDialSeqRef.current;
+        hiddenAtDialSeqRef.current = null;
+        recoverOnForeground("pageshow", hiddenAtDialSeq);
+      }
+    };
+    const onOnline = () => {
+      if (document.visibilityState === "visible") {
+        recoverOnForeground("online", null);
+      }
+    };
+    const onOffline = () => {
+      wakeRecoveredAtRef.current = null;
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("pageshow", onPageShow);
+    window.addEventListener("online", onOnline);
+    window.addEventListener("offline", onOffline);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("pageshow", onPageShow);
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("offline", onOffline);
+    };
+  }, [waitingForCreate, startRedial, probeActiveSession]);
 
   // Push code-font changes (Settings → Appearance) into the live session the
   // same way — xterm is a fixed-pixel widget, so it can't follow a CSS variable
@@ -979,7 +1151,8 @@ export function TerminalView({
   useEffect(() => {
     if (state.kind === "connected") {
       connectedAtRef.current = Date.now();
-      setReconnectPending(false);
+      wakeRecoveredAtRef.current = null;
+      setReconnectPendingState(false);
       return;
     }
     // "connecting" (a re-dial in flight) keeps the pending flag;
@@ -992,19 +1165,17 @@ export function TerminalView({
     // genuinely unreachable from here — stop, don't loop.
     if (state.code === WS_CLOSE_WRONG_REPLICA && isDatabricksWorkspace()) {
       if (keylessRef.current) {
-        setReconnectPending(false);
+        setReconnectPendingState(false);
         return;
       }
       keylessRef.current = true;
       const routingHostId = hostId ?? getSessionHost(sessionId!);
       if (routingHostId) markHostKeyless(routingHostId);
-      setReconnectPending(true);
-      disposeActiveSession();
-      setConnectAttempt((attempt) => attempt + 1);
+      startRedial(false);
       return;
     }
     if (!isReconnectableTerminalClose(state.code)) {
-      setReconnectPending(false);
+      setReconnectPendingState(false);
       return;
     }
     // A connection that survived RECONNECT_STABLE_MS before dropping
@@ -1018,33 +1189,22 @@ export function TerminalView({
     }
     connectedAtRef.current = null;
     if (reconnectAttemptsRef.current >= RECONNECT_BACKOFF_MS.length) {
-      setReconnectPending(false);
+      setReconnectPendingState(false);
       return;
     }
     const delay = RECONNECT_BACKOFF_MS[reconnectAttemptsRef.current];
     reconnectAttemptsRef.current += 1;
-    setReconnectPending(true);
-    // Re-dial on whichever fires first: the backoff timer (visible
-    // tabs), or the tab becoming visible again — frozen background
-    // tabs don't run timers, but they do deliver visibilitychange on
-    // thaw, which is exactly the moment the user is back and looking.
-    let redialed = false;
-    const redial = () => {
-      if (redialed) return;
-      redialed = true;
-      disposeActiveSession();
-      setConnectAttempt((attempt) => attempt + 1);
-    };
-    const timer = window.setTimeout(redial, delay);
-    const onVisible = () => {
-      if (document.visibilityState === "visible") redial();
-    };
-    document.addEventListener("visibilitychange", onVisible);
+    setReconnectPendingState(true);
+    const timer = window.setTimeout(() => {
+      reconnectTimerRef.current = null;
+      startRedial(false);
+    }, delay);
+    reconnectTimerRef.current = timer;
     return () => {
       window.clearTimeout(timer);
-      document.removeEventListener("visibilitychange", onVisible);
+      if (reconnectTimerRef.current === timer) reconnectTimerRef.current = null;
     };
-  }, [state, disposeActiveSession, sessionId, hostId]);
+  }, [state, startRedial, setReconnectPendingState, sessionId, hostId]);
 
   // `isolate` scopes the status overlay's z-index to this surface so it
   // can't paint over body-portaled UI such as the header's session menu.
@@ -1088,6 +1248,11 @@ export function TerminalView({
             state={refusedDuringLaunch ? { kind: "connecting" } : state}
             startingShell={waitingForCreate || refusedDuringLaunch}
             reconnectPending={reconnectPending}
+            onReconnect={
+              state.kind === "closed" && isReconnectableTerminalClose(state.code)
+                ? triggerReconnect
+                : undefined
+            }
             onResume={onResume ? handleResume : undefined}
             resumeTarget={resumeTarget}
             resumePending={resumePending}
@@ -1152,6 +1317,7 @@ function StatusOverlay({
   state,
   startingShell,
   reconnectPending,
+  onReconnect,
   onResume,
   resumeTarget,
   resumePending,
@@ -1163,6 +1329,8 @@ function StatusOverlay({
   startingShell: boolean;
   /** True while an automatic re-dial is scheduled for a closed bridge. */
   reconnectPending: boolean;
+  /** Manual retry action shown after a transport drop exhausts automatic retries. */
+  onReconnect?: () => void;
   onResume?: () => void | Promise<void>;
   resumeTarget: "session" | "sandbox";
   resumePending: boolean;
@@ -1184,6 +1352,15 @@ function StatusOverlay({
     browserSessionMissing && !needsSignIn
       ? "Sign in again through this server's sign-in page to use this terminal."
       : refusal;
+  const showReconnecting =
+    !startingShell && reconnectPending && (state.kind === "closed" || state.kind === "connecting");
+  const processExited =
+    state.kind === "closed" && refusal === undefined && isTerminalProcessExitedClose(state.code);
+  const disconnected =
+    state.kind === "closed" &&
+    refusal === undefined &&
+    !processExited &&
+    isReconnectableTerminalClose(state.code);
   const recoverSignIn = async () => {
     setSignInPending(true);
     setSignInError(null);
@@ -1201,24 +1378,38 @@ function StatusOverlay({
   // pollute the scrollback buffer the way ANSI-escape writes would.
   return (
     <div className="absolute inset-0 z-[10000] flex items-center justify-center bg-background/85 text-ui text-foreground backdrop-blur-[1px]">
-      {state.kind === "connecting" && (
+      {state.kind === "connecting" && !showReconnecting && (
         <span className="flex items-center gap-2">
           <Loader2Icon className="size-4 animate-spin" />
           {startingShell ? "Starting shell…" : "Connecting…"}
         </span>
       )}
-      {state.kind === "closed" && reconnectPending && (
-        // An automatic re-dial is scheduled — show recovery, not the
-        // dead-end message, so a transient drop never reads as fatal.
+      {showReconnecting && (
+        // An automatic re-dial is scheduled or in flight — show recovery, not
+        // the dead-end message, so a transient drop never reads as fatal.
         <span data-testid="terminal-reconnecting" className="flex items-center gap-2">
           <Loader2Icon className="size-4 animate-spin" />
-          Reconnecting…
+          Disconnected — reconnecting…
         </span>
       )}
       {state.kind === "closed" && !reconnectPending && (
         <div className="flex flex-wrap items-center justify-center gap-2 px-3">
-          <span role={refusal ? "status" : undefined}>
-            {refusalMessage ?? `Bridge closed: ${state.reason}`}
+          <span
+            role={refusal ? "status" : undefined}
+            data-testid={
+              processExited
+                ? "terminal-process-exited"
+                : disconnected
+                  ? "terminal-disconnected"
+                  : undefined
+            }
+          >
+            {refusalMessage ??
+              (processExited
+                ? "Process exited"
+                : disconnected
+                  ? `Disconnected: ${state.reason}`
+                  : `Bridge closed: ${state.reason}`)}
           </span>
           {needsSignIn && (
             <Button
@@ -1236,6 +1427,17 @@ function StatusOverlay({
             <span role="alert" className="basis-full text-center text-sm text-destructive">
               {signInError}
             </span>
+          )}
+          {disconnected && onReconnect && (
+            <Button
+              type="button"
+              size="xs"
+              variant="secondary"
+              onClick={onReconnect}
+              componentId="diagnostics.terminal.reconnect"
+            >
+              Reconnect
+            </Button>
           )}
           {onResume && !refusal && (
             <Button

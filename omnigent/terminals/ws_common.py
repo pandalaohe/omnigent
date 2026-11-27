@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 if TYPE_CHECKING:
     from fastapi import WebSocket
@@ -30,6 +31,29 @@ WS_CLOSE_INTERNAL_ERROR: Final[int] = 4500
 
 # A local tmux liveness probe should never stall bridge teardown.
 _TMUX_HAS_SESSION_TIMEOUT_S: Final[float] = 2.0
+
+
+def make_terminal_pong_frame(frame: dict[str, Any]) -> str | None:
+    """Return a JSON pong reply for a valid client liveness ping, or ``None``."""
+    if frame.get("type") != "ping":
+        return None
+    ping_id = frame.get("id")
+    if not isinstance(ping_id, str) or not 0 < len(ping_id) <= 64 or not ping_id.isascii():
+        return None
+    return json.dumps({"type": "pong", "id": ping_id}, separators=(",", ":"))
+
+
+def parse_terminal_ping_reply(text: str) -> str | None:
+    """Parse a client text frame and return its JSON pong reply when it is a ping."""
+    if '"ping"' not in text:
+        return None
+    try:
+        frame = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(frame, dict):
+        return None
+    return make_terminal_pong_frame(frame)
 
 
 def _monotonic() -> float:
