@@ -87,29 +87,30 @@ def process_table(monkeypatch: pytest.MonkeyPatch) -> list[Process]:
 
 @pytest.mark.parametrize("options", [[], ["-P"]])
 def test_unrecorded_autostart_tree_is_stopped(
-    monkeypatch: pytest.MonkeyPatch, process_table: list[Process], options: list[str]
+    monkeypatch: pytest.MonkeyPatch,
+    process_table: list[Process],
+    options: list[str],
+    tmp_path: Path,
 ) -> None:
-    home = Path("/opt/user")
+    home = tmp_path / "user"
+    prefix = tmp_path / "tools" / "omnigent"
+    launcher = home / ".local" / "bin" / "omni.exe"
     runner = Process(30, ["python", "runner"])
-    host = Process(
-        20, ["/opt/user/.local/bin/omni.exe", "host", "--server", "https://example.test"], [runner]
-    )
+    host = Process(20, [str(launcher), "host", "--server", "https://example.test"], [runner])
     loop = Process(
         10,
         [
-            "/opt/tools/omnigent/Scripts/pythonw.exe",
+            str(prefix / "Scripts" / "pythonw.exe"),
             *options,
             "-m",
             "omnigent.host.service_entry",
         ],
         [host, runner],
     )
-    unrelated = Process(40, ["/opt/other/omni.exe", "host"])
+    unrelated = Process(40, [str(tmp_path / "other" / "omni.exe"), "host"])
     monkeypatch.setattr(windows.Path, "home", lambda: home)
-    monkeypatch.setattr(windows.sys, "prefix", "/opt/tools/omnigent")
-    monkeypatch.setattr(
-        windows, "installed_launchers", lambda: [Path("/opt/user/.local/bin/omni.exe")]
-    )
+    monkeypatch.setattr(windows.sys, "prefix", str(prefix))
+    monkeypatch.setattr(windows, "installed_launchers", lambda: [launcher])
     process_table.extend([loop, host, runner, unrelated])
     captured = windows.capture_host_tree()
     assert {p.pid for p in captured} == {10, 20, 30}
@@ -139,28 +140,30 @@ def test_upgrade_inside_host_is_refused(
 
 
 def test_forced_upgrade_stops_detached_install_users_and_preserves_updater(
-    monkeypatch: pytest.MonkeyPatch, process_table: list[Process]
+    monkeypatch: pytest.MonkeyPatch, process_table: list[Process], tmp_path: Path
 ) -> None:
     from types import SimpleNamespace
 
-    prefix = "/opt/tools/omnigent"
-    launcher = Process(10, ["/opt/bin/omni.exe", "up", "--force"])
-    updater = Process(
-        windows.os.getpid(), [prefix + "/Scripts/python.exe", "/opt/bin/omni.exe", "up"]
+    prefix = tmp_path / "tools" / "omnigent"
+    launcher_path = tmp_path / "bin" / "omni.exe"
+    install_python = str(prefix / "Scripts" / "python.exe")
+    launcher = Process(10, [str(launcher_path), "up", "--force"])
+    updater = Process(windows.os.getpid(), [install_python, str(launcher_path), "up"])
+    daemon = Process(20, [install_python, "-P", "-m", "omnigent.host._daemon_entry"])
+    runner = Process(30, [install_python, "-P", "-m", "omnigent.runner._entry"])
+    orphan = Process(
+        40, [str(tmp_path / "python" / "python.exe"), "-P", "-m", "omnigent.runner._entry"]
     )
-    daemon = Process(
-        20, [prefix + "/Scripts/python.exe", "-P", "-m", "omnigent.host._daemon_entry"]
+    other = Process(
+        50, [str(tmp_path / "other" / "Scripts" / "python.exe"), "-m", "omnigent.runner._entry"]
     )
-    runner = Process(30, [prefix + "/Scripts/python.exe", "-P", "-m", "omnigent.runner._entry"])
-    orphan = Process(40, ["/opt/python/python.exe", "-P", "-m", "omnigent.runner._entry"])
-    other = Process(50, ["/opt/other/Scripts/python.exe", "-m", "omnigent.runner._entry"])
-    editor = Process(60, ["/opt/editor.exe", "/opt/bin/omni.exe"])
+    editor = Process(60, [str(tmp_path / "editor.exe"), str(launcher_path)])
     monkeypatch.setattr(
-        orphan, "memory_maps", lambda: [SimpleNamespace(path=prefix + "/Lib/psutil.pyd")]
+        orphan, "memory_maps", lambda: [SimpleNamespace(path=str(prefix / "Lib" / "psutil.pyd"))]
     )
-    monkeypatch.setattr(windows.sys, "prefix", prefix)
+    monkeypatch.setattr(windows.sys, "prefix", str(prefix))
     monkeypatch.setattr(windows.psutil.Process, "parents", lambda _: [launcher])
-    monkeypatch.setattr(windows, "installed_launchers", lambda: [Path("/opt/bin/omni.exe")])
+    monkeypatch.setattr(windows, "installed_launchers", lambda: [launcher_path])
     process_table.extend([launcher, updater, daemon, runner, orphan, other, editor])
     captured = windows.capture_host_tree(include_install_users=True)
     windows.stop_host_tree(captured)
@@ -450,8 +453,11 @@ def test_parent_gone_before_stop_does_not_authorize_unknown_children(
     assert worker.alive
 
 
-def test_capture_uses_fresh_identity_after_pid_reuse(monkeypatch: pytest.MonkeyPatch) -> None:
-    host = Process(10, ["/opt/bin/omni.exe", "host", "--server", "https://example.test"])
+def test_capture_uses_fresh_identity_after_pid_reuse(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    launcher = tmp_path / "bin" / "omni.exe"
+    host = Process(10, [str(launcher), "host", "--server", "https://example.test"])
     replacement = Process(10, host.args)
     updater = Process(999, ["updater"])
     monkeypatch.setattr(updater, "parents", list, raising=False)
@@ -465,7 +471,7 @@ def test_capture_uses_fresh_identity_after_pid_reuse(monkeypatch: pytest.MonkeyP
 
     monkeypatch.setattr(windows.psutil, "Process", process)
     monkeypatch.setattr(windows.psutil, "pids", lambda: [10])
-    monkeypatch.setattr(windows, "installed_launchers", lambda: [Path("/opt/bin/omni.exe")])
+    monkeypatch.setattr(windows, "installed_launchers", lambda: [launcher])
     monkeypatch.setattr(windows.shutil, "which", lambda _: "/opt/pwsh.exe")
     assert windows.capture_host_tree() == [host]
     host.alive = False
