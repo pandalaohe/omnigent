@@ -836,6 +836,26 @@ describe("AgentInfoContent keep-warm block", () => {
     expect(screen.queryByTestId("agent-info-keep-warm")).toBeNull();
   });
 
+  it("renders without crashing when list rows omit null keep-warm fields", () => {
+    // GET /v1/sessions serializes SessionListItem with exclude_none=True, so
+    // absent nullable keep-warm fields arrive as undefined rather than null.
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wireKeepWarm: KeepWarmStatus = {
+      state: "on",
+      episode: { pings: 0, cost_usd: 0, estimated: false },
+      total: { pings: 0, cost_usd: 0, estimated: false },
+    };
+    seedListCache(qc, { keep_warm: wireKeepWarm, warm_state: "warm" });
+    renderContent("conv_keep_warm", LEVEL_OWNER, qc);
+
+    const block = screen.getByTestId("agent-info-keep-warm");
+    expect(within(block).getByText("Cache").parentElement).toHaveTextContent("warm");
+    expect(within(block).getByText("State").parentElement).toHaveTextContent("on");
+    expect(block).toHaveTextContent("0 pings $0.00");
+    expect(within(block).queryByText("Stop reason")).toBeNull();
+    expect(within(block).queryByText("Last return")).toBeNull();
+  });
+
   it("re-renders when the stream patches the cached row's keep-warm counters", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     seedListCache(qc);

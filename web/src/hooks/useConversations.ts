@@ -271,7 +271,7 @@ export interface KeepWarmEpisode {
   pings: number;
   cost_usd: number;
   estimated: boolean;
-  started_at: number | null;
+  started_at?: number | null;
 }
 
 /** Mirrors the server's `KeepWarmTotal`. */
@@ -305,11 +305,11 @@ export type KeepWarmStopReason =
 /** Mirrors the server's `KeepWarmStatus`. */
 export interface KeepWarmStatus {
   state: "on" | "off" | "paused" | "stopped";
-  stop_reason: KeepWarmStopReason | null;
+  stop_reason?: KeepWarmStopReason | null;
   episode: KeepWarmEpisode;
   total: KeepWarmTotal;
-  last_return: KeepWarmLastReturn | null;
-  last_reason: string | null;
+  last_return?: KeepWarmLastReturn | null;
+  last_reason?: string | null;
   blocked_by?: string | null;
 }
 

@@ -1705,6 +1705,57 @@ describe("chatStore — switchTo", () => {
     expect(useChatStore.getState().blocks).toHaveLength(1);
   });
 
+  it("skips redundant reconcileOnReconnect when revisiting a conversation still hydrating", async () => {
+    const id = "conv_hydrating";
+    seedSession(id, [userMessage("resp_1", "hydrated message")]);
+    let finishSnapshot!: (response: Response) => void;
+    const pendingSnapshot = new Promise<Response>((resolve) => {
+      finishSnapshot = resolve;
+    });
+    const seenUrls: string[] = [];
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), "http://test.local");
+      seenUrls.push(`${url.pathname}${url.search}`);
+      if (
+        url.pathname === `/v1/sessions/${encodeURIComponent(id)}` &&
+        url.searchParams.get("refresh_state") === "true"
+      ) {
+        return pendingSnapshot;
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const firstBind = useChatStore.getState().switchTo(id);
+    await tick();
+    expect(useChatStore.getState().loadingConversation).toBe(true);
+
+    await useChatStore.getState().switchTo("conv_other");
+    seenUrls.length = 0;
+
+    // Return to `id` before its initial cold bind has resolved: must keep waiting
+    // on the in-flight bindStream instead of launching a racing reconcileOnReconnect.
+    await useChatStore.getState().switchTo(id);
+    await tick();
+    expect(seenUrls.filter((u) => u.startsWith(`/v1/sessions/${id}`))).toEqual([]);
+    expect(useChatStore.getState().loadingConversation).toBe(true);
+
+    finishSnapshot(
+      mockResponse({
+        id,
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 0,
+        usage_included: false,
+        total_cost_usd: null,
+        usage_by_model: null,
+      }),
+    );
+    await firstBind;
+    await tick();
+    expect(useChatStore.getState().loadingConversation).toBe(false);
+    expect(useChatStore.getState().blocks).toHaveLength(1);
+  });
+
   it("stamps a background session's runner launch without touching the open conversation", async () => {
     seedSession("conv_cell", []);
     seedSession("conv_open", []);

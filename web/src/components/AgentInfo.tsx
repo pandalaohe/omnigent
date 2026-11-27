@@ -1352,7 +1352,7 @@ function KeepWarmSection({
               status.total.estimated,
             )}
           </KeepWarmRow>
-          {status.last_return !== null && (
+          {status.last_return != null && (
             <KeepWarmRow label="Last return">
               {keepWarmLastReturnLabel(status.last_return)}
             </KeepWarmRow>
