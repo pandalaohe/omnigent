@@ -953,3 +953,286 @@ def test_contained_realpath_admits_a_symlink_loop_but_it_reaches_nothing(
     assert admitted.startswith(str(root))
     with pytest.raises(OSError):
         (Path(admitted)).read_bytes()
+
+
+# ---------------------------------------------------------------------------
+# Permission tier "full" reach bypass (and non-full / active-sandbox guards).
+# ---------------------------------------------------------------------------
+
+
+def test_full_tier_skips_reach_check_for_all_file_ops(tmp_path: Path) -> None:
+    """At tier ``full`` under sandbox ``type: none``, all reach-checked file ops
+    can target paths outside cwd, while deleting cwd or its ancestors stays blocked."""
+    import subprocess
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "note.txt"
+    policy = _grant_policy()
+
+    write_res = _handle_helper_request(
+        request={"op": "write", "path": str(target), "content": "hello\n"},
+        cwd=workspace,
+        shell_path="/bin/sh",
+        sandbox=policy,
+        permission_tier="full",
+    )
+    assert "error" not in write_res, write_res
+    assert target.read_text() == "hello\n"
+
+    edit_res = _handle_helper_request(
+        request={"op": "edit", "path": str(target), "oldText": "hello", "newText": "updated"},
+        cwd=workspace,
+        shell_path="/bin/sh",
+        sandbox=policy,
+        permission_tier="full",
+    )
+    assert "error" not in edit_res, edit_res
+
+    read_res = _handle_helper_request(
+        request={"op": "read", "path": str(target)},
+        cwd=workspace,
+        shell_path="/bin/sh",
+        sandbox=policy,
+        permission_tier="full",
+    )
+    assert "error" not in read_res, read_res
+    assert read_res["content"] == "updated\n"
+
+    git_repo = outside / "repo"
+    git_repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=git_repo, check=True)
+    git_res = _handle_helper_request(
+        request={"op": "git", "argv": ["status", "--short"], "cwd": str(git_repo), "timeout": 10},
+        cwd=workspace,
+        shell_path="/bin/sh",
+        sandbox=policy,
+        permission_tier="full",
+    )
+    assert "error" not in git_res, git_res
+    assert git_res["returncode"] == 0
+
+    if platform.system() != "Windows":
+        del_res = _handle_helper_request(
+            request={"op": "delete", "path": str(target), "recursive": False},
+            cwd=workspace,
+            shell_path="/bin/sh",
+            sandbox=policy,
+            permission_tier="full",
+        )
+        assert del_res.get("deleted") is True, del_res
+        assert not target.exists()
+
+        # Deleting the environment root or an ancestor remains refused even at full.
+        ancestor_del = _handle_helper_request(
+            request={"op": "delete", "path": str(tmp_path), "recursive": True},
+            cwd=workspace,
+            shell_path="/bin/sh",
+            sandbox=policy,
+            permission_tier="full",
+        )
+        assert ancestor_del.get("code") == "invalid_path"
+
+
+@pytest.mark.asyncio
+async def test_full_tier_real_helper_allows_outside_file_ops(tmp_path: Path) -> None:
+    """``create_os_environment(..., permission_tier='full')`` threads the tier
+    through the helper config payload so outside write/read/edit/delete succeed."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    outside = tmp_path / "outside" / "file.txt"
+
+    env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process", cwd=str(workspace), sandbox=OSEnvSandboxSpec(type="none")
+        ),
+        permission_tier="full",
+    )
+    assert env is not None
+    try:
+        w = await env.write(str(outside), "one\n")
+        assert "error" not in w, w
+        assert outside.read_text() == "one\n"
+
+        e = await env.edit(str(outside), old_text="one", new_text="two")
+        assert "error" not in e, e
+
+        r = await env.read(str(outside))
+        assert r.get("content") == "two\n"
+
+        if platform.system() != "Windows":
+            d = await env.delete(str(outside))
+            assert d.get("deleted") is True, d
+            assert not outside.exists()
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize("tier", ["ask", "plan", "accept-edits", "auto", None])
+def test_non_full_tiers_still_refuse_outside_paths_and_traversal(
+    tmp_path: Path, tier: str | None
+) -> None:
+    """Non-full tiers (and unset tier) keep cwd/grant confinement, including
+    symlink and ``..`` escape blocking."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "secret.txt"
+    target.write_text("secret\n")
+    escape_link = workspace / "link.txt"
+    escape_link.symlink_to(target)
+    dotdot = workspace / ".." / "outside" / "secret.txt"
+    policy = _grant_policy()
+
+    for candidate in (target, escape_link, dotdot):
+        for op, extra in (
+            ("read", {}),
+            ("write", {"content": "x"}),
+            ("edit", {"oldText": "secret", "newText": "x"}),
+        ):
+            res = _handle_helper_request(
+                request={"op": op, "path": str(candidate), **extra},
+                cwd=workspace,
+                shell_path="/bin/sh",
+                sandbox=policy,
+                permission_tier=tier,  # type: ignore[arg-type]
+            )
+            assert "error" in res and "outside the environment root" in res["error"], (
+                tier,
+                op,
+                candidate,
+                res,
+            )
+
+    del_res = _handle_helper_request(
+        request={"op": "delete", "path": str(target), "recursive": False},
+        cwd=workspace,
+        shell_path="/bin/sh",
+        sandbox=policy,
+        permission_tier=tier,  # type: ignore[arg-type]
+    )
+    assert del_res.get("code") == "invalid_path"
+    assert target.read_text() == "secret\n"
+
+    git_res = _handle_helper_request(
+        request={"op": "git", "argv": ["status"], "cwd": str(outside), "timeout": 5},
+        cwd=workspace,
+        shell_path="/bin/sh",
+        sandbox=policy,
+        permission_tier=tier,  # type: ignore[arg-type]
+    )
+    assert "error" in git_res and "outside the environment root" in git_res["error"]
+
+
+def test_full_tier_with_active_sandbox_keeps_sandbox_enforcement(tmp_path: Path) -> None:
+    """An active OS sandbox never widens its read/write grants under tier ``full``."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "guarded.txt"
+    target.write_text("keep\n")
+    active_policy = SandboxPolicy(
+        backend_type="darwin_seatbelt",
+        active=True,
+        read_roots=[workspace.resolve()],
+        write_roots=[workspace.resolve()],
+        write_files=[],
+        allow_network=False,
+    )
+
+    for op, extra in (
+        ("read", {}),
+        ("write", {"content": "overwrite"}),
+        ("edit", {"oldText": "keep", "newText": "overwrite"}),
+    ):
+        res = _handle_helper_request(
+            request={"op": op, "path": str(target), **extra},
+            cwd=workspace,
+            shell_path="/bin/sh",
+            sandbox=active_policy,
+            permission_tier="full",
+        )
+        assert "blocked by sandbox" in res.get("error", ""), (op, res)
+
+    del_res = _handle_helper_request(
+        request={"op": "delete", "path": str(target), "recursive": False},
+        cwd=workspace,
+        shell_path="/bin/sh",
+        sandbox=active_policy,
+        permission_tier="full",
+    )
+    assert del_res.get("code") == "permission_denied"
+    assert target.read_text() == "keep\n"
+
+    git_res = _handle_helper_request(
+        request={"op": "git", "argv": ["status"], "cwd": str(outside), "timeout": 5},
+        cwd=workspace,
+        shell_path="/bin/sh",
+        sandbox=active_policy,
+        permission_tier="full",
+    )
+    assert "blocked by sandbox" in git_res.get("error", "")
+
+
+def test_create_os_environment_rejects_invalid_permission_tier(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    with pytest.raises(ValueError, match="Unsupported permission_tier"):
+        create_os_environment(
+            OSEnvSpec(
+                type="caller_process", cwd=str(workspace), sandbox=OSEnvSandboxSpec(type="none")
+            ),
+            permission_tier="bogus",  # type: ignore[arg-type]
+        )
+
+
+def test_full_tier_still_refuses_deleting_standalone_write_grant_root(tmp_path: Path) -> None:
+    """Deleting a standalone declared write-grant root remains refused even at full."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    grant = tmp_path / "granted"
+    grant.mkdir()
+    child = grant / "inside.txt"
+    child.write_text("keep\n")
+    policy = _grant_policy(write_roots=[grant])
+
+    res = _handle_helper_request(
+        request={"op": "delete", "path": str(grant), "recursive": True},
+        cwd=workspace,
+        shell_path="/bin/sh",
+        sandbox=policy,
+        permission_tier="full",
+    )
+    assert res.get("code") == "invalid_path", res
+    assert grant.is_dir() and child.read_text() == "keep\n"
+
+
+@pytest.mark.asyncio
+async def test_full_tier_real_active_sandbox_helper_still_blocks_outside_write(
+    tmp_path: Path,
+) -> None:
+    """A real active OS sandbox helper still refuses outside writes at tier ``full``."""
+    if platform.system() != "Darwin":
+        pytest.skip("darwin_seatbelt backend check runs on macOS")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    outside = tmp_path / "outside" / "blocked.txt"
+    env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(type="darwin_seatbelt"),
+        ),
+        permission_tier="full",
+    )
+    assert env is not None
+    try:
+        res = await env.write(str(outside), "should fail\n")
+        assert "blocked by sandbox" in res.get("error", ""), res
+        assert not outside.exists()
+    finally:
+        env.close()

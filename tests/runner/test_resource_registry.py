@@ -5002,3 +5002,45 @@ async def test_tool_environment_reuse_checks_session_spec_and_resolved_paths(
     await registry.cleanup_session("other")
     assert first.environment._closed
     assert isinstance(rebuilt.environment, _FakeOSEnvironment) and rebuilt.environment._closed
+
+
+@pytest.mark.asyncio
+async def test_lease_tool_environment_replaces_cached_env_on_permission_tier_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Switching a session's permission tier replaces any cached tool helper."""
+    seen_tiers: list[str | None] = []
+
+    def _fake_create(spec, **kwargs):
+        seen_tiers.append(kwargs.get("permission_tier"))
+        return _FakeOSEnvironment(spec=spec, cwd=Path(spec.cwd or ".").resolve(strict=False))
+
+    monkeypatch.setattr("omnigent.inner.os_env.create_os_environment", _fake_create)
+    registry = SessionResourceRegistry()
+    spec = _agent_spec_with_sandbox_none(tmp_path / "workspace").os_env
+    assert spec is not None
+
+    first = await registry.lease_tool_environment("conv", spec, permission_tier="full")
+    assert first is not None
+    await first.release(reusable=True)
+
+    reused = await registry.lease_tool_environment("conv", spec, permission_tier="full")
+    assert reused is first
+    await reused.release(reusable=True)
+
+    downgraded = await registry.lease_tool_environment("conv", spec, permission_tier="auto")
+    assert downgraded is not None and downgraded is not first
+    assert isinstance(first.environment, _FakeOSEnvironment)
+    assert first.environment._closed
+    await downgraded.release(reusable=True)
+
+    unset = await registry.lease_tool_environment("conv", spec, permission_tier=None)
+    assert unset is not None and unset is not downgraded
+    assert isinstance(downgraded.environment, _FakeOSEnvironment)
+    assert downgraded.environment._closed
+    await unset.release(reusable=True)
+
+    assert seen_tiers == ["full", "auto", None]
+    await registry.cleanup_session("conv")
+    assert isinstance(unset.environment, _FakeOSEnvironment)
+    assert unset.environment._closed

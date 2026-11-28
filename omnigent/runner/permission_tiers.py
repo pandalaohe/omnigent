@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
@@ -79,7 +80,18 @@ class PermissionTierRuntime:
         ] = {}
         self._finished: dict[str, set[str]] = {}
         self._pi_control_paths: dict[str, set[str]] = {}
+        self._active_full_ops: dict[str, int] = {}
         self.pi_scopes = PiScopeRegistry(PERMISSION_RUNTIME_ID)
+
+    def _clear_session_authority(self, session_id: str) -> None:
+        """Drop installed tier state when a session leaves managed permissions."""
+        self.pi_scopes.invalidate(session_id)
+        self._states.pop(session_id, None)
+        self._paths.pop(session_id, None)
+        self._harnesses.pop(session_id, None)
+        self._leases.pop(session_id, None)
+        self._inspected.pop(session_id, None)
+        self._pi_control_paths.pop(session_id, None)
 
     @staticmethod
     def state_path(session_id: str, harness: str, labels: Mapping[str, str]) -> Path:
@@ -114,8 +126,11 @@ class PermissionTierRuntime:
         """Fence a launch, returning whether its active Pi authority was preserved."""
         if not permission_tier_active(harness, envelope.snapshot.labels if envelope else {}):
             if envelope is not None:
-                self.pi_scopes.invalidate(envelope.session_id)
-                self._harnesses.pop(envelope.session_id, None)
+                if not self.idle(envelope.session_id):
+                    raise ValueError(
+                        "Permission-tier reinitialization requires idle tool execution"
+                    )
+                self._clear_session_authority(envelope.session_id)
             return False
         if envelope is None or not (envelope.snapshot.host_id or envelope.snapshot.runner_id):
             raise ValueError("Permission-tier startup requires a trusted host snapshot")
@@ -177,7 +192,7 @@ class PermissionTierRuntime:
                     return True
             except ValueError:
                 pass
-        if self._leases.get(envelope.session_id):
+        if not self.idle(envelope.session_id):
             raise ValueError("Permission-tier reinitialization requires idle tool execution")
         fenced = HostPermissionState(
             session_id=envelope.session_id,
@@ -204,8 +219,11 @@ class PermissionTierRuntime:
         """Validate server state and local rules before confirming the launch."""
         if not permission_tier_active(harness, envelope.snapshot.labels if envelope else {}):
             if envelope is not None:
-                self.pi_scopes.invalidate(envelope.session_id)
-                self._harnesses.pop(envelope.session_id, None)
+                if not self.idle(envelope.session_id):
+                    raise ValueError(
+                        "Permission-tier reinitialization requires idle tool execution"
+                    )
+                self._clear_session_authority(envelope.session_id)
             return None
         if envelope is None:
             raise ValueError("A permission-tier session requires a current server envelope")
@@ -328,6 +346,35 @@ class PermissionTierRuntime:
         except (OSError, ValueError, TypeError):
             return None
 
+    def ready_tier(self, session_id: str, *, harness: str | None = None) -> PermissionTier | None:
+        """Return the verified tier only while ready and owned by the session's harness."""
+        owner = self._harnesses.get(session_id)
+        if owner is None:
+            return None
+        if harness is not None and owner != harness:
+            return None
+        state = self.state(session_id)
+        return state.tier if state is not None and state.status == "ready" else None
+
+    @contextlib.contextmanager
+    def hold_ready_tier(
+        self, session_id: str, *, harness: str | None = None
+    ) -> Iterator[PermissionTier | None]:
+        """Hold a ready ``full`` tier across an in-flight helper call so tier switches wait."""
+        tier = self.ready_tier(session_id, harness=harness)
+        if tier != "full":
+            yield tier
+            return
+        self._active_full_ops[session_id] = self._active_full_ops.get(session_id, 0) + 1
+        try:
+            yield tier
+        finally:
+            remaining = self._active_full_ops.get(session_id, 0) - 1
+            if remaining > 0:
+                self._active_full_ops[session_id] = remaining
+            else:
+                self._active_full_ops.pop(session_id, None)
+
     def path(self, session_id: str) -> Path:
         return self._paths[session_id]
 
@@ -355,7 +402,7 @@ class PermissionTierRuntime:
             or self._harnesses.get(session_id) not in ("pi", "pi-native")
         ):
             raise ValueError("Pi scope launch unavailable")
-        if self._leases.get(session_id):
+        if not self.idle(session_id):
             raise ValueError("Pi scope rebind requires idle execution")
         self.pi_scopes.begin_launch(session_id, preparing=state.status == "blocked")
         self._inspected.pop(session_id, None)
@@ -1215,7 +1262,7 @@ class PermissionTierRuntime:
         return True
 
     def idle(self, session_id: str) -> bool:
-        return not self._leases.get(session_id)
+        return not self._leases.get(session_id) and self._active_full_ops.get(session_id, 0) == 0
 
     def prepare(
         self, session_id: str, *, expected_revision: int, transaction_id: str

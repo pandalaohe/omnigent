@@ -122,6 +122,7 @@ class Harness:
         spec_resolver: object | None = None,
         permission_tiers: PermissionTierRuntime | None = None,
         harness: str = "claude-sdk",
+        runner_workspace: Path | None = None,
     ) -> None:
         self.app = FastAPI()
         self.mcp_manager = mcp_manager
@@ -133,6 +134,7 @@ class Harness:
         self.published: list[tuple[str, Any]] = []
         self.recovered: list[str] = []
         self.registry = McpExecutionRegistry()
+        self.resource_registry = SessionResourceRegistry()
         self.inboxes: dict[str, Any] = {}
         self.async_tasks: dict[str, Any] = {}
         self.agent_ids: dict[str, str] = {SESSION: "ag_1"}
@@ -152,6 +154,8 @@ class Harness:
             return self.resolved_entry
 
         async def _runtime_cwd(session_id: str) -> Path | None:
+            if runner_workspace is not None:
+                return runner_workspace
             return (
                 Path("/tmp/runtime-cwd")
                 if session_id == SESSION
@@ -159,6 +163,8 @@ class Harness:
             )
 
         async def _explicit_workspace(session_id: str) -> Path | None:
+            if runner_workspace is not None:
+                return runner_workspace
             return Path("/tmp/session-workspace")
 
         mcp_routes.register_mcp_routes(
@@ -180,8 +186,8 @@ class Harness:
             permission_tiers=permission_tiers or PermissionTierRuntime(),
             mcp_manager=mcp_manager,  # type: ignore[arg-type]
             process_manager=process_manager,  # type: ignore[arg-type]
-            resource_registry=SessionResourceRegistry(),
-            runner_workspace=Path("/tmp/runner-workspace"),
+            resource_registry=self.resource_registry,
+            runner_workspace=runner_workspace or Path("/tmp/runner-workspace"),
             server_client=httpx.AsyncClient(base_url="http://server"),
             spec_resolver=spec_resolver,  # type: ignore[arg-type]
             terminal_registry=None,
@@ -898,3 +904,373 @@ async def test_elicitation_forward_failure_is_502_with_a_generic_detail() -> Non
     assert status == 502
     assert body["error"] == "elicitation_failed"
     assert "harness.sock" not in body["detail"]
+
+
+# ── /mcp/execute: permission-tier reach for sys_os_* ───────────────────────
+
+
+def _install_permission_state(
+    runtime: PermissionTierRuntime,
+    *,
+    tmp_path: Path,
+    workspace: Path,
+    harness: str,
+    tier: str,
+    status: str = "ready",
+) -> None:
+    from omnigent.permission_tiers.host import HostPermissionState, write_host_permission_state
+
+    state = HostPermissionState(
+        session_id=SESSION,
+        host_id="host-test",
+        workspace=str(workspace),
+        tier=tier,  # type: ignore[arg-type]
+        revision=1,
+        status=status,  # type: ignore[arg-type]
+        transaction_id="tx-1" if status == "switching" else None,
+    )
+    path = tmp_path / f"state-{harness}-{tier}.json"
+    write_host_permission_state(path, state)
+    runtime._states[SESSION] = state
+    runtime._paths[SESSION] = path
+    runtime._harnesses[SESSION] = harness
+
+
+def _os_env_spec(workspace: Path, *, harness: str) -> AgentSpec:
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    return AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(config={"harness": harness}),
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+
+
+@pytest.mark.parametrize("harness", ["pi", "ag-acp"])
+async def test_mcp_execute_full_tier_allows_outside_os_file_ops(
+    tmp_path: Path, harness: str
+) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    outside = tmp_path / "outside" / "note.txt"
+    runtime = PermissionTierRuntime(runner_workspace=workspace)
+    _install_permission_state(
+        runtime, tmp_path=tmp_path, workspace=workspace, harness=harness, tier="full"
+    )
+    h = Harness(permission_tiers=runtime, harness=harness, runner_workspace=workspace)
+    h.spec_cache[SESSION] = _os_env_spec(workspace, harness=harness)
+    try:
+        status, body = await h.execute(
+            _call("sys_os_write", arguments={"path": str(outside), "content": "outside\n"})
+        )
+        assert status == 200
+        payload = json.loads(body["result"]["output"])
+        assert "error" not in payload, payload
+        assert outside.read_text(encoding="utf-8") == "outside\n"
+
+        status, body = await h.execute(
+            _call(
+                "sys_os_edit",
+                arguments={"path": str(outside), "oldText": "outside", "newText": "edited"},
+            )
+        )
+        assert status == 200
+        payload = json.loads(body["result"]["output"])
+        assert "error" not in payload, payload
+
+        status, body = await h.execute(_call("sys_os_read", arguments={"path": str(outside)}))
+        assert status == 200
+        payload = json.loads(body["result"]["output"])
+        assert payload.get("content") == "edited\n"
+    finally:
+        await h.resource_registry.cleanup_session(SESSION)
+
+
+@pytest.mark.parametrize(
+    ("tier", "state_status"),
+    [
+        ("ask", "ready"),
+        ("plan", "ready"),
+        ("accept-edits", "ready"),
+        ("auto", "ready"),
+        ("full", "blocked"),
+        ("full", "switching"),
+        (None, "ready"),
+    ],
+)
+async def test_execute_tool_non_full_or_unready_tier_refuses_outside_os_write(
+    tmp_path: Path, tier: str | None, state_status: str
+) -> None:
+    """Only a verified ready ``full`` state skips os_env reach checks."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    outside = tmp_path / "outside" / "blocked.txt"
+    runtime = PermissionTierRuntime(runner_workspace=workspace)
+    if tier is not None:
+        _install_permission_state(
+            runtime,
+            tmp_path=tmp_path,
+            workspace=workspace,
+            harness="pi",
+            tier=tier,
+            status=state_status,
+        )
+    resource_registry = SessionResourceRegistry()
+    try:
+        output = await execute_tool(
+            tool_name="sys_os_write",
+            arguments=json.dumps({"path": str(outside), "content": "nope\n"}),
+            resource_registry=resource_registry,
+            agent_spec=_os_env_spec(workspace, harness="pi"),
+            conversation_id=SESSION,
+            runner_workspace=workspace,
+            effective_harness="pi",
+            permission_tiers=runtime,
+        )
+        payload = json.loads(output)
+        assert "outside the environment root" in payload.get("error", ""), payload
+        assert not outside.exists()
+    finally:
+        await resource_registry.cleanup_session(SESSION)
+
+
+async def test_dispatch_tool_locally_async_and_flow_thread_permission_tiers(
+    tmp_path: Path,
+) -> None:
+    """Runner-local dispatch, sys_call_async, and flow steps all read the live tier."""
+    import asyncio
+
+    from omnigent.runner import flows
+    from omnigent.runner.tool_dispatch import dispatch_tool_locally, execute_tool
+    from omnigent.tools.builtins.flow import FlowPlan, FlowStep
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    runtime = PermissionTierRuntime(runner_workspace=workspace)
+    _install_permission_state(
+        runtime, tmp_path=tmp_path, workspace=workspace, harness="pi", tier="full"
+    )
+    resource_registry = SessionResourceRegistry()
+    spec = _os_env_spec(workspace, harness="pi")
+    harness_client = _FakeHarnessClient(
+        httpx.Response(
+            200,
+            json={"accepted": True},
+            request=httpx.Request("POST", f"http://harness/v1/sessions/{SESSION}/events"),
+        )
+    )
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] = {}
+
+    try:
+        # 1. dispatch_tool_locally (SSE action_required path for any harness)
+        local_target = tmp_path / "outside" / "local.txt"
+        out = await dispatch_tool_locally(
+            tool_name="sys_os_write",
+            call_id="call_1",
+            arguments=json.dumps({"path": str(local_target), "content": "local\n"}),
+            response_id="resp_1",
+            harness_client=harness_client,  # type: ignore[arg-type]
+            resource_registry=resource_registry,
+            agent_spec=spec,
+            conversation_id=SESSION,
+            runner_workspace=workspace,
+            effective_harness="pi",
+            permission_tiers=runtime,
+        )
+        assert "error" not in json.loads(out), out
+        assert local_target.read_text(encoding="utf-8") == "local\n"
+
+        # 2. sys_call_async background dispatch
+        async_target = tmp_path / "outside" / "async.txt"
+        handle_json = await execute_tool(
+            tool_name="sys_call_async",
+            arguments=json.dumps(
+                {
+                    "tool": "sys_os_write",
+                    "args": json.dumps({"path": str(async_target), "content": "async\n"}),
+                }
+            ),
+            resource_registry=resource_registry,
+            agent_spec=spec,
+            conversation_id=SESSION,
+            runner_workspace=workspace,
+            session_inbox=inbox,
+            session_async_tasks=async_tasks,
+            effective_harness="pi",
+            permission_tiers=runtime,
+        )
+        assert "handle_id" in json.loads(handle_json), handle_json
+        item = await asyncio.wait_for(inbox.get(), timeout=10.0)
+        assert item["status"] == "completed", item
+        assert async_target.read_text(encoding="utf-8") == "async\n"
+
+        # 3. Flow step execution at full, then downgraded to auto (live check)
+        flow_target = tmp_path / "outside" / "flow.txt"
+        ctx = flows.FlowContext(
+            server_client=httpx.AsyncClient(base_url="http://server"),
+            conversation_id=SESSION,
+            agent_spec=spec,
+            resource_registry=resource_registry,
+            runner_workspace=workspace,
+            effective_harness="pi",
+            permission_tiers=runtime,
+        )
+        run = flows._FlowRun(
+            flow_id="flow_1",
+            plan=FlowPlan(
+                steps=(
+                    FlowStep(
+                        tool="sys_os_write",
+                        args={"path": str(flow_target), "content": "flow\n"},
+                    ),
+                ),
+                start_after_s=0.0,
+                every_s=None,
+                for_s=None,
+                times=1,
+                stop_when=None,
+                bring_back="last",
+                max_chars=2000,
+                note=None,
+            ),
+            ctx=ctx,
+            created_mono=0.0,
+            started_at=0.0,
+        )
+        step_out = await flows._run_step(run, 0, {"path": str(flow_target), "content": "flow\n"})
+        assert "error" not in json.loads(step_out), step_out
+        assert flow_target.read_text(encoding="utf-8") == "flow\n"
+
+        # Downgrading the live tier immediately re-enables reach confinement.
+        _install_permission_state(
+            runtime, tmp_path=tmp_path, workspace=workspace, harness="pi", tier="auto"
+        )
+        blocked_target = tmp_path / "outside" / "after-downgrade.txt"
+        blocked_out = await flows._run_step(
+            run, 0, {"path": str(blocked_target), "content": "nope\n"}
+        )
+        assert "outside the environment root" in json.loads(blocked_out).get("error", "")
+        assert not blocked_target.exists()
+    finally:
+        await resource_registry.cleanup_session(SESSION)
+
+
+async def test_stale_owner_and_harness_mismatch_refuse_full_reach(tmp_path: Path) -> None:
+    """Deactivating managed permissions or mismatching the harness owner drops full reach."""
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PROTOCOL_VERSION,
+        RunnerSessionInitEnvelope,
+        RunnerSessionInitSnapshot,
+    )
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    outside = tmp_path / "outside" / "stale.txt"
+    runtime = PermissionTierRuntime(runner_workspace=workspace)
+    _install_permission_state(
+        runtime, tmp_path=tmp_path, workspace=workspace, harness="ag-acp", tier="full"
+    )
+    resource_registry = SessionResourceRegistry()
+    try:
+        # Different harness cannot inherit ag-acp's full tier.
+        assert runtime.ready_tier(SESSION, harness="claude-sdk") is None
+        mismatch_out = await execute_tool(
+            tool_name="sys_os_write",
+            arguments=json.dumps({"path": str(outside), "content": "nope\n"}),
+            resource_registry=resource_registry,
+            agent_spec=_os_env_spec(workspace, harness="claude-sdk"),
+            conversation_id=SESSION,
+            runner_workspace=workspace,
+            effective_harness="claude-sdk",
+            permission_tiers=runtime,
+        )
+        assert "outside the environment root" in json.loads(mismatch_out).get("error", "")
+        assert not outside.exists()
+
+        # Reinitializing without managed permissions clears cached state and owner.
+        envelope = RunnerSessionInitEnvelope(
+            protocol_version=SESSION_INIT_PROTOCOL_VERSION,
+            server_version="0.24.0",
+            session_id=SESSION,
+            agent_id="ag_1",
+            snapshot=RunnerSessionInitSnapshot(
+                session_id=SESSION,
+                host_id="host-test",
+                workspace=str(workspace),
+                labels={},
+                created_at=0,
+                updated_at=0,
+            ),
+        )
+        assert runtime.fence_start(envelope, "claude-sdk") is False
+        assert runtime.install(envelope, "claude-sdk") is None
+        assert runtime.state(SESSION) is None
+        assert runtime.ready_tier(SESSION) is None
+    finally:
+        await resource_registry.cleanup_session(SESSION)
+
+
+async def test_inflight_full_os_env_op_fences_concurrent_tier_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A paused full-tier os_env op marks PermissionTierRuntime busy so tier prepare fails."""
+    import asyncio
+
+    from omnigent.runner import tool_dispatch
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    outside = tmp_path / "outside" / "inflight.txt"
+    runtime = PermissionTierRuntime(runner_workspace=workspace)
+    _install_permission_state(
+        runtime, tmp_path=tmp_path, workspace=workspace, harness="pi", tier="full"
+    )
+    resource_registry = SessionResourceRegistry()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_exec = tool_dispatch._execute_os_env_tool
+
+    async def _paused_exec(*args: Any, **kwargs: Any) -> str:
+        entered.set()
+        await release.wait()
+        return await original_exec(*args, **kwargs)
+
+    monkeypatch.setattr(tool_dispatch, "_execute_os_env_tool", _paused_exec)
+    task = asyncio.create_task(
+        tool_dispatch.execute_tool(
+            tool_name="sys_os_write",
+            arguments=json.dumps({"path": str(outside), "content": "inflight\n"}),
+            resource_registry=resource_registry,
+            agent_spec=_os_env_spec(workspace, harness="pi"),
+            conversation_id=SESSION,
+            runner_workspace=workspace,
+            effective_harness="pi",
+            permission_tiers=runtime,
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5.0)
+        assert runtime.idle(SESSION) is False
+        with pytest.raises(ValueError, match="busy or stale"):
+            runtime.prepare(SESSION, expected_revision=1, transaction_id="tx-switch")
+        release.set()
+        out = await asyncio.wait_for(task, timeout=10.0)
+        assert "error" not in json.loads(out), out
+        assert outside.read_text(encoding="utf-8") == "inflight\n"
+        assert runtime.idle(SESSION) is True
+        switching = runtime.prepare(SESSION, expected_revision=1, transaction_id="tx-switch")
+        assert switching.status == "switching"
+    finally:
+        release.set()
+        if not task.done():
+            await task
+        await resource_registry.cleanup_session(SESSION)
