@@ -373,6 +373,8 @@ class ExecutorAdapter(HarnessApp):
         if request.session_mode is not None:
             extra["session_mode"] = request.session_mode
             extra["session_mode_selection"] = request.session_mode_selection
+        if request.host_permission_full:
+            extra["host_permission_full"] = True
         # model_override is the per-request override; takes precedence over the spec default.
         config = ExecutorConfig(
             model=request.model_override,

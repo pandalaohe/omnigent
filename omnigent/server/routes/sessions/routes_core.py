@@ -6772,7 +6772,6 @@ def register_core_routes(
                     action="unarchive",
                 )
         from omnigent.server.permission_tiers import (
-            is_acp_permission_harness,
             permission_tier_active,
             require_permission_protocol,
         )

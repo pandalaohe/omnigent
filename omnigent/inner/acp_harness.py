@@ -444,9 +444,6 @@ def _build_acp_executor(extension: AcpExtension = NO_ACP_EXTENSION) -> AcpExecut
         env_unset=_csv_names(_ENV_ENV_UNSET),
         permission_mode=permission_mode,
         host_permission_tier=_env_enabled("HARNESS_ACP_HOST_PERMISSION_TIER", default=False),
-        host_permission_state_path=(
-            os.environ.get("HARNESS_ACP_PERMISSION_STATE_PATH", "").strip() or None
-        ),
         inject_system_prompt=inject_system_prompt,
         init_timeout_s=parse_init_timeout_s(
             float(os.environ.get("HARNESS_ACP_INIT_TIMEOUT_S", "180"))

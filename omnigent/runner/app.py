@@ -5296,18 +5296,10 @@ def create_runner_app(
             )
 
         if is_acp_permission_harness(harness_name):
-            acp_host_tier_active = permission_tier_active(harness_name, init_context.labels or {})
             spawn_env = {
                 **(spawn_env or {}),
-                "HARNESS_ACP_HOST_PERMISSION_TIER": "1" if acp_host_tier_active else "0",
-                "HARNESS_ACP_PERMISSION_STATE_PATH": (
-                    str(
-                        permission_tiers.state_path(
-                            session_id, harness_name, init_context.labels or {}
-                        )
-                    )
-                    if acp_host_tier_active
-                    else ""
+                "HARNESS_ACP_HOST_PERMISSION_TIER": (
+                    "1" if permission_tier_active(harness_name, init_context.labels or {}) else "0"
                 ),
             }
         try:
@@ -11131,13 +11123,16 @@ def create_runner_app(
             harness_body["permission_mode"] = permission_mode
         if harness_name == "codex" and (approval_mode := _session_approval_mode.get(conv)):
             harness_body["approval_mode"] = approval_mode
-        if (
-            harness_name
-            and (harness_name == "acp" or harness_name.startswith("acp:"))
-            and (acp_mode := _session_acp_mode.get(conv))
-        ):
-            harness_body["session_mode"] = acp_mode
-            harness_body["session_mode_selection"] = _session_acp_mode_selection.get(conv)
+        if harness_name and (harness_name == "acp" or harness_name.startswith("acp:")):
+            if acp_mode := _session_acp_mode.get(conv):
+                harness_body["session_mode"] = acp_mode
+                harness_body["session_mode_selection"] = _session_acp_mode_selection.get(conv)
+            acp_perm_state = permission_tiers.state(conv)
+            harness_body["host_permission_full"] = (
+                acp_perm_state is not None
+                and acp_perm_state.status == "ready"
+                and acp_perm_state.tier == "full"
+            )
         if harness_name in {"codex", "claude-sdk"} and (
             service_tier := _session_service_tier.get(conv)
         ):
@@ -11802,15 +11797,9 @@ def create_runner_app(
                     return init_error
         acp_host_tier = managed_tier and acp_harness
         if acp_harness:
-            assert harness_name is not None
             spawn_env = {
                 **(spawn_env or {}),
                 "HARNESS_ACP_HOST_PERMISSION_TIER": "1" if acp_host_tier else "0",
-                "HARNESS_ACP_PERMISSION_STATE_PATH": (
-                    str(permission_tiers.state_path(conv_id, harness_name, startup_labels or {}))
-                    if acp_host_tier
-                    else ""
-                ),
             }
         _clean_terminal_exit_responses.pop(conv_id, None)
         try:

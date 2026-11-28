@@ -406,7 +406,6 @@ class AcpAgentConfig:
     env_passthrough: tuple[str, ...] = ()
     permission_mode: str = "auto"
     host_permission_tier: bool = False
-    host_permission_state_path: str | None = None
     inject_system_prompt: bool = True
     available_models: tuple[str, ...] = ()
     env_unset: tuple[str, ...] = ()
@@ -1532,6 +1531,7 @@ class AcpExecutor(Executor):
         self._pending: dict[int, asyncio.Future[_AcpJsonObject]] = {}
         self._active_prompt_request_id: int | None = None
         self._turn_prompt_id: int | None = None
+        self._turn_host_permission_full: bool = False
         self._cancel_grace_deadline: float | None = None
         self._clock: Callable[[], float] | None = clock
         self._poll_interval_s: float = 2.0
@@ -3315,19 +3315,6 @@ class AcpExecutor(Executor):
         allow, option_id, _reason = await self._decide_permission_detail(params)
         return allow, option_id
 
-    def _is_host_permission_full(self) -> bool:
-        """True only when the runner's trusted permission state is ready and set to ``full``."""
-        state_path = self._config.host_permission_state_path
-        if not self._config.host_permission_tier or not state_path:
-            return False
-        from omnigent.permission_tiers.host import read_host_permission_state
-
-        try:
-            state = read_host_permission_state(Path(state_path))
-        except (OSError, ValueError, TypeError):
-            return False
-        return state.status == "ready" and state.tier == "full"
-
     async def _decide_permission_detail(
         self, params: _AcpJsonObject
     ) -> tuple[bool | None, str | None, str | None]:
@@ -3358,10 +3345,11 @@ class AcpExecutor(Executor):
                 else:
                     self._denied_permission_calls.add(req_call_id)
             return unmanaged_result
-        if self._is_host_permission_full() and (
-            self._session_id is None
-            or params.get("sessionId") is None
-            or params.get("sessionId") == self._session_id
+        if (
+            self._turn_host_permission_full
+            and self._turn_accepts_permissions
+            and self._session_id is not None
+            and params.get("sessionId") == self._session_id
         ):
             option = self._allow_once_id(params)
             full_result: tuple[bool | None, str | None, str | None] = (
@@ -3376,24 +3364,11 @@ class AcpExecutor(Executor):
             if req_call_id:
                 self._answered_permission_calls.add(req_call_id)
                 self._permission_calls.pop(req_call_id, None)
-                if full_result[0] is True:
-                    raw_args = (
-                        tool_call_obj.get("rawInput") if isinstance(tool_call_obj, dict) else None
-                    )
-                    if not isinstance(raw_args, dict):
-                        raw_args = self._tool_inputs.get(req_call_id)
-                    if isinstance(raw_args, dict) and any(
-                        isinstance(raw_args.get(k), str) and raw_args[k]
-                        for k in ("Path", "AbsolutePath", "absolute_path", "file_path", "path")
-                    ):
-                        perm_name = "view_file" if "AbsolutePath" in raw_args else "read_file"
-                        self._authorized_read_calls[req_call_id] = (
-                            perm_name,
-                            copy.deepcopy(raw_args),
-                        )
-                else:
+                if full_result[0] is not True:
                     self._denied_permission_calls.add(req_call_id)
-            if self._managed_agy:
+            tool_name = "unknown"
+            intent_kind = "unknown"
+            if isinstance(tool_call_obj, dict):
                 tool_name, _ = self._extract_tool_call(params)
                 intent_kind = {
                     "run_command": "execute",
@@ -3402,20 +3377,25 @@ class AcpExecutor(Executor):
                     "write_to_file": "edit",
                     **_ACP_OMNIGENT_OS_KINDS,
                 }.get(tool_name, "unknown")
-                allowed, option_id, _reason = full_result
-                option_kind = "none"
-                if option_id is not None:
-                    option_kind = "allow_once" if allowed else "reject_once"
-                logger.info(
-                    "acp agy permission decision: tool=%s intent=%s binding=%s tier=%s "
-                    "once_offer=%s option=%s",
-                    tool_name,
-                    intent_kind,
-                    "skipped",
-                    "full",
-                    "valid" if option is not None else "missing",
-                    option_kind,
-                )
+                if intent_kind == "unknown":
+                    raw_kind = tool_call_obj.get("kind")
+                    if isinstance(raw_kind, str) and raw_kind:
+                        intent_kind = raw_kind
+            allowed, option_id, _reason = full_result
+            option_kind = "none"
+            if option_id is not None:
+                option_kind = "allow_once" if allowed else "reject_once"
+            logger.info(
+                "acp %s permission decision: tool=%s intent=%s binding=%s tier=%s "
+                "once_offer=%s option=%s",
+                "agy" if self._managed_agy else "host",
+                tool_name,
+                intent_kind,
+                "skipped",
+                "full",
+                "valid" if option is not None else "missing",
+                option_kind,
+            )
             return full_result
         bound_call = self._bound_permission_call(params)
         trace = _AcpPermissionTrace() if self._managed_agy else None
@@ -3980,6 +3960,7 @@ class AcpExecutor(Executor):
         self._tainted_interaction_calls.clear()
         self._observed_terminal_calls.clear()
         self._turn_prompt_id = None
+        self._turn_host_permission_full = False
         self._post_prompt_wait_active = False
         self._post_prompt_deadline = None
         self._reader_agy_bg_work = None
@@ -4998,6 +4979,7 @@ class AcpExecutor(Executor):
         """
         self._active_prompt_request_id = None
         self._turn_prompt_id = None
+        self._turn_host_permission_full = False
         self._post_prompt_wait_active = False
         self._post_prompt_deadline = None
         while not self._queue.empty():
@@ -5231,6 +5213,11 @@ class AcpExecutor(Executor):
         self._pending[req_id] = fut
         self._active_prompt_request_id = req_id
         self._turn_prompt_id = req_id
+        self._turn_host_permission_full = bool(
+            self._config.host_permission_tier
+            and config is not None
+            and config.extra.get("host_permission_full") is True
+        )
         self._cancel_grace_deadline = None
         is_agy = is_antigravity_acp_command(self._config.command)
         bg_work = _AgyBackgroundWork(session_id) if is_agy else None
@@ -5629,6 +5616,7 @@ class AcpExecutor(Executor):
                 self._active_prompt_request_id = None
             if self._turn_prompt_id == req_id:
                 self._turn_prompt_id = None
+            self._turn_host_permission_full = False
             self._post_prompt_wait_active = False
             self._post_prompt_deadline = None
             self._reader_agy_bg_work = None
@@ -5706,6 +5694,7 @@ class AcpExecutor(Executor):
         self._cancel_grace_deadline = None
         self._active_prompt_request_id = None
         self._turn_prompt_id = None
+        self._turn_host_permission_full = False
         self._post_prompt_wait_active = False
         self._post_prompt_deadline = None
         self._reader_agy_bg_work = None

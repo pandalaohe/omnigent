@@ -3012,12 +3012,7 @@ async def test_acp_managed_flag_survives_initialization(monkeypatch, tmp_path, t
         (_, harness, env), *_ = manager.get_client_calls
         assert harness == "acp"
         assert env["HARNESS_ACP_HOST_PERMISSION_TIER"] == expected
-        expected_state_path = (
-            str(app.state.permission_tiers.state_path(body["session_id"], "acp", {}))
-            if tier
-            else ""
-        )
-        assert env["HARNESS_ACP_PERMISSION_STATE_PATH"] == expected_state_path
+        assert "HARNESS_ACP_PERMISSION_STATE_PATH" not in env
 
         monkeypatch.setattr("omnigent.runner.app._SESSION_INIT_ENVELOPE_TTL_SECONDS", -1)
         response = await client.post(
@@ -3026,12 +3021,152 @@ async def test_acp_managed_flag_survives_initialization(monkeypatch, tmp_path, t
         )
         assert response.status_code == 200, response.text
         assert manager.get_client_calls[-1][2]["HARNESS_ACP_HOST_PERMISSION_TIER"] == expected
-        assert (
-            manager.get_client_calls[-1][2]["HARNESS_ACP_PERMISSION_STATE_PATH"]
-            == expected_state_path
-        )
+        assert manager._client.posted_bodies[-1]["host_permission_full"] is (tier == "full")
     state = app.state.permission_tiers.state(body["session_id"])
     assert (state.tier if state else None) == tier
+
+
+@pytest.mark.asyncio
+async def test_acp_live_full_to_auto_switch_rejects_active_turn_and_updates_next_turn(
+    monkeypatch, tmp_path
+):
+    from omnigent.onboarding import acp_auth
+    from omnigent.runner import create_runner_app
+    from omnigent.server.permission_tiers import (
+        ACP_PERMISSION_TIER_LABEL_KEY,
+        ConfirmedPermissionState,
+    )
+    from tests.runner.conftest import (
+        _FakeProcessManager,
+        _runner_client,
+        _ScriptedHarnessClient,
+        _spec_resolver_returning,
+    )
+    from tests.runner.helpers import NullServerClient, permission_session_init_payload
+    from tests.runner.native_helpers import _harness_spec
+
+    class _ServerSnapshotClient(NullServerClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.labels: dict[str, str] = {}
+
+        async def get(self, url: str, **_kwargs):
+            return httpx.Response(200, json={"labels": dict(self.labels)})
+
+    entry = acp_auth.AcpAgentEntry(slug="example", name="Example", command="example-acp")
+    monkeypatch.setattr(acp_auth, "resolve_acp_agent", lambda _slug: entry)
+    turn_started = asyncio.Event()
+    release_turn = asyncio.Event()
+    harness_client = _ScriptedHarnessClient([])
+    original_stream = harness_client.stream
+
+    def gated_stream(method: str, url: str, *, json: dict[str, object], timeout: object):
+        harness_client.posted_bodies.append(json)
+        if len(harness_client.posted_bodies) == 1:
+
+            class _HeldStream:
+                status_code = 200
+
+                async def __aenter__(self):
+                    turn_started.set()
+                    return self
+
+                async def __aexit__(self, *_exc):
+                    return False
+
+                async def aiter_text(self):
+                    await release_turn.wait()
+                    done = (
+                        'data: {"type":"response.completed",'
+                        '"response":{"id":"r1","status":"completed","output":[]}}\n\n'
+                    )
+                    yield done
+
+            return _HeldStream()
+        harness_client.posted_bodies.pop()
+        return original_stream(method, url, json=json, timeout=timeout)
+
+    monkeypatch.setattr(harness_client, "stream", gated_stream)
+    manager = _FakeProcessManager(harness_client)
+    server = _ServerSnapshotClient()
+    app = create_runner_app(
+        process_manager=manager,
+        spec_resolver=await _spec_resolver_returning(_harness_spec("acp:example")),
+        server_client=server,
+        runner_workspace=tmp_path,
+    )
+    session_id = "acp-live-switch"
+    init_body = permission_session_init_payload(
+        {"session_id": session_id, "agent_id": "test-agent"},
+        harness="acp",
+        snapshot={
+            "workspace": str(tmp_path),
+            "labels": {ACP_PERMISSION_TIER_LABEL_KEY: "full"},
+        },
+    )
+    async with _runner_client(app) as client:
+        assert (await client.post("/v1/sessions", json=init_body)).status_code == 201
+
+        turn1 = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{session_id}/events?stream=true",
+                json={"type": "message", "role": "user", "agent_id": "test-agent", "content": []},
+            )
+        )
+        await turn_started.wait()
+        assert harness_client.posted_bodies[0]["host_permission_full"] is True
+
+        # Active turn blocks live tier switch with 409 session_busy.
+        busy = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "permission_tier_prepare",
+                "permission_tier": "auto",
+                "transaction_id": "tx-busy",
+                "expected_revision": 1,
+            },
+        )
+        assert busy.status_code == 409, busy.text
+        assert busy.json()["error"] == "session_busy"
+
+        release_turn.set()
+        assert (await turn1).status_code == 200
+
+        # Idle switch full → auto commits cleanly and disables host_permission_full on next turn.
+        prep = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "permission_tier_prepare",
+                "permission_tier": "auto",
+                "transaction_id": "tx-1",
+                "expected_revision": 1,
+            },
+        )
+        assert prep.status_code == 200, prep.text
+        server.labels = ConfirmedPermissionState("auto", 2, "switching", "tx-1").labels("acp")
+        commit = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "permission_tier_commit",
+                "permission_tier": "auto",
+                "transaction_id": "tx-1",
+                "expected_revision": 1,
+                "revision": 2,
+            },
+        )
+        assert commit.status_code == 200, commit.text
+
+        turn2 = await client.post(
+            f"/v1/sessions/{session_id}/events?stream=true",
+            json={"type": "message", "role": "user", "agent_id": "test-agent", "content": []},
+        )
+        assert turn2.status_code == 200, turn2.text
+        assert harness_client.posted_bodies[-1]["host_permission_full"] is False
+
+        # Tampering with the on-disk state file fails closed instead of authorizing full.
+        tampered = replace(app.state.permission_tiers.state(session_id), tier="full")
+        write_host_permission_state(app.state.permission_tiers.path(session_id), tampered)
+        assert app.state.permission_tiers.state(session_id) is None
 
 
 @pytest.mark.parametrize(

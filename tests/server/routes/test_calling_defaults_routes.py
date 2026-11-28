@@ -902,6 +902,63 @@ async def test_acp_host_tier_defaults_on_delegated_create(client, app, stores):
     assert calling_full.status_code == 201, calling_full.text
     assert calling_full.json()["permission_tier"] == "full"
 
+    # Bundle upload create rejects explicit `full` on agent-originated creates too.
+    agent_headers = {**PERMISSION_TIERS_HEADERS, CREATE_ORIGIN_HEADER: CREATE_ORIGIN_AGENT}
+    bundle_denied = await client.post(
+        "/v1/sessions",
+        data={
+            "metadata": json.dumps(
+                {"host_id": HOST_A, "workspace": "/neutral/project", "permission_tier": "full"}
+            )
+        },
+        files={"bundle": ("agent.tar.gz", _bundle("acp:ag"), "application/gzip")},
+        headers=agent_headers,
+    )
+    assert bundle_denied.status_code == 400, bundle_denied.text
+
+    # Tiered parents never propagate `full` or widen past their tier despite a `full` default.
+    from omnigent.server.permission_tiers import (
+        PERMISSION_CAPABILITY_LABEL_KEY,
+        PERMISSION_CAPABILITY_VALUE,
+        ConfirmedPermissionState,
+    )
+
+    conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    for parent_tier, expected_child_tier in (("full", "auto"), ("plan", "plan")):
+        tiered_parent = conversations.create_conversation(
+            agent_id=AGENT_ID,
+            host_id=HOST_A,
+            workspace="/neutral/project",
+            runner_id="test-runner",
+            labels={
+                **ConfirmedPermissionState(parent_tier, 1, "ready").labels("acp:ag"),
+                PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
+            },
+        )
+        child = await client.post(
+            "/v1/sessions",
+            json={**request, "parent_session_id": tiered_parent.id},
+            headers=agent_headers,
+        )
+        assert child.status_code == 201, child.text
+        assert child.json()["permission_tier"] == expected_child_tier
+
+    # An untiered orchestrator omitting `permission_tier` honors the user's saved `full` default.
+    _seed_agent(stores, "parent-claude", "claude-native")
+    untiered_parent = conversations.create_conversation(
+        agent_id="parent-claude",
+        host_id=HOST_A,
+        workspace="/neutral/project",
+        runner_id="test-runner",
+    )
+    orchestrated = await client.post(
+        "/v1/sessions",
+        json={**request, "parent_session_id": untiered_parent.id},
+        headers=agent_headers,
+    )
+    assert orchestrated.status_code == 201, orchestrated.text
+    assert orchestrated.json()["permission_tier"] == "full"
+
 
 @pytest.mark.parametrize("bundled", [False, True], ids=["registered", "upload"])
 @pytest.mark.parametrize(
