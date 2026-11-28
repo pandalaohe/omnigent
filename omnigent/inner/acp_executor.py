@@ -3045,36 +3045,42 @@ class AcpExecutor(Executor):
 
     def _bound_permission_call(self, params: _AcpJsonObject) -> _AcpJsonObject | None:
         """Bind a permission request to the pending tool event, never its display title."""
-        if (
-            not self._turn_accepts_permissions
-            or self._session_id is None
-            or params.get("sessionId") != self._session_id
-        ):
-            return None
+
+        def reject(reason: str, field: str = "none") -> None:
+            logger.info("acp permission binding rejected: reason=%s field=%s", reason, field)
+
+        if not self._turn_accepts_permissions:
+            return reject("inactive_turn")
+        if self._session_id is None or params.get("sessionId") != self._session_id:
+            return reject("session_mismatch", "sessionId")
         call = params.get("toolCall")
-        if not isinstance(call, dict) or not isinstance(call.get("toolCallId"), str):
-            return None
+        if not isinstance(call, dict):
+            return reject("invalid_request_type", "toolCall")
+        if not isinstance(call.get("toolCallId"), str):
+            return reject("invalid_request_type", "toolCallId")
         call_id = call["toolCallId"]
+        if call_id in self._answered_permission_calls:
+            return reject("already_answered", "toolCallId")
         observed = self._permission_calls.get(call_id)
-        if observed is None or call_id in self._answered_permission_calls:
-            return None
+        if observed is None:
+            return reject("missing_pending_call", "toolCallId")
         self._answered_permission_calls.add(call_id)
         is_agy = is_antigravity_acp_command(self._config.command)
         if is_agy and not isinstance(call.get("rawInput"), dict):
-            return None
+            return reject("invalid_request_type", "rawInput")
         same_value = _same_json_value if is_agy else operator.eq
         for key in ("kind", "name", "title", "rawInput"):
             if call.get(key) is not None and not same_value(call[key], observed.get(key)):
-                return None
+                return reject("field_mismatch", key)
         arguments = observed.get("rawInput")
         if not isinstance(arguments, dict):
-            return None
+            return reject("invalid_pending_type", "rawInput")
         kind = observed.get("kind")
         if kind is not None and not isinstance(kind, str):
-            return None
+            return reject("invalid_pending_type", "kind")
         bridge_tool = None
         if is_agy:
-            agy_tool = self._validate_agy_permission_tool(kind, arguments)
+            agy_tool = self._validate_agy_permission_tool(kind, observed.get("name"), arguments)
             if self._managed_agy and (agy_tool is None or agy_tool[0] == "unknown"):
                 bridge_tool = self._bound_omnigent_tool(observed)
                 if bridge_tool is not None:
@@ -3085,29 +3091,29 @@ class AcpExecutor(Executor):
                             kind in _ACP_KNOWN_TOOL_KINDS
                             and _ACP_OMNIGENT_OS_KINDS[bridge_tool] != kind
                         ):
-                            return None
+                            return reject("bridge_kind_mismatch", "kind")
                         schema = next(
                             tool.get_schema()["function"]["parameters"]
                             for tool in OS_ENV_TOOL_TYPES
                             if tool.name() == bridge_tool
                         )
                         if arguments.keys() - schema["properties"].keys():
-                            return None
+                            return reject("invalid_bridge_arguments", "rawInput")
                     agy_tool = bridge_tool, arguments
             if agy_tool is None:
-                return None
+                return reject("invalid_agy_arguments", "rawInput")
             name, arguments = agy_tool
         elif kind == "execute":
             if not isinstance(arguments.get("CommandLine"), str):
-                return None
+                return reject("invalid_pending_type", "CommandLine")
             name = "run_command"
         elif kind == "read":
             if not isinstance(arguments.get("AbsolutePath"), str):
-                return None
+                return reject("invalid_pending_type", "AbsolutePath")
             name = "view_file"
         elif kind == "edit":
             if not isinstance(arguments.get("TargetFile"), str):
-                return None
+                return reject("invalid_pending_type", "TargetFile")
             # The shared classifier binds all of these to the same write target.
             name = "write_to_file"
         else:
@@ -3144,7 +3150,7 @@ class AcpExecutor(Executor):
 
     @staticmethod
     def _validate_agy_permission_tool(
-        kind: object, arguments: _AcpJsonObject
+        kind: object, observed_name: object, arguments: _AcpJsonObject
     ) -> tuple[str, _AcpJsonObject] | None:
         """Reject mixed and malformed known agy shapes before consulting policy."""
         if kind is not None and not isinstance(kind, str):
@@ -3194,6 +3200,17 @@ class AcpExecutor(Executor):
             ):
                 return None
             return "write_to_file", {**arguments, "TargetFile": target}
+        if (
+            kind == "edit"
+            and observed_name == "edit_file"
+            and keys == {"Path", "Target", "Replacement"}
+        ):
+            if (
+                not all(isinstance(value, str) for value in arguments.values())
+                or not arguments["Path"]
+            ):
+                return None
+            return "write_to_file", {**arguments, "TargetFile": arguments["Path"]}
         if kind == "edit" and isinstance(arguments.get("TargetFile"), str):
             if keys & _AGY_ACP_SHELL_FIELDS:
                 return None
