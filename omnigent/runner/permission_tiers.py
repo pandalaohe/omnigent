@@ -1039,6 +1039,29 @@ class PermissionTierRuntime:
         leases.setdefault(call_id, PermissionLease(binding))
         return True
 
+    def _native_failed_blocks_execute(
+        self,
+        state: HostPermissionState,
+        inspected_decision: TierDecision,
+        name: str,
+        native: tuple[NativeCallBinding, NativeSupport] | None,
+    ) -> bool:
+        if (
+            state.tier == "full"
+            or native is None
+            or native[1].status != NativeSupportStatus.FAILED
+        ):
+            return False
+        from omnigent.permission_tiers import _NATIVE_BOOTSTRAP_ERRORS, _NATIVE_SUBAGENT_TOOLS
+
+        return not (
+            state.tier == "auto"
+            and inspected_decision.action == Verdict.ALLOW
+            and inspected_decision.reason == "relaxed-auto:native-proof"
+            and name in _NATIVE_SUBAGENT_TOOLS
+            and native[1].reason not in _NATIVE_BOOTSTRAP_ERRORS
+        )
+
     def verify_execute(
         self,
         session_id: str,
@@ -1088,11 +1111,7 @@ class PermissionTierRuntime:
                 return False
             self._pi_receipt(session_id, origin_receipt, actual, local_execution=inspected[2])
             native = self._native_support(session_id, origin_receipt, arguments)
-            if (
-                state.tier != "full"
-                and native is not None
-                and native[1].status == NativeSupportStatus.FAILED
-            ):
+            if self._native_failed_blocks_execute(state, inspected[3], name, native):
                 return False
         except ValueError:
             return False
@@ -1148,11 +1167,7 @@ class PermissionTierRuntime:
                 return False
             self._pi_receipt(session_id, origin_receipt, actual, local_execution=inspected[2])
             native = self._native_support(session_id, origin_receipt, arguments)
-            if (
-                state.tier != "full"
-                and native is not None
-                and native[1].status == NativeSupportStatus.FAILED
-            ):
+            if self._native_failed_blocks_execute(state, inspected[3], name, native):
                 return False
         except ValueError:
             return False

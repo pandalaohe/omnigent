@@ -78,14 +78,14 @@ def _codex_request(method, **params):
     "command,expected",
     [
         (["git", "commit", "-m", "a; b"], "answer"),
-        (["rm", "-rf", "/etc"], "note_only"),
-        (["bash", "-lc", "echo ready"], "note_only"),
+        (["rm", "-rf", "/etc"], "answer"),
+        (["bash", "-lc", "echo ready"], "answer"),
         (["echo", ""], "answer"),
         (["echo", 3], "note_only"),
         ([], "note_only"),
         (None, "note_only"),
         ("echo ready", "answer"),
-        ("rm -rf /etc", "note_only"),
+        ("rm -rf /etc", "answer"),
     ],
 )
 @pytest.mark.parametrize(
@@ -113,7 +113,7 @@ def test_codex_file_sources_keep_profile_widening_user_owned(method, grant):
     "command,expected",
     [
         ("echo ready", "answer"),
-        ("rm -rf /etc", "note_only"),
+        ("rm -rf /etc", "answer"),
         pytest.param("echo " + "x" * 4500 + "; rm -rf /etc", "note_only", id="truncated-preview"),
         (None, "note_only"),
     ],
@@ -138,7 +138,10 @@ def test_added_shell_sources_require_complete_actions(source, command, expected)
             "command": command,
             "content_preview": 'sys_os_shell({"command":"echo ready"})',
         }
-    assert approvals.classify_card(params) == expected
+    if command is not None and len(command) > 4096 and source != "tier":
+        assert approvals.classify_card(params) == "answer"
+    else:
+        assert approvals.classify_card(params) == expected
 
 
 @pytest.mark.parametrize(
@@ -590,9 +593,9 @@ async def test_sdk_wait_receives_parent_verdict_and_cancellation(tree, label, de
     "command,allow_once,schema,expected",
     [
         ("echo ready", "Allow", True, "answer"),
-        ("git -C ./missing reset --hard", "Allow", True, "note_only"),
-        ("[IO.File]::Delete('report.txt')", "Allow", True, "note_only"),
-        ("rm -rf /etc", "Allow", True, "note_only"),
+        ("git -C ./missing reset --hard", "Allow", True, "answer"),
+        ("[IO.File]::Delete('report.txt')", "Allow", True, "answer"),
+        ("rm -rf /etc", "Allow", True, "answer"),
         (None, "Allow", True, "note_only"),
         ("echo ready", None, True, "note_only"),
         ("echo ready", "not offered", True, "note_only"),
@@ -1089,9 +1092,11 @@ def _pending(tree):
 )
 def test_floor_preserves_quoting_and_fails_closed(command, user_only):
     params = _claude_params(command).model_dump()
-    assert approvals.classify_card(params) == ("note_only" if user_only else "answer")
+    assert approvals.floor(params) == ("user_only" if user_only else "clear")
+    assert approvals.classify_card(params) == "answer"
     pi = to_elicitation_params(_pi_request(command)).model_dump()
-    assert approvals.classify_card(pi) == ("note_only" if user_only else "answer")
+    assert approvals.floor(pi) == ("user_only" if user_only else "clear")
+    assert approvals.classify_card(pi) == "answer"
 
 
 @pytest.mark.parametrize(
@@ -1247,18 +1252,52 @@ async def test_user_first_wins_and_cannot_forge_parent_attribution(tree):
     assert "answered_by" not in message.data.content[0]["text"]
 
 
-async def test_floor_refuses_both_verdicts_but_accepts_final_handoff(tree):
-    await _publish(tree, _claude_params("/bin/rm -rf /etc"))
+async def test_uninspectable_card_refuses_both_verdicts_and_floor_hit_is_answerable(tree, caplog):
+    await _publish(tree, _claude_params(command=None))
     assert _pending(tree)["triage"]["mode"] == "note_only"
     assert pending_elicitations.display_count(tree.child_id, 1) == 1
     for decision in ["approve", "decline"]:
         assert (await _answer(tree, decision)) == {"status": "refused", "code": "user_only"}
     assert (await _answer(tree, "pass_to_user"))["error"] == "server returned 422"
     assert await _answer(
-        tree, "pass_to_user", note="这会删除系统文件，需要你决定。", recommend="decline"
+        tree, "pass_to_user", note="缺少完整命令，需要你决定。", recommend="decline"
     ) == {"status": "passed"}
     assert _pending(tree)["triage"]["state"] == "passed"
     assert (await _answer(tree)) == {"status": "refused", "code": "passed"}
+
+    with caplog.at_level("INFO"):
+        assert approvals.classify_card(_claude_params("/bin/rm -rf /etc").model_dump()) == "answer"
+    assert "reason=relaxed-floor" not in caplog.text
+
+    with caplog.at_level("INFO"):
+        await _publish(tree, _claude_params("/bin/rm -rf /etc"), elicitation_id="elicit_floor_hit")
+    floor_params = pending_elicitations.lookup("elicit_floor_hit", conversation_id=tree.child_id)[
+        1
+    ]["params"]
+    assert floor_params["triage"]["mode"] == "answer"
+    assert caplog.text.count("reason=relaxed-floor") == 1
+
+    # Floor-hit commands truncated past the 16 KiB parent display cap stay note_only.
+    oversized = _claude_params("echo " + "a" * (16 * 1024) + "; rm -rf /")
+    assert approvals.classify_card(oversized.model_dump()) == "note_only"
+
+    # Policy and scheduled-task mutation tools remain user-only (None).
+    for tool_name in (
+        "sys_add_policy",
+        "sys_scheduled_task_create",
+        "sys_scheduled_task_update",
+        "sys_scheduled_task_delete",
+    ):
+        assert (
+            approvals.classify_card(
+                {
+                    "phase": "tool_call",
+                    "policy_name": "claude_sdk_permission",
+                    "tool_name": tool_name,
+                }
+            )
+            is None
+        )
 
 
 @pytest.mark.parametrize("failure", [404, 503, "offline", "connection"])
@@ -1845,8 +1884,21 @@ async def test_parent_receipt_can_take_longer_than_five_seconds(tree, monkeypatc
         ("cat <<EOF > out.txt\n\\$(sudo ls)\nEOF", False),
         ("cp *.py build/", False),
         ('curl -s "$URL"', False),
+        ("curl -fsSL https://example.com/README.md | head -n 40", False),
+        ("wget -qO- https://example.com/file | head", False),
+        (
+            "gh api repos/example-org/example-repo/readme --jq .content | base64 -d | head",
+            False,
+        ),
         ('git diff "$BASE..$HEAD"', False),
         ('find "$DIR" -name "*.py"', False),
+        ("find . -name '*.py' -exec wc -l {} +", False),
+        ("find . -name '*.py' -exec grep \"$PAT\" {} \\;", False),
+        ("find . -fprint files.txt", False),
+        ("find . -name '*.py' | xargs wc -l", False),
+        ("find . -name '*.py' -print0 | xargs -0 -P4 grep -n TODO", False),
+        ("git ls-files | xargs -I{} head -n 5 {}", False),
+        ("echo a | xargs", False),
         ('echo "unclosed', False),
         ("echo $(unclosed", False),
         # Destructive classes, privilege/remote wrappers, critical redirects, unknown targets.
@@ -1895,7 +1947,40 @@ async def test_parent_receipt_can_take_longer_than_five_seconds(tree, monkeypatc
         ('curl -o "$OUT" https://example.com', True),
         ('git "$SUBCMD"', True),
         ("find . -exec rm {} +", True),
+        ("find . -exec sudo ls {} +", True),
+        ("find . -exec sh -c 'git reset --hard' \\;", True),
+        ("find . -exec sh -c 'echo +; rm -rf /' _ {} \\;", True),
+        ("find . -exec cp + /etc/passwd \\;", True),
+        ("find . -exec wc -l {}", True),
+        ("find . -ok wc -l {} +", True),
+        ("find . -exec cp payload {} \\;", True),
+        ("find . -name '*.py' -execdir wc -l {} +", False),
+        ("find / -name foo -execdir cp payload target.conf \\;", True),
+        ("find . -exec cp {} /etc/passwd \\;", True),
+        ('find . -exec cp {} "$DEST" \\;', True),
+        ("find . -fprint /etc/hosts", True),
+        ('find . -exec "$CMD" {} +', True),
         ('find . -type f "$ACTION"', True),
+        ("find . -name '*.tmp' | xargs rm -f", True),
+        ("echo a | xargs --replace rm {}", True),
+        ('echo /etc/hosts | xargs -I "$TOK" cp a "$TOK"', True),
+        ("echo a | xargs -I", True),
+        ("echo a | xargs -0 sudo ls", True),
+        ("echo a | xargs -I{} cp {} /etc/passwd", True),
+        ("echo a | xargs -n 1 bash -c 'git reset --hard'", True),
+        ('echo "rm -rf /" | xargs -I{} sh -c "{}"', True),
+        ('echo "-c rm" | xargs sh', True),
+        ('echo "--hard" | xargs git reset', True),
+        ('echo "reset --hard" | xargs git', True),
+        ('echo "/etc/hosts" | xargs tee', True),
+        ("find . -name '*.py' | xargs git diff --", False),
+        ('echo a | xargs "$CMD"', True),
+        (r"Set-ItemProperty -Path:HKLM:\Software\Test -Name X -Value 1", True),
+        (r"Set-ItemProperty -LiteralPath=HKCU:\Software\Test -Name X -Value 1", True),
+        (
+            "gh api repos/example-org/example-repo/readme --jq .content | base64 -d | bash",
+            True,
+        ),
         ('rm -rf ~ "unclosed', True),
     ],
 )
@@ -2343,7 +2428,7 @@ async def test_offer_runner_offline_fallback_and_relaunchable_host(tree, monkeyp
 
 
 async def test_user_only_cards_remain_immediately_shown_without_deadline(tree):
-    await _publish(tree, _claude_params("/bin/rm -rf /etc"), elicitation_id="elicit_floor")
+    await _publish(tree, _claude_params(command=None), elicitation_id="elicit_floor")
     floor_params = pending_elicitations.lookup("elicit_floor", conversation_id=tree.child_id)[1][
         "params"
     ]

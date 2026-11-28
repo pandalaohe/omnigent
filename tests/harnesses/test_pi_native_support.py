@@ -228,9 +228,11 @@ def test_false_sharing_normalization_reaches_python_tier_without_rebinding(shari
         assert result.action == Verdict.ALLOW
         assert result.rule_id != "native-proof"
     changed = {**arguments, "task": "changed"}
-    assert decision("auto", "subagent", changed, host).rule_id == "native-proof"
+    assert decision("ask", "subagent", changed, host).rule_id == "native-proof"
+    assert decision("auto", "subagent", changed, host).reason == "relaxed-auto:native-proof"
     omitted = {key: value for key, value in arguments.items() if key not in ("share", "options")}
-    assert decision("auto", "subagent", omitted, host).rule_id == "native-proof"
+    assert decision("ask", "subagent", omitted, host).rule_id == "native-proof"
+    assert decision("auto", "subagent", omitted, host).reason == "relaxed-auto:native-proof"
     assert host.native_binding.arguments_digest == _native_digest(arguments)
 
 
@@ -245,7 +247,8 @@ def test_false_sharing_normalization_reaches_python_tier_without_rebinding(shari
 def test_native_sharing_normalization_rejects_true_conflicts_and_malformed_values(sharing):
     arguments = {"agent": "reader", "task": "read", "async": False, **sharing}
     host = _host("subagent", arguments, action="delegate", native_tools={"subagent": ""})
-    assert decision("auto", "subagent", arguments, host).rule_id == "native-proof"
+    assert decision("ask", "subagent", arguments, host).rule_id == "native-proof"
+    assert decision("auto", "subagent", arguments, host).reason == "relaxed-auto:native-proof"
 
 
 @pytest.mark.parametrize("tier", ["ask", "plan", "accept-edits", "auto"])
@@ -266,6 +269,9 @@ def test_failed_native_proof_denies_every_tool_kind(tier, name, arguments):
     if name == "subagent":
         if tier == "plan":
             assert result.action == Verdict.DENY
+        elif tier == "auto":
+            assert result.action == Verdict.ALLOW
+            assert result.reason == "relaxed-auto:native-proof"
         else:
             assert result.action == Verdict.ASK
             assert result.rule_id == "native-proof"
@@ -359,6 +365,9 @@ def test_verified_subagent_source_cannot_skip_input_and_cwd_semantics(tier, argu
     result = decision(tier, "subagent", arguments, host)
     if tier == "plan":
         assert result.action == Verdict.DENY
+    elif tier == "auto":
+        assert result.action == Verdict.ALLOW
+        assert result.reason == "relaxed-auto:native-proof"
     else:
         assert result.action == Verdict.ASK
         assert result.rule_id == "native-proof"
@@ -386,10 +395,12 @@ def test_positive_outside_native_support_keeps_unknown_tool_policy(tier, kind):
         "ask": Verdict.ASK,
         "accept-edits": Verdict.ASK,
         "plan": Verdict.DENY,
-        "auto": Verdict.ASK,
+        "auto": Verdict.ALLOW,
     }[tier]
     assert result.action == expected
     assert result.rule_id != "native-proof"
+    if tier == "auto":
+        assert result.reason == "relaxed-auto:unknown-tool"
 
 
 def test_unproven_outside_classification_fails_and_payload_lookalikes_grant_nothing():

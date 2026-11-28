@@ -4309,7 +4309,7 @@ def test_claude_sdk_question_card_keeps_full_questions() -> None:
 @pytest.mark.parametrize("label", ["Claude", "Codex"])
 def test_sdk_permission_card_carries_complete_shell_action(label) -> None:
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
-    from omnigent.server.child_approvals import classify_card
+    from omnigent.server.child_approvals import classify_card, floor
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor(), harness_label=label)
     command = "echo " + "x" * 400 + "; rm -rf /etc"
@@ -4317,7 +4317,8 @@ def test_sdk_permission_card_carries_complete_shell_action(label) -> None:
     data = params.model_dump()
     assert data["tool_name"] == "mcp__omnigent__sys_os_shell"
     assert data["command"] == command
-    assert classify_card(data) == "note_only"
+    assert floor(data) == "user_only"
+    assert classify_card(data) == "answer"
     assert (
         classify_card(adapter._permission_card("Read", {"path": "src/app.py"}).model_dump())
         == "answer"

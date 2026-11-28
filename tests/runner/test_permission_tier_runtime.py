@@ -180,7 +180,7 @@ def _runtime(
 ) -> PermissionTierRuntime:
     runtime = runtime or PermissionTierRuntime()
     workspace = tmp_path / "workspace"
-    workspace.mkdir()
+    workspace.mkdir(parents=True, exist_ok=True)
     state = HostPermissionState(
         session_id="session-a",
         host_id="host-a",
@@ -213,6 +213,12 @@ def _runtime(
             "auto",
             "sys_os_write",
             {"path": "../outside.txt", "content": "fixture"},
+            Verdict.ALLOW,
+        ),
+        (
+            "auto",
+            "sys_os_write",
+            {"path": "/boot/grub.cfg", "content": "fixture"},
             Verdict.ASK,
         ),
         ("auto", "sys_os_write", {"path": "note.txt", "content": "fixture"}, Verdict.ALLOW),
@@ -229,7 +235,8 @@ def _runtime(
             {"CommandLine": 'pwsh -Command "git branch -D main"'},
             Verdict.ASK,
         ),
-        ("auto", "unknown", {}, Verdict.ASK),
+        ("auto", "unknown", {}, Verdict.ALLOW),
+        ("ask", "unknown", {}, Verdict.ASK),
         ("plan", "unknown", {}, Verdict.DENY),
     ],
 )
@@ -927,6 +934,77 @@ def test_pi_native_attestation_keeps_identical_calls_and_refreshes_distinct(tmp_
     )
     assert seen.count(binding_a.call_id) >= 3
     assert seen.count(binding_b.call_id) >= 2
+
+
+def test_pi_scoped_subagent_failed_proof_auto_vs_bootstrap_lease_checks(tmp_path):
+    runtime, _parent, _child, _source, _registry = _scoped_runtime(tmp_path, "auto")
+    child = runtime.open_pi_child_scope("session-a")
+    tools = [{"name": "subagent", "sourceInfo": {"source": "builtin", "path": "builtin:subagent"}}]
+    _write_scope_registry(child, tools)
+    assert runtime.acknowledge_pi_scope("session-a", child.credential)
+    record = runtime.pi_scopes.record(child.principal)
+    expected = record.expected
+    guard = Path(expected["extension_path"])
+    snap = NativeInputSnapshot(str(guard), str(guard.resolve()), expected["extension_sha256"])
+
+    def classify(canonical_call_id, binding, _arguments):
+        reason = (
+            "Native bootstrap support is missing, malformed or stale"
+            if canonical_call_id.endswith(
+                hashlib.sha256((child.principal.scope_id + "\0boot").encode()).hexdigest()
+            )
+            else "Semantic proof unavailable"
+        )
+        return NativeSupport(binding, NativeSupportStatus.FAILED, reason=reason, inputs=(snap,))
+
+    runtime.install_pi_native_classifier(child.principal, classify)
+    args = {"agent": "worker", "task": "Read a.py"}
+    ok_receipt, ok_binding, ok_decision = _scope_call(
+        runtime, child, call_id="sem", name="subagent", arguments=args
+    )
+    assert ok_decision.action.value == "ALLOW"
+    assert ok_decision.reason == "relaxed-auto:native-proof"
+    assert runtime.authorize(
+        "session-a",
+        call_id=ok_binding.call_id,
+        name="subagent",
+        arguments_digest=ok_binding.arguments_digest,
+        expected_revision=3,
+        origin_receipt=ok_receipt.token,
+    )
+    assert runtime.matches_authorized_call(
+        "session-a",
+        call_id=ok_binding.call_id,
+        revision=3,
+        arguments_digest=ok_binding.arguments_digest,
+        name="subagent",
+        arguments=args,
+        origin_receipt=ok_receipt.token,
+    )
+    assert runtime.verify_execute(
+        "session-a",
+        call_id=ok_binding.call_id,
+        revision=3,
+        arguments_digest=ok_binding.arguments_digest,
+        name="subagent",
+        arguments=args,
+        operation_id="subagent-run",
+        step="launch",
+        origin_receipt=ok_receipt.token,
+    )
+
+    boot_receipt, boot_binding, boot_decision = _scope_call(
+        runtime, child, call_id="boot", name="subagent", arguments=args
+    )
+    assert boot_decision.action.value == "DENY"
+    assert not runtime.authorize(
+        "session-a",
+        call_id=boot_binding.call_id,
+        name="subagent",
+        arguments_digest=boot_binding.arguments_digest,
+        expected_revision=3,
+        origin_receipt=boot_receipt.token,
+    )
 
 
 @pytest.mark.parametrize("untrusted", [None, "", "forged", {}, {"origin": "parent"}])
@@ -1660,8 +1738,8 @@ async def test_scoped_native_http_policy_runs_through_server_and_runner(tmp_path
                     for name, expected in (
                         ("notes__search", "POLICY_ACTION_UNSPECIFIED"),
                         ("notes___search", "POLICY_ACTION_UNSPECIFIED"),
-                        ("notes___overlap", "POLICY_ACTION_DENY"),
-                        ("notes__unlisted", "POLICY_ACTION_DENY"),
+                        ("notes___overlap", "POLICY_ACTION_UNSPECIFIED"),
+                        ("notes__unlisted", "POLICY_ACTION_UNSPECIFIED"),
                     ):
                         remote = await client.post(
                             "/policies/evaluate",
@@ -1683,8 +1761,10 @@ async def test_scoped_native_http_policy_runs_through_server_and_runner(tmp_path
                         json=event,
                         headers={"Authorization": "Bearer " + parent.credential},
                     )
-                    assert parent_response.json()["result"] == "POLICY_ACTION_DENY"
-                    assert len(asked_tools) == 3
+                    parent_body = parent_response.json()
+                    assert parent_body["result"] == "POLICY_ACTION_UNSPECIFIED"
+                    parent_binding = parent_body["permission_tier_binding"]
+                    assert len(asked_tools) == 0
                     bypass = await client.post(
                         "/permission-tiers/control",
                         headers=child_headers,
@@ -1735,6 +1815,17 @@ async def test_scoped_native_http_policy_runs_through_server_and_runner(tmp_path
                         "/permission-tiers/control", headers=child_headers, json=finish
                     )
                     assert settled.json().get("finished") is True
+                    parent_settled = await client.post(
+                        "/permission-tiers/control",
+                        headers={"Authorization": "Bearer " + parent.credential},
+                        json={
+                            "type": "permission_tier_finish",
+                            "call_id": parent_binding["call_id"],
+                            "expected_revision": 3,
+                            "pi_origin_receipt": parent_binding["pi_origin_receipt"],
+                        },
+                    )
+                    assert parent_settled.json().get("finished") is True
                     assert runtime.idle("session-a")
             finally:
                 relay.close()
@@ -1905,6 +1996,28 @@ async def test_pi_subagent_denial_cannot_open_card_or_acquire_launch_lease(
             arguments_digest=binding.arguments_digest,
             expected_revision=3,
         )
+    elif tier == "auto":
+        assert decision.action.value == "ALLOW"
+        assert decision.reason == "relaxed-auto:native-proof"
+        assert cards == []
+        assert runtime.authorize(
+            "session-a",
+            call_id=binding.call_id,
+            name=binding.name,
+            arguments_digest=binding.arguments_digest,
+            expected_revision=3,
+        )
+        assert runtime.verify_execute(
+            "session-a",
+            call_id=binding.call_id,
+            revision=3,
+            arguments_digest=binding.arguments_digest,
+            name=binding.name,
+            arguments=arguments,
+            operation_id="native-launch",
+            step="launch",
+        )
+        return
     else:
         assert decision.action.value == "ASK"
         assert decision.rule_id == "native-proof"
@@ -1932,22 +2045,32 @@ async def test_pi_subagent_denial_cannot_open_card_or_acquire_launch_lease(
 
 @pytest.mark.parametrize("scope", ["project", "temporary", "unknown"])
 def test_extension_scope_cannot_claim_builtin_read_permissions(tmp_path, scope):
-    runtime, _source, _registry = _extension_runtime(tmp_path, "auto", scope, "read")
-    _binding, decision = runtime.inspect(
+    ask_runtime, _source, _registry = _extension_runtime(tmp_path / "ask", "ask", scope, "read")
+    _binding, ask_decision = ask_runtime.inspect(
         "session-a",
         call_id="collision",
         name="read",
         arguments={"path": "notes.txt"},
         expected_revision=3,
     )
-    assert decision.action.value == "ASK"
-    assert "extension" in decision.reason.lower()
+    assert ask_decision.action.value == "ASK"
+    assert "extension" in ask_decision.reason.lower()
+    auto_runtime, _source, _registry = _extension_runtime(tmp_path / "auto", "auto", scope, "read")
+    _binding, auto_decision = auto_runtime.inspect(
+        "session-a",
+        call_id="collision",
+        name="read",
+        arguments={"path": "notes.txt"},
+        expected_revision=3,
+    )
+    assert auto_decision.action.value == "ALLOW"
+    assert auto_decision.reason == "relaxed-auto:unknown-tool"
 
 
 @pytest.mark.parametrize(
     ("tier", "expected"),
     [
-        ("auto", "ASK"),
+        ("auto", "ALLOW"),
         ("ask", "ASK"),
         ("accept-edits", "ASK"),
         ("plan", "DENY"),
@@ -2057,11 +2180,11 @@ def test_extension_implementation_and_configuration_are_control_paths(tmp_path, 
 
 @pytest.mark.parametrize("source", [None, {}, {"scope": "user", "source": "sdk"}])
 def test_tool_arguments_cannot_supply_missing_extension_provenance(tmp_path, source):
-    runtime, _entry, registry = _extension_runtime(tmp_path, "auto")
+    ask_runtime, _entry, registry = _extension_runtime(tmp_path / "ask", "ask")
     registry["tools"][0]["sourceInfo"] = source
-    bridge = runtime.path("session-a").parent
+    bridge = ask_runtime.path("session-a").parent
     (bridge / "permission_tools.json").write_text(json.dumps(registry))
-    _binding, decision = runtime.inspect(
+    _binding, ask_decision = ask_runtime.inspect(
         "session-a",
         call_id="spoof",
         name="google_search",
@@ -2072,8 +2195,22 @@ def test_tool_arguments_cannot_supply_missing_extension_provenance(tmp_path, sou
         },
         expected_revision=3,
     )
-    assert decision.action.value == "ASK"
-    assert "extension source" in decision.reason
+    assert ask_decision.action.value == "ASK"
+    assert "extension source" in ask_decision.reason
+    auto_runtime, _entry, auto_registry = _extension_runtime(tmp_path / "auto", "auto")
+    auto_registry["tools"][0]["sourceInfo"] = source
+    (auto_runtime.path("session-a").parent / "permission_tools.json").write_text(
+        json.dumps(auto_registry)
+    )
+    _binding, auto_decision = auto_runtime.inspect(
+        "session-a",
+        call_id="spoof",
+        name="google_search",
+        arguments={"readOnlyHint": True},
+        expected_revision=3,
+    )
+    assert auto_decision.action.value == "ALLOW"
+    assert auto_decision.reason == "relaxed-auto:unknown-tool"
 
 
 @pytest.mark.parametrize(
@@ -2081,7 +2218,7 @@ def test_tool_arguments_cannot_supply_missing_extension_provenance(tmp_path, sou
     [
         ("ask", "ASK"),
         ("accept-edits", "ASK"),
-        ("auto", "ASK"),
+        ("auto", "ALLOW"),
         ("plan", "DENY"),
         ("full", "ALLOW"),
     ],
@@ -2106,8 +2243,8 @@ def test_incomplete_initial_local_extension_source_is_untrusted_not_changed(
 
 
 def test_verified_extension_registry_is_not_remote_tool_authority(tmp_path):
-    runtime, _entry, _registry = _extension_runtime(tmp_path, "auto")
-    _binding, decision = runtime.inspect(
+    ask_runtime, _entry, _registry = _extension_runtime(tmp_path / "ask", "ask")
+    _binding, ask_decision = ask_runtime.inspect(
         "session-a",
         call_id="remote",
         name="google_search",
@@ -2115,7 +2252,18 @@ def test_verified_extension_registry_is_not_remote_tool_authority(tmp_path):
         expected_revision=3,
         local_execution=False,
     )
-    assert decision.action.value == "ASK"
+    assert ask_decision.action.value == "ASK"
+    auto_runtime, _entry, _registry = _extension_runtime(tmp_path / "auto", "auto")
+    _binding, auto_decision = auto_runtime.inspect(
+        "session-a",
+        call_id="remote",
+        name="google_search",
+        arguments={},
+        expected_revision=3,
+        local_execution=False,
+    )
+    assert auto_decision.action.value == "ALLOW"
+    assert auto_decision.reason == "relaxed-auto:unknown-tool"
 
 
 def test_user_extension_symlink_protects_the_resolved_package(tmp_path):
@@ -2193,17 +2341,23 @@ def test_cli_permission_fence_uses_authenticated_runner_binding(tmp_path, monkey
 
 
 @pytest.mark.parametrize(
-    ("name", "local_execution", "expected"),
+    ("tier", "name", "local_execution", "expected"),
     [
-        ("sys_read_inbox", True, "ALLOW"),
-        ("sys_read_inbox", False, "ASK"),
-        ("unknown_control", True, "ASK"),
+        ("auto", "sys_read_inbox", True, "ALLOW"),
+        ("auto", "sys_read_inbox", False, "ALLOW"),
+        ("auto", "unknown_control", True, "ALLOW"),
+        ("ask", "sys_read_inbox", True, "ALLOW"),
+        ("ask", "sys_read_inbox", False, "ASK"),
+        ("ask", "unknown_control", True, "ASK"),
+        ("plan", "sys_read_inbox", True, "ALLOW"),
+        ("plan", "sys_read_inbox", False, "DENY"),
+        ("plan", "unknown_control", True, "DENY"),
     ],
 )
 def test_framework_inbox_requires_local_execution(
-    tmp_path: Path, name: str, local_execution: bool, expected: str
+    tmp_path: Path, tier: str, name: str, local_execution: bool, expected: str
 ) -> None:
-    runtime = _runtime(tmp_path, "auto")
+    runtime = _runtime(tmp_path, tier)
     _binding, decision = runtime.inspect(
         "session-a",
         call_id="inbox",
@@ -2216,8 +2370,8 @@ def test_framework_inbox_requires_local_execution(
 
 
 def test_remote_tool_name_cannot_impersonate_local_write(tmp_path: Path) -> None:
-    runtime = _runtime(tmp_path, "auto")
-    _binding, decision = runtime.inspect(
+    ask_runtime = _runtime(tmp_path / "ask", "ask")
+    _binding, ask_decision = ask_runtime.inspect(
         "session-a",
         call_id="call-a",
         name="sys_os_write",
@@ -2225,7 +2379,18 @@ def test_remote_tool_name_cannot_impersonate_local_write(tmp_path: Path) -> None
         expected_revision=3,
         local_execution=False,
     )
-    assert decision.action.value == "ASK"
+    assert ask_decision.action.value == "ASK"
+    auto_runtime = _runtime(tmp_path / "auto", "auto")
+    _binding, auto_decision = auto_runtime.inspect(
+        "session-a",
+        call_id="call-a",
+        name="sys_os_write",
+        arguments={"path": str(tmp_path / "data.txt"), "content": "x"},
+        expected_revision=3,
+        local_execution=False,
+    )
+    assert auto_decision.action.value == "ALLOW"
+    assert auto_decision.reason == "relaxed-auto:unknown-tool"
 
 
 def test_approval_requires_inspection_and_cannot_replay(tmp_path: Path) -> None:
@@ -3198,16 +3363,24 @@ async def test_acp_live_full_to_auto_switch_rejects_active_turn_and_updates_next
         ("tool_search", {"query": "session"}, True, Verdict.ALLOW),
         ("write", {"path": "../note.txt", "content": "fixture"}, True, Verdict.ALLOW),
         ("edit", {"path": "../note.txt", "oldText": "a", "newText": "b"}, True, Verdict.ALLOW),
-        ("write", {"path": "../../outside.txt", "content": "fixture"}, True, Verdict.ASK),
+        ("write", {"path": "../../outside.txt", "content": "fixture"}, True, Verdict.ALLOW),
+        ("write", {"path": "/boot/grub.cfg", "content": "fixture"}, True, Verdict.ASK),
         ("sys_os_shell", {"command": "omni --version"}, False, Verdict.ALLOW),
         ("sys_os_shell", {"command": "echo $HOME"}, False, Verdict.ALLOW),
         ("sys_os_shell", {"command": "git reset --hard"}, False, Verdict.ASK),
         ("sys_os_shell", {"command": "rm -rf /"}, False, Verdict.DENY),
-        ("sys_os_write", {"path": "../../outside.txt", "content": "fixture"}, False, Verdict.ASK),
+        (
+            "sys_os_write",
+            {"path": "../../outside.txt", "content": "fixture"},
+            False,
+            Verdict.ALLOW,
+        ),
+        ("sys_os_write", {"path": "/boot/grub.cfg", "content": "fixture"}, False, Verdict.ASK),
         ("sys_os_write", {"path": "../note.txt", "content": "fixture"}, False, Verdict.ALLOW),
-        # Bridged non-local tools reusing Pi built-in names must not inherit builtin READ.
-        ("tool_search", {"query": "session"}, False, Verdict.ASK),
-        ("grep", {"pattern": "TODO"}, False, Verdict.ASK),
+        # Bridged non-local tools reusing Pi built-in names relax under auto (unknown-tool)
+        # while plan/ask still distinguish them from genuine built-ins.
+        ("tool_search", {"query": "session"}, False, Verdict.ALLOW),
+        ("grep", {"pattern": "TODO"}, False, Verdict.ALLOW),
     ],
 )
 def test_scoped_pi_auto_classifies_native_and_bridged_calls(
@@ -3253,7 +3426,7 @@ def test_scoped_pi_auto_classifies_native_and_bridged_calls(
 
 
 def test_legacy_pi_inspect_rejects_bridge_collision_with_builtin_name(tmp_path: Path) -> None:
-    runtime, _source, registry = _extension_runtime(tmp_path, "auto")
+    runtime, _source, registry = _extension_runtime(tmp_path, "ask")
     registry["tools"] = [
         {
             "name": "grep",
@@ -3320,9 +3493,9 @@ def test_pi_scope_unlisted_bridged_tool_is_denied_in_auto(tmp_path):
         assert decision.action.value == "ALLOW", (name, decision.reason)
 
     for call_id, name, arguments, expected_action in (
-        ("calc-call", "calculate", {"expression": "19 * 23"}, "ASK"),
-        ("terminal-call", "sys_terminal_launch", {"command": "sh"}, "ASK"),
-        ("unlisted-call", "unlisted_bridge_tool", {"x": 1}, "ASK"),
+        ("calc-call", "calculate", {"expression": "19 * 23"}, "ALLOW"),
+        ("terminal-call", "sys_terminal_launch", {"command": "sh"}, "ALLOW"),
+        ("unlisted-call", "unlisted_bridge_tool", {"x": 1}, "ALLOW"),
     ):
         receipt = runtime.pi_origin_receipt(
             "session-a",
@@ -3342,7 +3515,7 @@ def test_pi_scope_unlisted_bridged_tool_is_denied_in_auto(tmp_path):
             origin_receipt=receipt.token,
         )
         assert decision.action.value == expected_action, (name, decision.reason)
-        assert decision.reason == "Unknown tool schema"
+        assert decision.reason == "relaxed-auto:unknown-tool"
 
 
 @pytest.mark.asyncio
@@ -3452,8 +3625,8 @@ def test_agy_remote_registry_tool_uses_shared_tier_classifier(tmp_path, tier, ac
     runtime = _runtime(tmp_path, tier)
     for local_execution, registry_tool, expected in (
         (False, True, action),
-        (False, False, "ASK" if tier == "auto" else action),
-        (True, True, "ASK" if tier == "auto" else action),
+        (False, False, "ALLOW" if tier == "auto" else action),
+        (True, True, "ALLOW" if tier == "auto" else action),
     ):
         _, decision = runtime.inspect(
             "session-a",
@@ -3465,12 +3638,14 @@ def test_agy_remote_registry_tool_uses_shared_tier_classifier(tmp_path, tier, ac
             registry_tool=registry_tool,
         )
         assert decision.action.value == expected
+        if tier == "auto" and not (not local_execution and registry_tool):
+            assert decision.reason == "relaxed-auto:unknown-tool"
 
 
 @pytest.mark.parametrize(
     "tier,action,reason",
     [
-        ("auto", "ASK", "Unknown tool schema"),
+        ("auto", "ALLOW", "relaxed-auto:unknown-tool"),
         ("plan", "DENY", "Plan tier permits only known reads and user questions"),
         ("ask", "ASK", "Unknown tool schema"),
     ],

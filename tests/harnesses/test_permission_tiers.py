@@ -97,12 +97,14 @@ def test_agy_delegation_requires_current_host_proof(tier, status):
     )
     expected = (
         Verdict.ALLOW
-        if tier == "full" or status == "proven"
+        if tier in ("full", "auto") or status == "proven"
         else (Verdict.DENY if tier == "plan" else Verdict.ASK)
     )
     assert result.action == expected
-    if status == "failed" and tier not in ("full", "plan"):
+    if status == "failed" and tier in ("ask", "accept-edits"):
         assert result.rule_id == "native-proof"
+    if status != "proven" and tier == "auto":
+        assert result.reason.startswith("relaxed-auto:")
 
 
 @pytest.mark.parametrize(
@@ -118,7 +120,9 @@ def test_agy_delegation_requires_current_host_proof(tier, status):
 def test_agy_proof_does_not_authorize_unchecked_spawn_arguments(extra):
     host = posix_host(agy_delegation_status="proven")
     arguments = {"TypeName": "self", "Prompt": "Read the workspace", **extra}
-    assert decision("auto", "invoke_subagent", arguments, host).action == Verdict.ASK
+    auto_res = decision("auto", "invoke_subagent", arguments, host)
+    assert auto_res.action == Verdict.ALLOW
+    assert auto_res.reason == "relaxed-auto:unknown-tool"
     assert decision("ask", "invoke_subagent", arguments, host).action == Verdict.ASK
     assert decision("plan", "invoke_subagent", arguments, host).action == Verdict.DENY
 
@@ -196,6 +200,9 @@ def test_pi_subagent_is_never_approvable_below_full(tier, background, verified):
     result = decision(tier, "subagent", arguments, host)
     if tier == "plan":
         assert result.action == Verdict.DENY
+    elif tier == "auto":
+        assert result.action == Verdict.ALLOW
+        assert result.reason == "relaxed-auto:native-proof"
     else:
         assert result.action == Verdict.ASK
         assert result.rule_id == "native-proof"
@@ -340,9 +347,21 @@ def test_agy_operations_keep_existing_operational_tiers(name, args):
 def test_uncheckable_agy_tools_keep_fail_closed_tiers_and_explain_why(name, args, reason):
     result = decision("auto", name, args)
     is_native_grant = name in ("ask_permission", "ask_custom_permission")
-    assert result.action == (Verdict.DENY if is_native_grant else Verdict.ASK)
-    assert reason in result.reason
-    assert decision("ask", name, args).action == (Verdict.DENY if is_native_grant else Verdict.ASK)
+    is_terminal_input = name == "send_command_input" or (
+        name == "manage_task" and args.get("Action") == "send_input"
+    )
+    if is_native_grant:
+        assert result.action == Verdict.DENY
+        assert reason in result.reason
+    elif is_terminal_input:
+        assert result.action == Verdict.ASK
+        assert reason in result.reason
+    else:
+        assert result.action == Verdict.ALLOW
+        assert result.reason == "relaxed-auto:unknown-tool"
+    ask_result = decision("ask", name, args)
+    assert ask_result.action == (Verdict.DENY if is_native_grant else Verdict.ASK)
+    assert reason in ask_result.reason
     assert decision("plan", name, args).action == Verdict.DENY
     assert decision("accept-edits", name, args).action == (
         Verdict.DENY if is_native_grant else Verdict.ASK
@@ -350,11 +369,13 @@ def test_uncheckable_agy_tools_keep_fail_closed_tiers_and_explain_why(name, args
     assert decision("full", name, args).action == Verdict.ALLOW
 
 
-def test_unseen_agy_tool_asks_under_auto_and_denies_under_plan():
+def test_unseen_agy_tool_allows_under_auto_and_denies_under_plan():
     result = decision("auto", "future_agy_tool", {})
-    assert result.action == Verdict.ASK
-    assert "Unknown tool schema" in result.reason
-    assert decision("ask", "future_agy_tool", {}).action == Verdict.ASK
+    assert result.action == Verdict.ALLOW
+    assert result.reason == "relaxed-auto:unknown-tool"
+    ask_result = decision("ask", "future_agy_tool", {})
+    assert ask_result.action == Verdict.ASK
+    assert "Unknown tool schema" in ask_result.reason
     assert decision("accept-edits", "future_agy_tool", {}).action == Verdict.ASK
     assert decision("plan", "future_agy_tool", {}).action == Verdict.DENY
     assert decision("full", "future_agy_tool", {}).action == Verdict.ALLOW
@@ -612,7 +633,9 @@ def test_panel_presentation_rejects_unconfirmed_target_paths() -> None:
         return ResolvedPath(path, "directory" if path == "/opt/work/project" else "unknown")
 
     for tier in NON_FULL_TIERS:
-        expected = Verdict.DENY if tier == "plan" else Verdict.ASK
+        expected = (
+            Verdict.DENY if tier == "plan" else (Verdict.ALLOW if tier == "auto" else Verdict.ASK)
+        )
         assert (
             decision(
                 tier, "open_in_panel", {"path": "report.html"}, posix_host(resolver=unresolved)
@@ -751,16 +774,16 @@ def test_antigravity_mcp_calls_classify_the_omnigent_target(
 @pytest.mark.parametrize(
     ("name", "auto_action"),
     [
-        # Unclassified tools (including deferred sys_* tools) ask by approval card under auto (D3).
-        ("sys_agent_download", Verdict.ASK),
-        ("sys_call_async", Verdict.ASK),
-        ("sys_flow_start", Verdict.ASK),
-        ("sys_terminal_launch", Verdict.ASK),
-        ("sys_future_read", Verdict.ASK),
-        ("browser_future_read", Verdict.ASK),
-        ("web_search", Verdict.ASK),
-        ("third_party", Verdict.ASK),
-        ("calculate", Verdict.ASK),
+        # Unclassified tools (including deferred sys_* tools) relax to ALLOW under auto.
+        ("sys_agent_download", Verdict.ALLOW),
+        ("sys_call_async", Verdict.ALLOW),
+        ("sys_flow_start", Verdict.ALLOW),
+        ("sys_terminal_launch", Verdict.ALLOW),
+        ("sys_future_read", Verdict.ALLOW),
+        ("browser_future_read", Verdict.ALLOW),
+        ("web_search", Verdict.ALLOW),
+        ("third_party", Verdict.ALLOW),
+        ("calculate", Verdict.ALLOW),
     ],
 )
 def test_deferred_and_unregistered_tools_keep_unknown_tiers(
@@ -770,7 +793,9 @@ def test_deferred_and_unregistered_tools_keep_unknown_tiers(
     assert decision("ask", name, {}).action == Verdict.ASK
     assert decision("plan", name, {}).action == Verdict.DENY
     assert decision("accept-edits", name, {}).action == Verdict.ASK
-    assert decision("auto", name, {}).action == auto_action
+    auto_res = decision("auto", name, {})
+    assert auto_res.action == auto_action
+    assert auto_res.reason == "relaxed-auto:unknown-tool"
     assert decision("full", name, {}).action == Verdict.ALLOW
     assert plan_visible_tool_names((name,)) == ()
     assert (
@@ -789,7 +814,9 @@ def test_third_party_mcp_server_cannot_reuse_known_omnigent_names() -> None:
         assert decision("ask", "call_mcp_tool", args).action == Verdict.ASK
         assert decision("plan", "call_mcp_tool", args).action == Verdict.DENY
         assert decision("accept-edits", "call_mcp_tool", args).action == Verdict.ASK
-        assert decision("auto", "call_mcp_tool", args).action == Verdict.ASK
+        auto_res = decision("auto", "call_mcp_tool", args)
+        assert auto_res.action == Verdict.ALLOW
+        assert auto_res.reason == "relaxed-auto:unknown-tool"
         assert decision("full", "call_mcp_tool", args).action == Verdict.ALLOW
 
 
@@ -1450,6 +1477,7 @@ def test_windows_drive_unc_ads_device_and_system(option_command: str, expected: 
         assert (
             decision("auto", "write", {"path": path, "content": "x"}, host).action == Verdict.ASK
         )
+        assert decision("ask", "write", {"path": path, "content": "x"}, host).action == Verdict.ASK
         assert (
             decision("plan", "write", {"path": path, "content": "x"}, host).action == Verdict.DENY
         )
@@ -3649,14 +3677,16 @@ def test_pi_tool_search_extension_and_non_local_do_not_inherit_builtin_read() ->
 
     untrusted_ext = pi_host(extension_tools={"tool_search": "untrusted"})
     assert adapt_tool_call("tool_search", {"query": "x"}, untrusted_ext).kind == ToolKind.UNKNOWN
-    assert decision("auto", "tool_search", {"query": "x"}, untrusted_ext).action == Verdict.ASK
+    assert decision("auto", "tool_search", {"query": "x"}, untrusted_ext).action == Verdict.ALLOW
+    assert decision("ask", "tool_search", {"query": "x"}, untrusted_ext).action == Verdict.ASK
     assert decision("plan", "tool_search", {"query": "x"}, untrusted_ext).action == Verdict.DENY
 
     remote = pi_host(local_execution=False)
     intent = adapt_tool_call("tool_search", {"query": "x"}, remote)
     assert (intent.kind, intent.unseen_tool) == (ToolKind.UNKNOWN, False)
     assert decision("plan", "tool_search", {"query": "x"}, remote).action == Verdict.DENY
-    assert decision("auto", "tool_search", {"query": "x"}, remote).action == Verdict.ASK
+    assert decision("ask", "tool_search", {"query": "x"}, remote).action == Verdict.ASK
+    assert decision("auto", "tool_search", {"query": "x"}, remote).action == Verdict.ALLOW
 
 
 @pytest.mark.parametrize(
@@ -3823,7 +3853,10 @@ def test_binding_failures_never_turn_well_formed_calls_invalid(
     edit_intent = adapt_tool_call("write_file", {"Path": "weird*.txt", "Content": "x"}, host)
     assert edit_intent.status == "ok"
     assert edit_intent.target == ResolvedPath("weird*.txt", "unknown")
-    assert decide_tier("auto", edit_intent, RULES).action == Verdict.ASK
+    auto_edit = decide_tier("auto", edit_intent, RULES)
+    assert auto_edit.action == Verdict.ALLOW
+    assert auto_edit.reason == "relaxed-auto:unknown-target"
+    assert decide_tier("ask", edit_intent, RULES).action == Verdict.ASK
     assert decide_tier("plan", edit_intent, RULES).action == Verdict.DENY
 
     # run_command Cwd resolve failure -> command_opaque, not invalid
@@ -4089,8 +4122,13 @@ def test_persistent_run_command_runs_d2_checks_before_d3_ask() -> None:
         host,
     )
     assert (ctrl_res.action, ctrl_res.rule_id) == (Verdict.DENY, "control-path")
+    persistent_auto = decision(
+        "auto", "run_command", {"CommandLine": "pwd", "RunPersistent": True}, host
+    )
+    assert persistent_auto.action == Verdict.ALLOW
+    assert persistent_auto.reason == "relaxed-auto:unknown-tool"
     assert (
-        decision("auto", "run_command", {"CommandLine": "pwd", "RunPersistent": True}, host).action
+        decision("ask", "run_command", {"CommandLine": "pwd", "RunPersistent": True}, host).action
         == Verdict.ASK
     )
     assert (
@@ -4177,4 +4215,36 @@ def test_r2_symlink_lexical_escape_windows_operand_fallback_and_persistent_cwd()
         {"CommandLine": "cat ../control/tier", "RunPersistent": True},
         host,
     )
-    assert rel_res.action == Verdict.ASK
+    assert rel_res.action == Verdict.ALLOW
+    assert rel_res.reason == "relaxed-auto:unknown-tool"
+    assert (
+        decision(
+            "ask",
+            "run_command",
+            {"CommandLine": "cat ../control/tier", "RunPersistent": True},
+            host,
+        ).action
+        == Verdict.ASK
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        r"\\?\C:\Windows\System32\drivers\etc\hosts",
+        r"\\.\PhysicalDrive0",
+        r"\Windows\System32\drivers\etc\hosts",
+        r"/Windows/win.ini",
+        r"%UNKNOWN_ROOT%\win.ini",
+        r"D:Windows\win.ini",
+    ],
+)
+def test_windows_unknown_critical_or_namespace_edit_stays_ask_under_auto(path: str) -> None:
+    def failing_resolver(raw: str) -> ResolvedPath:
+        if raw == path or raw.endswith(path):
+            raise OSError("cannot resolve")
+        return ResolvedPath(raw, "directory")
+
+    host = windows_host(resolver=failing_resolver)
+    result = decision("auto", "write", {"path": path, "content": "x"}, host)
+    assert result.action == Verdict.ASK
