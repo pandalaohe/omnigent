@@ -4135,7 +4135,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
     :param msg: Decoded frame object.
     :returns: Typed host hello frame.
     """
-    from omnigent.permission_tiers import NON_FULL_TIERS
+    from omnigent.permission_tiers import PERMISSION_TIERS
 
     raw_tiers = msg.get("acp_permission_tiers")
     acp_permission_tiers: dict[str, str] = (
@@ -4145,7 +4145,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
             if isinstance(key, str)
             and key.startswith("acp:")
             and isinstance(value, str)
-            and value in NON_FULL_TIERS
+            and value in PERMISSION_TIERS
         }
         if isinstance(raw_tiers, dict)
         else {}

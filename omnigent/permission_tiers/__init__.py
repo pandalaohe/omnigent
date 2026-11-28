@@ -587,8 +587,6 @@ def normalize_permission_tier(raw: object, *, harness: str, legacy: bool) -> Per
         return "auto"
     if not isinstance(raw, str) or raw not in PERMISSION_TIERS:
         raise ValueError("Missing permission tier")
-    if acp and raw == "full":
-        raise ValueError("Full permission is unavailable for ACP host tiers")
     return raw
 
 

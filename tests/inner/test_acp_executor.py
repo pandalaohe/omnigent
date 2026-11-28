@@ -2533,6 +2533,138 @@ async def test_managed_agy_pending_update_negatives_and_non_agy_control(
 
 
 @pytest.mark.asyncio
+async def test_host_tier_full_short_circuits_unbound_edit_and_traces(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from omnigent.permission_tiers.host import HostPermissionState, write_host_permission_state
+
+    state_path = tmp_path / "permission_state.json"
+    write_host_permission_state(
+        state_path,
+        HostPermissionState(
+            session_id="s1",
+            host_id="host-1",
+            workspace="/opt/work/omnigent/fork/wt",
+            tier="full",
+            revision=1,
+            status="ready",
+        ),
+    )
+    ex = AcpExecutor(
+        AcpAgentConfig(
+            command="agy acp --stdio",
+            host_permission_tier=True,
+            host_permission_state_path=str(state_path),
+        )
+    )
+    ex._session_id = "s1"
+    ex._active_prompt_request_id = 1
+    ex._policy_evaluator = AsyncMock(
+        side_effect=AssertionError("full tier must not invoke tier policy evaluation")
+    )
+    ex._elicitation_handler = AsyncMock(return_value=False)
+    edit_params = {
+        "sessionId": "s1",
+        "toolCall": {
+            "toolCallId": "edit-1",
+            "kind": "edit",
+            "rawInput": {
+                "path": "D:/work/omnigent/tmp/x.txt",
+                "oldText": "before",
+                "newText": "after",
+            },
+        },
+        "options": [
+            {"kind": "allow_once", "optionId": "allow-1", "name": "Allow once"},
+            {"kind": "reject_once", "optionId": "reject-1", "name": "Reject"},
+        ],
+    }
+
+    with caplog.at_level(logging.INFO, logger="omnigent.inner.acp_executor"):
+        allowed, option_id, reason = await ex._decide_permission_detail(edit_params)
+
+    assert (allowed, option_id, reason) == (True, "allow-1", None)
+    ex._policy_evaluator.assert_not_awaited()
+    ex._elicitation_handler.assert_not_awaited()
+    logs = [m for m in caplog.messages if m.startswith("acp agy permission decision:")]
+    assert logs[-1] == (
+        "acp agy permission decision: tool=edit intent=unknown "
+        "binding=skipped tier=full once_offer=valid option=allow_once"
+    )
+
+    # No allow_once offered → reject even under full.
+    no_allow_params = {
+        **edit_params,
+        "toolCall": {**edit_params["toolCall"], "toolCallId": "edit-2"},
+        "options": [{"kind": "reject_once", "optionId": "reject-1", "name": "Reject"}],
+    }
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="omnigent.inner.acp_executor"):
+        denied = await ex._decide_permission_detail(no_allow_params)
+    assert denied == (
+        False,
+        None,
+        "Denied by permission mode (acp): No one-time allow option was offered.",
+    )
+    logs = [m for m in caplog.messages if m.startswith("acp agy permission decision:")]
+    assert logs[-1] == (
+        "acp agy permission decision: tool=edit intent=unknown "
+        "binding=skipped tier=full once_offer=missing option=none"
+    )
+
+    # Switching state away from ready/full restores normal unbound denial on the same request.
+    write_host_permission_state(
+        state_path,
+        HostPermissionState(
+            session_id="s1",
+            host_id="host-1",
+            workspace="/opt/work/omnigent/fork/wt",
+            tier="auto",
+            revision=2,
+            status="ready",
+        ),
+    )
+    auto_params = {
+        **edit_params,
+        "toolCall": {**edit_params["toolCall"], "toolCallId": "edit-3"},
+    }
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="omnigent.inner.acp_executor"):
+        auto_result = await ex._decide_permission_detail(auto_params)
+    assert auto_result == (
+        False,
+        None,
+        "Denied by permission mode (acp): Unbound or malformed ACP tool call.",
+    )
+    logs = [m for m in caplog.messages if m.startswith("acp agy permission decision:")]
+    assert logs[-1] == (
+        "acp agy permission decision: tool=unbound intent=unbound "
+        "binding=unbound tier=unreported once_offer=unchecked option=none"
+    )
+
+    # Switching status="switching" with tier="full" fails closed (does not short-circuit).
+    write_host_permission_state(
+        state_path,
+        HostPermissionState(
+            session_id="s1",
+            host_id="host-1",
+            workspace="/opt/work/omnigent/fork/wt",
+            tier="full",
+            revision=3,
+            status="switching",
+            transaction_id="tx-1",
+        ),
+    )
+    switching_params = {
+        **edit_params,
+        "toolCall": {**edit_params["toolCall"], "toolCallId": "edit-4"},
+    }
+    switching_result = await ex._decide_permission_detail(switching_params)
+    assert switching_result[0] is False
+    assert switching_result[1] is None
+
+
+@pytest.mark.asyncio
 async def test_decide_permission_ask_defers_to_elicitation() -> None:
     ex = AcpExecutor(AcpAgentConfig(command="x"))
 

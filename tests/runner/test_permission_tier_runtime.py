@@ -2972,10 +2972,11 @@ async def test_runner_rejects_missing_trusted_init_and_accepts_current_server_in
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tier", [None, "auto"])
+@pytest.mark.parametrize("tier", [None, "auto", "full"])
 async def test_acp_managed_flag_survives_initialization(monkeypatch, tmp_path, tier):
     from omnigent.onboarding import acp_auth
     from omnigent.runner import create_runner_app
+    from omnigent.server.permission_tiers import ACP_PERMISSION_TIER_LABEL_KEY
     from tests.runner.conftest import (
         _FakeProcessManager,
         _runner_client,
@@ -2997,7 +2998,12 @@ async def test_acp_managed_flag_survives_initialization(monkeypatch, tmp_path, t
     body = {"session_id": "acp-startup", "agent_id": "test-agent"}
     if tier is not None:
         body = permission_session_init_payload(
-            body, harness="acp", snapshot={"workspace": str(tmp_path)}
+            body,
+            harness="acp",
+            snapshot={
+                "workspace": str(tmp_path),
+                "labels": {ACP_PERMISSION_TIER_LABEL_KEY: tier},
+            },
         )
     async with _runner_client(app) as client:
         response = await client.post("/v1/sessions", json=body)
@@ -3006,6 +3012,12 @@ async def test_acp_managed_flag_survives_initialization(monkeypatch, tmp_path, t
         (_, harness, env), *_ = manager.get_client_calls
         assert harness == "acp"
         assert env["HARNESS_ACP_HOST_PERMISSION_TIER"] == expected
+        expected_state_path = (
+            str(app.state.permission_tiers.state_path(body["session_id"], "acp", {}))
+            if tier
+            else ""
+        )
+        assert env["HARNESS_ACP_PERMISSION_STATE_PATH"] == expected_state_path
 
         monkeypatch.setattr("omnigent.runner.app._SESSION_INIT_ENVELOPE_TTL_SECONDS", -1)
         response = await client.post(
@@ -3014,6 +3026,10 @@ async def test_acp_managed_flag_survives_initialization(monkeypatch, tmp_path, t
         )
         assert response.status_code == 200, response.text
         assert manager.get_client_calls[-1][2]["HARNESS_ACP_HOST_PERMISSION_TIER"] == expected
+        assert (
+            manager.get_client_calls[-1][2]["HARNESS_ACP_PERMISSION_STATE_PATH"]
+            == expected_state_path
+        )
     state = app.state.permission_tiers.state(body["session_id"])
     assert (state.tier if state else None) == tier
 

@@ -268,7 +268,7 @@ function AgentLayerEditor({
             placeholder={inherited || "Agent's default"}
             onChange={(event) => setValue(event.target.value.trim())}
           />
-        ) : options.length > COMBOBOX_OPTION_THRESHOLD ? (
+        ) : field !== "permission" && options.length > COMBOBOX_OPTION_THRESHOLD ? (
           <Combobox
             mode="select"
             options={selectOptions}

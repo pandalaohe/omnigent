@@ -941,7 +941,7 @@ def test_hello_frame_preserves_acp_permission_tier_defaults() -> None:
         version="0.1.0",
         frame_protocol_version=1,
         name="test-host",
-        acp_permission_tiers={"acp:example": "auto"},
+        acp_permission_tiers={"acp:example": "auto", "acp:full-agent": "full"},
     )
     assert decode_host_frame(encode_host_frame(hello)) == hello
 

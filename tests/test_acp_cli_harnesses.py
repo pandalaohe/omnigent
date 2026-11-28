@@ -467,5 +467,7 @@ def test_ag_acp_row_config_spawn_env_and_managed_command(
     assert is_acp_harness("ag-acp") is True
     assert is_acp_permission_harness("ag-acp") is True
     assert normalize_permission_tier("auto", harness="ag-acp", legacy=False) == "auto"
-    with pytest.raises(ValueError, match="Full permission is unavailable"):
-        normalize_permission_tier("full", harness="ag-acp", legacy=False)
+    assert normalize_permission_tier("full", harness="ag-acp", legacy=False) == "full"
+    assert normalize_permission_tier("full", harness="acp:example", legacy=False) == "full"
+    with pytest.raises(ValueError, match="Unknown harness"):
+        normalize_permission_tier("full", harness="unknown-harness", legacy=False)

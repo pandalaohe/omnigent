@@ -5296,10 +5296,18 @@ def create_runner_app(
             )
 
         if is_acp_permission_harness(harness_name):
+            acp_host_tier_active = permission_tier_active(harness_name, init_context.labels or {})
             spawn_env = {
                 **(spawn_env or {}),
-                "HARNESS_ACP_HOST_PERMISSION_TIER": (
-                    "1" if permission_tier_active(harness_name, init_context.labels or {}) else "0"
+                "HARNESS_ACP_HOST_PERMISSION_TIER": "1" if acp_host_tier_active else "0",
+                "HARNESS_ACP_PERMISSION_STATE_PATH": (
+                    str(
+                        permission_tiers.state_path(
+                            session_id, harness_name, init_context.labels or {}
+                        )
+                    )
+                    if acp_host_tier_active
+                    else ""
                 ),
             }
         try:
@@ -11794,9 +11802,15 @@ def create_runner_app(
                     return init_error
         acp_host_tier = managed_tier and acp_harness
         if acp_harness:
+            assert harness_name is not None
             spawn_env = {
                 **(spawn_env or {}),
                 "HARNESS_ACP_HOST_PERMISSION_TIER": "1" if acp_host_tier else "0",
+                "HARNESS_ACP_PERMISSION_STATE_PATH": (
+                    str(permission_tiers.state_path(conv_id, harness_name, startup_labels or {}))
+                    if acp_host_tier
+                    else ""
+                ),
             }
         _clean_terminal_exit_responses.pop(conv_id, None)
         try:
@@ -14762,11 +14776,7 @@ def create_runner_app(
             transaction_id = body.get("transaction_id")
             expected_revision = body.get("expected_revision")
             assert harness is not None
-            allowed_tiers = (
-                NON_FULL_TIERS
-                if harness == "antigravity-native" or is_acp_permission_harness(harness)
-                else PERMISSION_TIERS
-            )
+            allowed_tiers = NON_FULL_TIERS if harness == "antigravity-native" else PERMISSION_TIERS
             if (
                 target not in allowed_tiers
                 or not isinstance(transaction_id, str)

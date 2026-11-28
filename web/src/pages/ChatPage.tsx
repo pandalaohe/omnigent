@@ -3309,7 +3309,7 @@ function ComposerImpl(
     (sdkPermissionControl ? sdkPermissionOptions(sessionHarness) : null) ??
     (hostPermissionControl
       ? tierPermissionControl
-        ? AGY_NATIVE_PERMISSION_TIERS.filter((option) => !acpSession || option.value !== "full")
+        ? AGY_NATIVE_PERMISSION_TIERS
         : devinPermissionControl
           ? DEVIN_NATIVE_PERMISSION_MODES
           : CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES

@@ -857,6 +857,51 @@ async def test_acp_host_tier_defaults_on_delegated_create(client, app, stores):
     assert explicit.json()["permission_tier"] == "accept-edits"
     assert explicit.json()["permission_tier_state"] == "blocked"
 
+    # User create accepts `full` for ACP; agent-originated create still refuses it.
+    explicit_full = await client.post(
+        "/v1/sessions",
+        json={**request, "permission_tier": "full"},
+        headers=PERMISSION_TIERS_HEADERS,
+    )
+    assert explicit_full.status_code == 201, explicit_full.text
+    assert explicit_full.json()["permission_tier"] == "full"
+
+    delegated_full = await client.post(
+        "/v1/sessions",
+        json={**request, "permission_tier": "full"},
+        headers={**PERMISSION_TIERS_HEADERS, CREATE_ORIGIN_HEADER: CREATE_ORIGIN_AGENT},
+    )
+    assert delegated_full.status_code == 400, delegated_full.text
+
+    # Host config default `full` applies on user create.
+    connection.hello.acp_permission_tiers = {"acp:ag": "full"}
+    defaulted_full = await client.post(
+        "/v1/sessions", json=request, headers=PERMISSION_TIERS_HEADERS
+    )
+    assert defaulted_full.status_code == 201, defaulted_full.text
+    assert defaulted_full.json()["permission_tier"] == "full"
+
+    # Calling default `host-tier:full` resolves and applies on create, and validates for ACP only.
+    from omnigent.calling_defaults import validate_project_calling_defaults
+    from omnigent.errors import OmnigentError
+
+    assert validate_project_calling_defaults(
+        {HOST_A: {"harnesses": {"acp:ag": {"permission": "host-tier:full"}}}}
+    ) == {HOST_A: {"harnesses": {"acp:ag": {"permission": "host-tier:full"}}}}
+    with pytest.raises(OmnigentError):
+        validate_project_calling_defaults(
+            {HOST_A: {"harnesses": {"codex-native": {"permission": "host-tier:full"}}}}
+        )
+    connection.hello.acp_permission_tiers = {}
+    stores.prefs.patch_namespace(
+        "local", "calling_defaults", {HOST_A: {"acp:ag": {"permission": "host-tier:full"}}}
+    )
+    calling_full = await client.post(
+        "/v1/sessions", json=request, headers=PERMISSION_TIERS_HEADERS
+    )
+    assert calling_full.status_code == 201, calling_full.text
+    assert calling_full.json()["permission_tier"] == "full"
+
 
 @pytest.mark.parametrize("bundled", [False, True], ids=["registered", "upload"])
 @pytest.mark.parametrize(
