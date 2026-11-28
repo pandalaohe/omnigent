@@ -3017,7 +3017,14 @@ async def test_acp_managed_flag_survives_initialization(monkeypatch, tmp_path, t
         monkeypatch.setattr("omnigent.runner.app._SESSION_INIT_ENVELOPE_TTL_SECONDS", -1)
         response = await client.post(
             f"/v1/sessions/{body['session_id']}/events?stream=true",
-            json={"type": "message", "role": "user", "agent_id": "test-agent", "content": []},
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "test-agent",
+                "content": [],
+                # Spoofed caller input must be stripped and replaced from runner state.
+                "host_permission_full": True,
+            },
         )
         assert response.status_code == 200, response.text
         assert manager.get_client_calls[-1][2]["HARNESS_ACP_HOST_PERMISSION_TIER"] == expected

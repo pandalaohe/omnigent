@@ -4012,7 +4012,8 @@ def register_core_routes(
 
         from omnigent.server.routes.sandbox_inference import prepare_create_inference
 
-        if spec.executor.harness_kind == "acp" or spec.executor.harness_kind.startswith("acp:"):
+        bundle_calling_permission: str | None = None
+        if is_acp_permission_harness(spec.executor.harness_kind):
             from omnigent.server.routes._session_create_validation import resolve_create_calling
 
             project = None
@@ -4043,6 +4044,7 @@ def register_core_routes(
                 parent_session_id=parsed_metadata.parent_session_id,
                 warnings=calling_warnings,
             )
+            bundle_calling_permission = resolution.permission
             updates = {}
             if "model_override" not in explicit_fields and resolution.model is not None:
                 updates["model_override"] = resolution.model
@@ -4157,7 +4159,11 @@ def register_core_routes(
             permission_host_id = parsed_metadata.host_id or (
                 effective_host_id(conversation_store, parent_conv) if parent_conv else None
             )
-            calling_default_tier = parse_acp_host_tier(project_resolution.permission)
+            calling_default_tier = parse_acp_host_tier(
+                bundle_calling_permission
+                if bundle_calling_permission is not None
+                else project_resolution.permission
+            )
             configured_default_tier = configured_acp_default_tier(
                 host_registry, permission_host_id, bundle_harness
             )
