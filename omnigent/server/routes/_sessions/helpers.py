@@ -5893,15 +5893,23 @@ async def _create_and_publish_antigravity_child(
             runner_id=parent_conv.runner_id,
             sub_agent_name=agent_type or _ANTIGRAVITY_NATIVE_SUBAGENT_DISPLAY_FALLBACK,
         )
-    except NameAlreadyExistsError:
-        # The (parent, title) unique index fired: a concurrent start, or a
-        # redelivery that arrived before ``set_labels`` ran. Adopt the row and
-        # upsert labels rather than 500ing the sub-agent out of the rail.
-        existing = await asyncio.to_thread(
-            _find_subagent_child_by_title, conversation_store, parent_id, title
+    except NameAlreadyExistsError as exc:
+        # The title embeds the cascade id. Recovery must search archived
+        # children too, since they can still own that title.
+        matches = await asyncio.to_thread(
+            conversation_store.list_conversations,
+            kind="sub_agent",
+            parent_conversation_id=parent_id,
+            title=title,
+            include_archived=True,
+            limit=1,
         )
-        if existing is None:
-            raise
+        if not matches.data:
+            raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+        existing = matches.data[0]
+        if existing.archived:
+            # A replay can address the existing child without re-announcing it.
+            return existing.id
         await asyncio.to_thread(conversation_store.set_labels, existing.id, labels)
         # An orphaned row's creator died before publishing, so live clients have
         # never heard about this child; a duplicate publish in the race case is a

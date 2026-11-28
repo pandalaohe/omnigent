@@ -19869,6 +19869,49 @@ async def test_external_antigravity_subagent_start_is_idempotent(
     assert len(matching) == 1, f"Expected exactly 1 child row; got {len(matching)}"
 
 
+async def test_external_antigravity_subagent_start_reuses_archived_child(
+    client: httpx.AsyncClient,
+) -> None:
+    """Replay keeps the same child ID through archive and unarchive."""
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "antigravity-native-ui"},
+    )
+    events_url = f"/v1/sessions/{parent['id']}/events"
+    payload = {
+        "type": "external_antigravity_subagent_start",
+        "data": {"cascade_id": "child-cascade", "role": "Reviewer"},
+    }
+    first = await client.post(events_url, json=payload)
+    assert first.status_code == 202, first.text
+    child_id = first.json()["child_session_id"]
+    child_url = f"/v1/sessions/{child_id}"
+    archived = await client.patch(child_url, json={"archived": True})
+    assert archived.status_code == 200, archived.text
+    assert archived.json()["archived"] is True
+
+    for _ in range(2):
+        replay = await client.post(events_url, json=payload)
+        assert replay.status_code == 202, replay.text
+        assert replay.json()["child_session_id"] == child_id
+
+    children_url = f"/v1/sessions/{parent['id']}/child_sessions"
+    children = await client.get(children_url, params={"include_archived": "true"})
+    assert children.status_code == 200, children.text
+    (child,) = children.json()["data"]
+    assert child["id"] == child_id
+    assert child["archived"] is True
+
+    unarchived = await client.patch(child_url, json={"archived": False})
+    assert unarchived.status_code == 200, unarchived.text
+    assert unarchived.json()["archived"] is False
+    replay = await client.post(events_url, json=payload)
+    assert replay.status_code == 202, replay.text
+    assert replay.json()["child_session_id"] == child_id
+
+
 async def test_external_antigravity_subagent_start_requires_cascade_id(
     client: httpx.AsyncClient,
 ) -> None:
