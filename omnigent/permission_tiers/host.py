@@ -193,8 +193,13 @@ def apply_auto_floor(
     if intent.kind == ToolKind.EXEC:
         if intent.hidden_script:
             return TierDecision(Verdict.ASK, "Command requires user approval")
-        from omnigent.server.child_approvals import auto_floor_decision
+        from omnigent.server.child_approvals import _critical_target, auto_floor_decision
 
+        if any(
+            _critical_target(path)
+            for path in (*intent.command_write_paths, *intent.command_delete_paths)
+        ):
+            return TierDecision(Verdict.ASK, "Writing to a critical path requires approval")
         if intent.command:
             asks, relaxed_floor = auto_floor_decision(
                 intent.command,

@@ -4233,6 +4233,8 @@ def test_r2_symlink_lexical_escape_windows_operand_fallback_and_persistent_cwd()
     [
         r"\\?\C:\Windows\System32\drivers\etc\hosts",
         r"\\.\PhysicalDrive0",
+        r"\Windows\System32\drivers\etc\hosts",
+        r"/Windows/win.ini",
         r"%SystemRoot%\win.ini",
         r"C:Windows\win.ini",
     ],

@@ -4317,7 +4317,7 @@ def _unknown_edit_target_is_ambiguous_or_critical(path: str, *, windows: bool) -
     if windows and (
         "%" in path
         or "$" in path
-        or bool(re.match(r"^(?:\\\\[?.]\\|//[?.]/|\\\?\?\\)", path))
+        or path.startswith(("\\", "/"))
         or bool(re.match(r"^[A-Za-z]:(?![/\\])", path))
     ):
         return True

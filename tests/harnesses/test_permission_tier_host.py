@@ -365,7 +365,7 @@ def test_pi_auto_approval_floor_allows_non_critical_outside_edit_and_keeps_sever
         assert relaxed.reason == expected_reason
         assert f"tier=allow reason={expected_reason}" in caplog.text
 
-    # Critical targets stay ASK even when inside a broad workspace root.
+    # Critical targets stay ASK even when inside a broad workspace root or via relative shell cwd.
     root_state = snapshot(Path("/"))
     critical_inside = host.evaluate_host_tool(
         root_state,
@@ -375,6 +375,14 @@ def test_pi_auto_approval_floor_allows_non_critical_outside_edit_and_keeps_sever
         auto_approval_floor="narrow",
     )
     assert critical_inside.action == Verdict.ASK
+    relative_critical_shell = host.evaluate_host_tool(
+        root_state,
+        "bash",
+        {"command": "cd /boot && echo x > grub.cfg"},
+        control_paths=controls,
+        auto_approval_floor="narrow",
+    )
+    assert relative_critical_shell.action == Verdict.ASK
 
 
 def test_windows_pi_bash_and_powershell_select_their_own_executors(

@@ -936,6 +936,77 @@ def test_pi_native_attestation_keeps_identical_calls_and_refreshes_distinct(tmp_
     assert seen.count(binding_b.call_id) >= 2
 
 
+def test_pi_scoped_subagent_failed_proof_auto_vs_bootstrap_lease_checks(tmp_path):
+    runtime, _parent, _child, _source, _registry = _scoped_runtime(tmp_path, "auto")
+    child = runtime.open_pi_child_scope("session-a")
+    tools = [{"name": "subagent", "sourceInfo": {"source": "builtin", "path": "builtin:subagent"}}]
+    _write_scope_registry(child, tools)
+    assert runtime.acknowledge_pi_scope("session-a", child.credential)
+    record = runtime.pi_scopes.record(child.principal)
+    expected = record.expected
+    guard = Path(expected["extension_path"])
+    snap = NativeInputSnapshot(str(guard), str(guard.resolve()), expected["extension_sha256"])
+
+    def classify(canonical_call_id, binding, _arguments):
+        reason = (
+            "Native bootstrap support is missing, malformed or stale"
+            if canonical_call_id.endswith(
+                hashlib.sha256((child.principal.scope_id + "\0boot").encode()).hexdigest()
+            )
+            else "Semantic proof unavailable"
+        )
+        return NativeSupport(binding, NativeSupportStatus.FAILED, reason=reason, inputs=(snap,))
+
+    runtime.install_pi_native_classifier(child.principal, classify)
+    args = {"agent": "worker", "task": "Read a.py"}
+    ok_receipt, ok_binding, ok_decision = _scope_call(
+        runtime, child, call_id="sem", name="subagent", arguments=args
+    )
+    assert ok_decision.action.value == "ALLOW"
+    assert ok_decision.reason == "relaxed-auto:native-proof"
+    assert runtime.authorize(
+        "session-a",
+        call_id=ok_binding.call_id,
+        name="subagent",
+        arguments_digest=ok_binding.arguments_digest,
+        expected_revision=3,
+        origin_receipt=ok_receipt.token,
+    )
+    assert runtime.matches_authorized_call(
+        "session-a",
+        call_id=ok_binding.call_id,
+        revision=3,
+        arguments_digest=ok_binding.arguments_digest,
+        name="subagent",
+        arguments=args,
+        origin_receipt=ok_receipt.token,
+    )
+    assert runtime.verify_execute(
+        "session-a",
+        call_id=ok_binding.call_id,
+        revision=3,
+        arguments_digest=ok_binding.arguments_digest,
+        name="subagent",
+        arguments=args,
+        operation_id="subagent-run",
+        step="launch",
+        origin_receipt=ok_receipt.token,
+    )
+
+    boot_receipt, boot_binding, boot_decision = _scope_call(
+        runtime, child, call_id="boot", name="subagent", arguments=args
+    )
+    assert boot_decision.action.value == "DENY"
+    assert not runtime.authorize(
+        "session-a",
+        call_id=boot_binding.call_id,
+        name="subagent",
+        arguments_digest=boot_binding.arguments_digest,
+        expected_revision=3,
+        origin_receipt=boot_receipt.token,
+    )
+
+
 @pytest.mark.parametrize("untrusted", [None, "", "forged", {}, {"origin": "parent"}])
 def test_pi_v2_local_call_requires_runner_receipt(tmp_path, untrusted):
     runtime, _parent, _child, _source, _registry = _scoped_runtime(tmp_path)

@@ -1511,6 +1511,7 @@ def _scan_find_for_auto(
             continue
         if text in _FIND_EXEC_ACTIONS:
             allow_plus = text in {"-exec", "-execdir"}
+            relative_cwd = text in {"-execdir", "-okdir"}
             inner: list[_ShellToken] = []
             terminated = False
             index += 1
@@ -1524,8 +1525,11 @@ def _scan_find_for_auto(
                     terminated = True
                     index += 1
                     break
+                mark_unknown = "{}" in cur.text or (
+                    relative_cwd and bool(inner) and not cur.text.startswith(("-", "/", "~"))
+                )
                 inner.append(
-                    _ShellToken(cur.text, True, cur.tilde_expanded) if "{}" in cur.text else cur
+                    _ShellToken(cur.text, True, cur.tilde_expanded) if mark_unknown else cur
                 )
                 index += 1
             if not terminated or not inner or inner[0].unknown_expansion:
@@ -1581,7 +1585,11 @@ def _scan_xargs_for_auto(
                     if attached:
                         replace_placeholder = attached
                     elif index + 1 < len(arg_tokens):
+                        if arg_tokens[index + 1].unknown_expansion:
+                            return True
                         replace_placeholder = arg_tokens[index + 1].text
+                    else:
+                        return True
                 if not attached:
                     consumed_next = True
                 break
