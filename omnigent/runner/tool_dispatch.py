@@ -13293,27 +13293,28 @@ async def execute_tool(
                 return "Error: agent_spec not available for MCP dispatch"
             output = await mcp_manager.call_tool(agent_spec, tool_name, args)
         elif tool_name in _OS_ENV_TOOLS:
-            permission_tier = (
-                permission_tiers.ready_tier(conversation_id)
+            tier_scope = (
+                permission_tiers.hold_ready_tier(conversation_id, harness=effective_harness)
                 if permission_tiers is not None and conversation_id is not None
-                else None
+                else contextlib.nullcontext(None)
             )
-            output = await _execute_os_env_tool(
-                tool_name,
-                args,
-                resource_registry=resource_registry,
-                agent_spec=agent_spec,
-                conversation_id=conversation_id,
-                runner_workspace=runner_workspace,
-                filesystem_registry=filesystem_registry,
-                bundle_dir=(
-                    None
-                    if local_tool_workdir is _UNSET_LOCAL_TOOL_WORKDIR
-                    else cast(Path | None, local_tool_workdir)
-                ),
-                effective_harness=effective_harness,
-                permission_tier=permission_tier,
-            )
+            with tier_scope as permission_tier:
+                output = await _execute_os_env_tool(
+                    tool_name,
+                    args,
+                    resource_registry=resource_registry,
+                    agent_spec=agent_spec,
+                    conversation_id=conversation_id,
+                    runner_workspace=runner_workspace,
+                    filesystem_registry=filesystem_registry,
+                    bundle_dir=(
+                        None
+                        if local_tool_workdir is _UNSET_LOCAL_TOOL_WORKDIR
+                        else cast(Path | None, local_tool_workdir)
+                    ),
+                    effective_harness=effective_harness,
+                    permission_tier=permission_tier,
+                )
         elif tool_name in _REST_TOOLS:
             output = await _execute_rest_tool(
                 tool_name,

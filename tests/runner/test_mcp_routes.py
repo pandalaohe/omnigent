@@ -1161,3 +1161,116 @@ async def test_dispatch_tool_locally_async_and_flow_thread_permission_tiers(
         assert not blocked_target.exists()
     finally:
         await resource_registry.cleanup_session(SESSION)
+
+
+async def test_stale_owner_and_harness_mismatch_refuse_full_reach(tmp_path: Path) -> None:
+    """Deactivating managed permissions or mismatching the harness owner drops full reach."""
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PROTOCOL_VERSION,
+        RunnerSessionInitEnvelope,
+        RunnerSessionInitSnapshot,
+    )
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    outside = tmp_path / "outside" / "stale.txt"
+    runtime = PermissionTierRuntime(runner_workspace=workspace)
+    _install_permission_state(
+        runtime, tmp_path=tmp_path, workspace=workspace, harness="ag-acp", tier="full"
+    )
+    resource_registry = SessionResourceRegistry()
+    try:
+        # Different harness cannot inherit ag-acp's full tier.
+        assert runtime.ready_tier(SESSION, harness="claude-sdk") is None
+        mismatch_out = await execute_tool(
+            tool_name="sys_os_write",
+            arguments=json.dumps({"path": str(outside), "content": "nope\n"}),
+            resource_registry=resource_registry,
+            agent_spec=_os_env_spec(workspace, harness="claude-sdk"),
+            conversation_id=SESSION,
+            runner_workspace=workspace,
+            effective_harness="claude-sdk",
+            permission_tiers=runtime,
+        )
+        assert "outside the environment root" in json.loads(mismatch_out).get("error", "")
+        assert not outside.exists()
+
+        # Reinitializing without managed permissions clears cached state and owner.
+        envelope = RunnerSessionInitEnvelope(
+            protocol_version=SESSION_INIT_PROTOCOL_VERSION,
+            server_version="0.24.0",
+            session_id=SESSION,
+            agent_id="ag_1",
+            snapshot=RunnerSessionInitSnapshot(
+                session_id=SESSION,
+                host_id="host-test",
+                workspace=str(workspace),
+                labels={},
+                created_at=0,
+                updated_at=0,
+            ),
+        )
+        assert runtime.fence_start(envelope, "claude-sdk") is False
+        assert runtime.install(envelope, "claude-sdk") is None
+        assert runtime.state(SESSION) is None
+        assert runtime.ready_tier(SESSION) is None
+    finally:
+        await resource_registry.cleanup_session(SESSION)
+
+
+async def test_inflight_full_os_env_op_fences_concurrent_tier_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A paused full-tier os_env op marks PermissionTierRuntime busy so tier prepare fails."""
+    import asyncio
+
+    from omnigent.runner import tool_dispatch
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    outside = tmp_path / "outside" / "inflight.txt"
+    runtime = PermissionTierRuntime(runner_workspace=workspace)
+    _install_permission_state(
+        runtime, tmp_path=tmp_path, workspace=workspace, harness="pi", tier="full"
+    )
+    resource_registry = SessionResourceRegistry()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_exec = tool_dispatch._execute_os_env_tool
+
+    async def _paused_exec(*args: Any, **kwargs: Any) -> str:
+        entered.set()
+        await release.wait()
+        return await original_exec(*args, **kwargs)
+
+    monkeypatch.setattr(tool_dispatch, "_execute_os_env_tool", _paused_exec)
+    task = asyncio.create_task(
+        tool_dispatch.execute_tool(
+            tool_name="sys_os_write",
+            arguments=json.dumps({"path": str(outside), "content": "inflight\n"}),
+            resource_registry=resource_registry,
+            agent_spec=_os_env_spec(workspace, harness="pi"),
+            conversation_id=SESSION,
+            runner_workspace=workspace,
+            effective_harness="pi",
+            permission_tiers=runtime,
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5.0)
+        assert runtime.idle(SESSION) is False
+        with pytest.raises(ValueError, match="busy or stale"):
+            runtime.prepare(SESSION, expected_revision=1, transaction_id="tx-switch")
+        release.set()
+        out = await asyncio.wait_for(task, timeout=10.0)
+        assert "error" not in json.loads(out), out
+        assert outside.read_text(encoding="utf-8") == "inflight\n"
+        assert runtime.idle(SESSION) is True
+        switching = runtime.prepare(SESSION, expected_revision=1, transaction_id="tx-switch")
+        assert switching.status == "switching"
+    finally:
+        release.set()
+        if not task.done():
+            await task
+        await resource_registry.cleanup_session(SESSION)

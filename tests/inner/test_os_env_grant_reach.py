@@ -1188,3 +1188,51 @@ def test_create_os_environment_rejects_invalid_permission_tier(tmp_path: Path) -
             ),
             permission_tier="bogus",  # type: ignore[arg-type]
         )
+
+
+def test_full_tier_still_refuses_deleting_standalone_write_grant_root(tmp_path: Path) -> None:
+    """Deleting a standalone declared write-grant root remains refused even at full."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    grant = tmp_path / "granted"
+    grant.mkdir()
+    child = grant / "inside.txt"
+    child.write_text("keep\n")
+    policy = _grant_policy(write_roots=[grant])
+
+    res = _handle_helper_request(
+        request={"op": "delete", "path": str(grant), "recursive": True},
+        cwd=workspace,
+        shell_path="/bin/sh",
+        sandbox=policy,
+        permission_tier="full",
+    )
+    assert res.get("code") == "invalid_path", res
+    assert grant.is_dir() and child.read_text() == "keep\n"
+
+
+@pytest.mark.asyncio
+async def test_full_tier_real_active_sandbox_helper_still_blocks_outside_write(
+    tmp_path: Path,
+) -> None:
+    """A real active OS sandbox helper still refuses outside writes at tier ``full``."""
+    if platform.system() != "Darwin":
+        pytest.skip("darwin_seatbelt backend check runs on macOS")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    outside = tmp_path / "outside" / "blocked.txt"
+    env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(type="darwin_seatbelt"),
+        ),
+        permission_tier="full",
+    )
+    assert env is not None
+    try:
+        res = await env.write(str(outside), "should fail\n")
+        assert "blocked by sandbox" in res.get("error", ""), res
+        assert not outside.exists()
+    finally:
+        env.close()

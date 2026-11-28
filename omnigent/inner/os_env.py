@@ -1822,13 +1822,16 @@ def _delete_anchor(
         components from it down to *parent*, or ``None`` when *entry* is a
         grant root whose parent no grant covers.
     """
-    for root in reachable_roots(cwd, sandbox):
+    roots = reachable_roots(cwd, sandbox)
+    for root in roots:
         if root.access != "write":
             continue
         if root.kind == "tree" and root.contains(parent):
             return root.path, parent.relative_to(root.path).parts
         if root.kind == "file" and root.path == entry:
             return parent, ()
+    if any(root.kind == "tree" and root.path.is_relative_to(entry) for root in roots):
+        return None
     if permission_tier == "full" and not sandbox.active and parent.anchor:
         return Path(parent.anchor), parent.parts[1:]
     return None
