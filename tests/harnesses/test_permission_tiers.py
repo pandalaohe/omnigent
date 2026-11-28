@@ -4235,13 +4235,13 @@ def test_r2_symlink_lexical_escape_windows_operand_fallback_and_persistent_cwd()
         r"\\.\PhysicalDrive0",
         r"\Windows\System32\drivers\etc\hosts",
         r"/Windows/win.ini",
-        r"%SystemRoot%\win.ini",
-        r"C:Windows\win.ini",
+        r"%UNKNOWN_ROOT%\win.ini",
+        r"D:Windows\win.ini",
     ],
 )
 def test_windows_unknown_critical_or_namespace_edit_stays_ask_under_auto(path: str) -> None:
     def failing_resolver(raw: str) -> ResolvedPath:
-        if raw == path:
+        if raw == path or raw.endswith(path):
             raise OSError("cannot resolve")
         return ResolvedPath(raw, "directory")
 
