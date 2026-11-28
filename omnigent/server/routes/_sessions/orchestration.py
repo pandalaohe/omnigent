@@ -19220,7 +19220,7 @@ def _create_session_from_bundle(
 
     from omnigent.server.routes.sandbox_inference import configured_snapshot
 
-    if is_acp_permission_harness(harness) and not configured_snapshot(inference_snapshot):
+    if harness == "acp" and not configured_snapshot(inference_snapshot):
         _validate_acp_spec_models(spec, inference_model)
 
     effort = metadata.reasoning_effort
