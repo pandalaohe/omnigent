@@ -64,6 +64,12 @@ export function sessionModeHandler(
   return null;
 }
 
+export const ACP_HOST_TIER_OPTIONS = AGY_NATIVE_PERMISSION_TIERS.map((option) => ({
+  value: `host-tier:${option.value}`,
+  label: `Host tier · ${option.label}`,
+  description: option.description,
+}));
+
 export function sessionDefaultModeOptions(
   harness: string,
   field: "speed" | "permission",
@@ -72,6 +78,15 @@ export function sessionDefaultModeOptions(
   context: SessionModeContext = "default",
   capabilities?: HarnessCapabilityMap,
 ) {
+  if (
+    field === "permission" &&
+    context === "default" &&
+    (harness === "acp" ||
+      harness.startsWith("acp:") ||
+      capabilities?.[harness]?.integration_mode === "acp-subprocess")
+  ) {
+    return ACP_HOST_TIER_OPTIONS;
+  }
   const declared = declaredModeSet(harness, field, capabilities);
   if (declared !== undefined) {
     if (!declared) return [];

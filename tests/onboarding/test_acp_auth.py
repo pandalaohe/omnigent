@@ -35,6 +35,27 @@ def test_permission_concepts_survive_registry_rewrites() -> None:
     assert acp_agents_settings(entries) == {"acp": {"agents": [row]}}
 
 
+@pytest.mark.parametrize("tier", ["ask", "plan", "accept-edits", "auto", "full"])
+def test_permission_tier_round_trips_including_full(tier: str) -> None:
+    row = {"name": "Neutral", "command": "neutral acp", "permission_tier": tier}
+    entries = acp_agents({"acp": {"agents": [row]}})
+    assert entries[0].permission_tier == tier
+    assert acp_agents_settings(entries) == {"acp": {"agents": [row]}}
+
+
+def test_permission_tier_rejects_unknown_value() -> None:
+    with pytest.raises(ValueError, match="permission_tier"):
+        acp_agents(
+            {
+                "acp": {
+                    "agents": [
+                        {"name": "Neutral", "command": "neutral acp", "permission_tier": "x"}
+                    ]
+                }
+            }
+        )
+
+
 @pytest.mark.parametrize(
     "value", [[], "manual", {"plan": "plan"}, {"plan": []}, {1: "manual"}, {"": "manual"}]
 )

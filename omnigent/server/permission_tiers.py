@@ -12,7 +12,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.permission_tiers import (
     AGY_PERMISSION_TIER_LABEL_KEY,
     DEFAULT_PERMISSION_TIER,
-    NON_FULL_TIERS,
+    PERMISSION_TIERS,
     PI_PERMISSION_TIER_LABEL_KEY,
     PermissionTier,
     normalize_permission_tier,
@@ -64,7 +64,7 @@ def configured_acp_default_tier(
         return None
     tiers = getattr(connection.hello, "acp_permission_tiers", None) or {}
     tier = tiers.get(harness)
-    return tier if tier in NON_FULL_TIERS else None
+    return tier if tier in PERMISSION_TIERS else None
 
 
 def supports_delegated_acp_tier(

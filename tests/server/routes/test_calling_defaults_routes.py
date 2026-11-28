@@ -857,6 +857,120 @@ async def test_acp_host_tier_defaults_on_delegated_create(client, app, stores):
     assert explicit.json()["permission_tier"] == "accept-edits"
     assert explicit.json()["permission_tier_state"] == "blocked"
 
+    # User create accepts `full` for ACP; agent-originated create still refuses it.
+    explicit_full = await client.post(
+        "/v1/sessions",
+        json={**request, "permission_tier": "full"},
+        headers=PERMISSION_TIERS_HEADERS,
+    )
+    assert explicit_full.status_code == 201, explicit_full.text
+    assert explicit_full.json()["permission_tier"] == "full"
+
+    delegated_full = await client.post(
+        "/v1/sessions",
+        json={**request, "permission_tier": "full"},
+        headers={**PERMISSION_TIERS_HEADERS, CREATE_ORIGIN_HEADER: CREATE_ORIGIN_AGENT},
+    )
+    assert delegated_full.status_code == 400, delegated_full.text
+
+    # Host config default `full` applies on user create.
+    connection.hello.acp_permission_tiers = {"acp:ag": "full"}
+    defaulted_full = await client.post(
+        "/v1/sessions", json=request, headers=PERMISSION_TIERS_HEADERS
+    )
+    assert defaulted_full.status_code == 201, defaulted_full.text
+    assert defaulted_full.json()["permission_tier"] == "full"
+
+    # Calling default `host-tier:full` resolves and applies on create, and validates for ACP only.
+    from omnigent.calling_defaults import validate_project_calling_defaults
+    from omnigent.errors import OmnigentError
+
+    assert validate_project_calling_defaults(
+        {HOST_A: {"harnesses": {"acp:ag": {"permission": "host-tier:full"}}}}
+    ) == {HOST_A: {"harnesses": {"acp:ag": {"permission": "host-tier:full"}}}}
+    with pytest.raises(OmnigentError):
+        validate_project_calling_defaults(
+            {HOST_A: {"harnesses": {"codex-native": {"permission": "host-tier:full"}}}}
+        )
+    connection.hello.acp_permission_tiers = {}
+    stores.prefs.patch_namespace(
+        "local", "calling_defaults", {HOST_A: {"acp:ag": {"permission": "host-tier:full"}}}
+    )
+    calling_full = await client.post(
+        "/v1/sessions", json=request, headers=PERMISSION_TIERS_HEADERS
+    )
+    assert calling_full.status_code == 201, calling_full.text
+    assert calling_full.json()["permission_tier"] == "full"
+
+    # Bundle upload create rejects explicit `full` on agent-originated creates too.
+    agent_headers = {**PERMISSION_TIERS_HEADERS, CREATE_ORIGIN_HEADER: CREATE_ORIGIN_AGENT}
+    bundle_denied = await client.post(
+        "/v1/sessions",
+        data={
+            "metadata": json.dumps(
+                {"host_id": HOST_A, "workspace": "/neutral/project", "permission_tier": "full"}
+            )
+        },
+        files={"bundle": ("agent.tar.gz", _bundle("acp:ag"), "application/gzip")},
+        headers=agent_headers,
+    )
+    assert bundle_denied.status_code == 400, bundle_denied.text
+
+    # Tiered parents never propagate `full` or widen past their tier despite a `full` default.
+    from omnigent.server.permission_tiers import (
+        PERMISSION_CAPABILITY_LABEL_KEY,
+        PERMISSION_CAPABILITY_VALUE,
+        ConfirmedPermissionState,
+    )
+
+    conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    for parent_tier, expected_child_tier in (("full", "auto"), ("plan", "plan")):
+        tiered_parent = conversations.create_conversation(
+            agent_id=AGENT_ID,
+            host_id=HOST_A,
+            workspace="/neutral/project",
+            runner_id="test-runner",
+            labels={
+                **ConfirmedPermissionState(parent_tier, 1, "ready").labels("acp:ag"),
+                PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
+            },
+        )
+        child = await client.post(
+            "/v1/sessions",
+            json={**request, "parent_session_id": tiered_parent.id},
+            headers=agent_headers,
+        )
+        assert child.status_code == 201, child.text
+        assert child.json()["permission_tier"] == expected_child_tier
+
+    # User bundle upload also picks up the saved `host-tier:full` calling default.
+    bundle_default = await client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({"parent_session_id": parent.id})},
+        files={"bundle": ("agent.tar.gz", _bundle("acp:ag"), "application/gzip")},
+        headers=PERMISSION_TIERS_HEADERS,
+    )
+    assert bundle_default.status_code == 201, bundle_default.text
+    bundle_snapshot = await client.get(f"/v1/sessions/{bundle_default.json()['session_id']}")
+    assert bundle_snapshot.json()["permission_tier"] == "full"
+
+    # An untiered orchestrator omitting `permission_tier` honors the user's saved `full` default.
+    untiered_agent_id = "c1c2c3c4c5c6c7c8c9c0c1c2c3c4c5c6"
+    _seed_agent(stores, untiered_agent_id, "claude-native", name="parent-claude-agent")
+    untiered_parent = conversations.create_conversation(
+        agent_id=untiered_agent_id,
+        host_id=HOST_A,
+        workspace="/neutral/project",
+        runner_id="test-runner",
+    )
+    orchestrated = await client.post(
+        "/v1/sessions",
+        json={**request, "parent_session_id": untiered_parent.id},
+        headers=agent_headers,
+    )
+    assert orchestrated.status_code == 201, orchestrated.text
+    assert orchestrated.json()["permission_tier"] == "full"
+
 
 @pytest.mark.parametrize("bundled", [False, True], ids=["registered", "upload"])
 @pytest.mark.parametrize(

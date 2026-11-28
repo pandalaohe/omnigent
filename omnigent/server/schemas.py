@@ -1552,6 +1552,7 @@ class CreateResponseRequest(BaseModel):
     permission_mode: str | None = None
     session_mode: SkipJsonSchema[str | None] = None
     session_mode_selection: SkipJsonSchema[str | None] = None
+    host_permission_full: SkipJsonSchema[bool] = False
     approval_mode: str | None = None
     service_tier: str | None = None
     # Per-request LLM model override (distinct from ``model``, which

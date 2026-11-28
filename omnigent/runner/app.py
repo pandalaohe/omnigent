@@ -1201,6 +1201,7 @@ def _wrap_as_message_event(body: _JsonObject) -> _JsonObject:
         input dict.
     """
     event_body = dict(body)
+    event_body.pop("host_permission_full", None)
     event_body["type"] = "message"
     event_body["role"] = "user"
     if "input" in event_body:
@@ -11139,13 +11140,16 @@ def create_runner_app(
             harness_body["permission_mode"] = permission_mode
         if harness_name == "codex" and (approval_mode := _session_approval_mode.get(conv)):
             harness_body["approval_mode"] = approval_mode
-        if (
-            harness_name
-            and (harness_name == "acp" or harness_name.startswith("acp:"))
-            and (acp_mode := _session_acp_mode.get(conv))
-        ):
-            harness_body["session_mode"] = acp_mode
-            harness_body["session_mode_selection"] = _session_acp_mode_selection.get(conv)
+        if is_acp_permission_harness(harness_name):
+            if acp_mode := _session_acp_mode.get(conv):
+                harness_body["session_mode"] = acp_mode
+                harness_body["session_mode_selection"] = _session_acp_mode_selection.get(conv)
+            acp_perm_state = permission_tiers.state(conv)
+            harness_body["host_permission_full"] = (
+                acp_perm_state is not None
+                and acp_perm_state.status == "ready"
+                and acp_perm_state.tier == "full"
+            )
         if harness_name in {"codex", "claude-sdk"} and (
             service_tier := _session_service_tier.get(conv)
         ):
@@ -12098,6 +12102,15 @@ def create_runner_app(
                 event_body["startup_required"] = True
             else:
                 event_body.pop("startup_required", None)
+            event_body.pop("host_permission_full", None)
+            if acp_harness:
+                acp_perm_state = permission_tiers.state(conv_id)
+                event_body["host_permission_full"] = (
+                    acp_host_tier
+                    and acp_perm_state is not None
+                    and acp_perm_state.status == "ready"
+                    and acp_perm_state.tier == "full"
+                )
             _inject_mcp_schemas(event_body, _mcp_schemas)
             _dispatch_tasks: list[_asyncio.Task[object]] = []
             _dispatch_cancelled = (
@@ -14778,11 +14791,7 @@ def create_runner_app(
             transaction_id = body.get("transaction_id")
             expected_revision = body.get("expected_revision")
             assert harness is not None
-            allowed_tiers = (
-                NON_FULL_TIERS
-                if harness == "antigravity-native" or is_acp_permission_harness(harness)
-                else PERMISSION_TIERS
-            )
+            allowed_tiers = NON_FULL_TIERS if harness == "antigravity-native" else PERMISSION_TIERS
             if (
                 target not in allowed_tiers
                 or not isinstance(transaction_id, str)

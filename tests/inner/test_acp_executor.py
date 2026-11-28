@@ -2684,6 +2684,139 @@ async def test_managed_agy_pending_update_negatives_and_non_agy_control(
 
 
 @pytest.mark.asyncio
+async def test_host_tier_full_short_circuits_unbound_edit_and_traces(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    ex = AcpExecutor(
+        AcpAgentConfig(
+            command="agy acp --stdio",
+            host_permission_tier=True,
+        )
+    )
+    ex._session_id = "s1"
+    ex._active_prompt_request_id = 1
+    ex._turn_host_permission_full = True
+    ex._policy_evaluator = AsyncMock(
+        side_effect=AssertionError("full tier must not invoke tier policy evaluation")
+    )
+    ex._elicitation_handler = AsyncMock(return_value=False)
+    edit_params = {
+        "sessionId": "s1",
+        "toolCall": {
+            "toolCallId": "edit-1",
+            "kind": "edit",
+            "rawInput": {
+                "path": "D:/work/omnigent/tmp/x.txt",
+                "oldText": "before",
+                "newText": "after",
+            },
+        },
+        "options": [
+            {"kind": "allow_once", "optionId": "allow-1", "name": "Allow once"},
+            {"kind": "reject_once", "optionId": "reject-1", "name": "Reject"},
+        ],
+    }
+
+    with caplog.at_level(logging.INFO, logger="omnigent.inner.acp_executor"):
+        allowed, option_id, reason = await ex._decide_permission_detail(edit_params)
+
+    assert (allowed, option_id, reason) == (True, "allow-1", None)
+    assert "edit-1" not in ex._authorized_read_calls
+    ex._policy_evaluator.assert_not_awaited()
+    ex._elicitation_handler.assert_not_awaited()
+    logs = [m for m in caplog.messages if m.startswith("acp agy permission decision:")]
+    assert logs[-1] == (
+        "acp agy permission decision: tool=edit intent=edit "
+        "binding=skipped tier=full once_offer=valid option=allow_once"
+    )
+
+    # Malformed non-dict toolCall still short-circuits cleanly without raising.
+    malformed_params = {
+        "sessionId": "s1",
+        "toolCall": "not-an-object",
+        "options": [{"kind": "allow_once", "optionId": "allow-1", "name": "Allow once"}],
+    }
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="omnigent.inner.acp_executor"):
+        malformed_result = await ex._decide_permission_detail(malformed_params)
+    assert malformed_result == (True, "allow-1", None)
+    logs = [m for m in caplog.messages if m.startswith("acp agy permission decision:")]
+    assert logs[-1] == (
+        "acp agy permission decision: tool=unknown intent=unknown "
+        "binding=skipped tier=full once_offer=valid option=allow_once"
+    )
+
+    # No allow_once offered → reject even under full.
+    no_allow_params = {
+        **edit_params,
+        "toolCall": {**edit_params["toolCall"], "toolCallId": "edit-2"},
+        "options": [{"kind": "reject_once", "optionId": "reject-1", "name": "Reject"}],
+    }
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="omnigent.inner.acp_executor"):
+        denied = await ex._decide_permission_detail(no_allow_params)
+    assert denied == (
+        False,
+        None,
+        "Denied by permission mode (acp): No one-time allow option was offered.",
+    )
+    logs = [m for m in caplog.messages if m.startswith("acp agy permission decision:")]
+    assert logs[-1] == (
+        "acp agy permission decision: tool=edit intent=edit "
+        "binding=skipped tier=full once_offer=missing option=none"
+    )
+
+    # Missing or foreign sessionId fails closed even during a full turn.
+    for bad_params in (
+        {k: v for k, v in edit_params.items() if k != "sessionId"},
+        {**edit_params, "sessionId": "foreign-session"},
+    ):
+        bad_result = await ex._decide_permission_detail(bad_params)
+        assert bad_result == (
+            False,
+            None,
+            "Denied by permission mode (acp): Unbound or malformed ACP tool call.",
+        )
+
+    # Non-AGY managed ACP harnesses emit the same binding=skipped tier=full trace.
+    generic = AcpExecutor(AcpAgentConfig(command="example-acp --stdio", host_permission_tier=True))
+    generic._session_id = "s-generic"
+    generic._active_prompt_request_id = 1
+    generic._turn_host_permission_full = True
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="omnigent.inner.acp_executor"):
+        generic_result = await generic._decide_permission_detail(
+            {**edit_params, "sessionId": "s-generic"}
+        )
+    assert generic_result == (True, "allow-1", None)
+    generic_logs = [m for m in caplog.messages if m.startswith("acp host permission decision:")]
+    assert generic_logs[-1] == (
+        "acp host permission decision: tool=edit intent=edit "
+        "binding=skipped tier=full once_offer=valid option=allow_once"
+    )
+
+    # Non-full turn (e.g. auto) restores normal unbound denial on the same request.
+    ex._turn_host_permission_full = False
+    auto_params = {
+        **edit_params,
+        "toolCall": {**edit_params["toolCall"], "toolCallId": "edit-3"},
+    }
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="omnigent.inner.acp_executor"):
+        auto_result = await ex._decide_permission_detail(auto_params)
+    assert auto_result == (
+        False,
+        None,
+        "Denied by permission mode (acp): Unbound or malformed ACP tool call.",
+    )
+    logs = [m for m in caplog.messages if m.startswith("acp agy permission decision:")]
+    assert logs[-1] == (
+        "acp agy permission decision: tool=unbound intent=unbound "
+        "binding=unbound tier=unreported once_offer=unchecked option=none"
+    )
+
+
+@pytest.mark.asyncio
 async def test_decide_permission_ask_defers_to_elicitation() -> None:
     ex = AcpExecutor(AcpAgentConfig(command="x"))
 

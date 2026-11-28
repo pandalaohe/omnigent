@@ -4012,7 +4012,8 @@ def register_core_routes(
 
         from omnigent.server.routes.sandbox_inference import prepare_create_inference
 
-        if spec.executor.harness_kind == "acp" or spec.executor.harness_kind.startswith("acp:"):
+        bundle_calling_permission: str | None = None
+        if is_acp_permission_harness(spec.executor.harness_kind):
             from omnigent.server.routes._session_create_validation import resolve_create_calling
 
             project = None
@@ -4043,6 +4044,7 @@ def register_core_routes(
                 parent_session_id=parsed_metadata.parent_session_id,
                 warnings=calling_warnings,
             )
+            bundle_calling_permission = resolution.permission
             updates = {}
             if "model_override" not in explicit_fields and resolution.model is not None:
                 updates["model_override"] = resolution.model
@@ -4150,22 +4152,46 @@ def register_core_routes(
         acp_tier_enabled = False
         default_tier = project_resolution.permission
         if is_acp_permission_harness(bundle_harness):
+            from omnigent.permission_tiers import NON_FULL_TIERS, PERMISSION_TIERS
+            from omnigent.session_default_modes import parse_acp_host_tier
+
             host_registry = getattr(request.app.state, "host_registry", None)
             permission_host_id = parsed_metadata.host_id or (
                 effective_host_id(conversation_store, parent_conv) if parent_conv else None
             )
-            default_tier = configured_acp_default_tier(
+            calling_default_tier = parse_acp_host_tier(
+                bundle_calling_permission
+                if bundle_calling_permission is not None
+                else project_resolution.permission
+            )
+            configured_default_tier = configured_acp_default_tier(
                 host_registry, permission_host_id, bundle_harness
             )
+            allowed_acp_tiers = NON_FULL_TIERS if agent_create else PERMISSION_TIERS
+            if (
+                parsed_metadata.permission_tier is not None
+                and parsed_metadata.permission_tier not in allowed_acp_tiers
+            ):
+                raise OmnigentError(
+                    "Unsupported ACP permission tier", code=ErrorCode.INVALID_INPUT
+                )
+            acp_supported = configured_default_tier is not None or supports_delegated_acp_tier(
+                host_registry, permission_host_id, bundle_harness, spec
+            )
+            default_tier = (
+                calling_default_tier
+                if calling_default_tier is not None and acp_supported
+                else configured_default_tier
+            )
+            if parsed_metadata.permission_tier is not None and not acp_supported:
+                raise OmnigentError(
+                    "Target ACP host or harness does not support permission_tier",
+                    code=ErrorCode.INVALID_INPUT,
+                )
             acp_tier_enabled = (
                 parsed_metadata.permission_tier is not None
                 or default_tier is not None
-                or (
-                    agent_create
-                    and supports_delegated_acp_tier(
-                        host_registry, permission_host_id, bundle_harness, spec
-                    )
-                )
+                or (agent_create and acp_supported)
             )
             require_permission_protocol(request, harness=bundle_harness, required=acp_tier_enabled)
         if (
@@ -6752,7 +6778,6 @@ def register_core_routes(
                     action="unarchive",
                 )
         from omnigent.server.permission_tiers import (
-            is_acp_permission_harness,
             permission_tier_active,
             require_permission_protocol,
         )
@@ -6796,7 +6821,6 @@ def register_core_routes(
                 allowed_tiers = (
                     NON_FULL_TIERS
                     if effective_harness == "antigravity-native"
-                    or is_acp_permission_harness(effective_harness)
                     else PERMISSION_TIERS
                 )
                 if target not in allowed_tiers or (

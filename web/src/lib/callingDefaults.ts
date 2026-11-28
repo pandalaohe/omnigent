@@ -21,6 +21,7 @@ import {
   type LayeredOptions,
 } from "./layeredValues";
 import {
+  ACP_HOST_TIER_OPTIONS,
   sessionDefaultModeOptions,
   sessionModeHandler,
   type HarnessCapabilityMap,
@@ -177,7 +178,7 @@ export function callingPermissionOptions(
     harness.startsWith("acp:") ||
     capabilities?.[harness]?.integration_mode === "acp-subprocess"
   )
-    return [...(acpOptions ?? [])];
+    return [...(acpOptions ?? []), ...ACP_HOST_TIER_OPTIONS];
   const declared = capabilities?.[harness]?.session_modes?.permission?.options;
   if (declared && declared !== "per-model")
     return declared.filter((row) => row.contexts.includes("default"));

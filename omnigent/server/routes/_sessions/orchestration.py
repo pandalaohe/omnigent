@@ -18646,7 +18646,8 @@ async def _create_session_from_existing_agent_impl(
     acp_tier_enabled = False
     if is_acp_permission_harness(create_harness):
         from omnigent.models.model_catalog import spec_harness as declared_spec_harness
-        from omnigent.permission_tiers import NON_FULL_TIERS
+        from omnigent.permission_tiers import NON_FULL_TIERS, PERMISSION_TIERS
+        from omnigent.session_default_modes import parse_acp_host_tier
 
         effective_spec = sub_spec or selection_spec
         if harness_override:
@@ -18662,11 +18663,24 @@ async def _create_session_from_existing_agent_impl(
                 effective_host_id, conversation_store, parent_conv
             )
         host_registry = getattr(request.app.state, "host_registry", None)
-        default_tier = configured_acp_default_tier(host_registry, permission_host_id, acp_harness)
-        if body.permission_tier is not None and body.permission_tier not in NON_FULL_TIERS:
+        calling_default_tier = (
+            parse_acp_host_tier(project_resolution.permission)
+            if body.sub_agent_name is None and body.permission_mode is None
+            else None
+        )
+        configured_default_tier = configured_acp_default_tier(
+            host_registry, permission_host_id, acp_harness
+        )
+        allowed_acp_tiers = NON_FULL_TIERS if agent_create else PERMISSION_TIERS
+        if body.permission_tier is not None and body.permission_tier not in allowed_acp_tiers:
             raise OmnigentError("Unsupported ACP permission tier", code=ErrorCode.INVALID_INPUT)
-        acp_supported = default_tier is not None or supports_delegated_acp_tier(
+        acp_supported = configured_default_tier is not None or supports_delegated_acp_tier(
             host_registry, permission_host_id, acp_harness, effective_spec
+        )
+        default_tier = (
+            calling_default_tier
+            if calling_default_tier is not None and acp_supported
+            else configured_default_tier
         )
         if body.permission_tier is not None and not acp_supported:
             raise OmnigentError(

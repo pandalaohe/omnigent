@@ -6,10 +6,11 @@ import re
 import secrets
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import cast
 
 from omnigent.codex_approval_modes import CODEX_NATIVE_PERMISSION_PRESETS
 from omnigent.harness_capabilities import ModeContext, ModeOption, ModeSet, SessionModes
-from omnigent.permission_tiers import NON_FULL_TIERS
+from omnigent.permission_tiers import NON_FULL_TIERS, PERMISSION_TIERS, PermissionTier
 from omnigent.sdk_permission_modes import (
     ACP_SESSION_MODE_LABEL_KEY,
     ACP_SESSION_MODE_SELECTION_LABEL_KEY,
@@ -20,9 +21,18 @@ from omnigent.sdk_permission_modes import (
 SPEED_TIER_LABEL_KEY = "omnigent.speed_tier"
 SPEED_TIER_REQUESTED_LABEL_KEY = "omnigent.speed_tier_requested"
 SPEED_TIER_VALUES = frozenset({"standard", "fast"})
+ACP_HOST_TIER_PREFIX = "host-tier:"
+ACP_HOST_TIER_VALUES = frozenset(f"{ACP_HOST_TIER_PREFIX}{tier}" for tier in PERMISSION_TIERS)
 _SERVICE_TIER_ID = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
 _BOTH: frozenset[ModeContext] = frozenset({"default", "create"})
 _CREATE: frozenset[ModeContext] = frozenset({"create"})
+
+
+def parse_acp_host_tier(value: object) -> PermissionTier | None:
+    """Extract an ACP host permission tier from a ``host-tier:<tier>`` default value."""
+    if isinstance(value, str) and value in ACP_HOST_TIER_VALUES:
+        return cast("PermissionTier", value.removeprefix(ACP_HOST_TIER_PREFIX))
+    return None
 
 
 @dataclass(frozen=True)
@@ -197,7 +207,8 @@ def mode_values(
     if context not in {"default", "create"}:
         raise ValueError(f"unknown mode context: {context!r}")
     if field == "permission" and is_acp_harness(harness):
-        return frozenset(row["value"] for row in (acp_options or []) if row.get("value"))
+        reported = frozenset(row["value"] for row in (acp_options or []) if row.get("value"))
+        return reported | ACP_HOST_TIER_VALUES if context == "default" else reported
     declared = mode_set(harness, field)
     if declared is None or declared.options == "per-model":
         return frozenset()
@@ -284,6 +295,9 @@ def apply_mode(
     if not valid_mode(value, harness, field, context, acp_options):
         raise ValueError(f"unsupported {field} mode {value!r} for {harness!r}")
     if field == "permission" and is_acp_harness(harness):
+        host_tier = parse_acp_host_tier(value)
+        if host_tier is not None:
+            return ModeApplication(tier=host_tier)
         return ModeApplication(
             labels={
                 ACP_SESSION_MODE_LABEL_KEY: value,

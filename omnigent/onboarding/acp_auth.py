@@ -215,13 +215,15 @@ def acp_agents(config: dict[str, object] | None = None) -> list[AcpAgentEntry]:
         inject_system_prompt = raw.get("inject_system_prompt", True)
         if not isinstance(inject_system_prompt, bool):
             raise ValueError("acp agent inject_system_prompt must be a boolean")
-        from omnigent.permission_tiers import NON_FULL_TIERS
+        from omnigent.permission_tiers import PERMISSION_TIERS
 
         permission_tier = raw.get("permission_tier")
         if permission_tier is not None and (
-            not isinstance(permission_tier, str) or permission_tier not in NON_FULL_TIERS
+            not isinstance(permission_tier, str) or permission_tier not in PERMISSION_TIERS
         ):
-            raise ValueError("acp agent permission_tier must be ask, plan, accept-edits, or auto")
+            raise ValueError(
+                "acp agent permission_tier must be ask, plan, accept-edits, auto, or full"
+            )
         entries.append(
             AcpAgentEntry(
                 slug=slug,

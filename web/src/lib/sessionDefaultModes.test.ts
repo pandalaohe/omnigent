@@ -45,4 +45,20 @@ describe("declared mode contexts and calling defaults", () => {
     expect(callingDefaultHasModels("acp:example", capabilities)).toBe(true);
     expect(callingDefaultParent("custom", capabilities)).toBe("parent");
   });
+  it("offers ACP host-tier defaults including full for ACP harnesses only", () => {
+    expect(
+      sessionDefaultModeOptions("acp:example", "permission", [], null, "default", capabilities).map(
+        (x) => x.value,
+      ),
+    ).toEqual([
+      "host-tier:ask",
+      "host-tier:plan",
+      "host-tier:accept-edits",
+      "host-tier:auto",
+      "host-tier:full",
+    ]);
+    expect(
+      sessionDefaultModeOptions("acp:example", "permission", [], null, "create", capabilities),
+    ).toEqual([]);
+  });
 });

@@ -4635,9 +4635,7 @@ function NewChatLandingContent({
                 option.description ??
                 "Sets the agent's own mode. What it covers is up to the agent.",
             })),
-            ...AGY_NATIVE_PERMISSION_TIERS.filter(
-              (option) => option.value !== AGY_NATIVE_FULL_PERMISSION_TIER,
-            ).map((option) => ({
+            ...AGY_NATIVE_PERMISSION_TIERS.map((option) => ({
               ...option,
               value: `host-tier:${option.value}`,
               label: `Host tier · ${option.label}`,

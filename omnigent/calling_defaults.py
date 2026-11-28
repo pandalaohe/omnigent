@@ -383,11 +383,7 @@ def _field_normalizer(
                 except ValueError:
                     return None
             values = (
-                frozenset(
-                    row["value"]
-                    for row in permission_options(host_id, harness)
-                    if row.get("value")
-                )
+                mode_values(harness, field, "default", permission_options(host_id, harness))
                 if permission_options and harness is not None and is_acp_harness(harness)
                 else mode_values(harness, field, "default")
             )
