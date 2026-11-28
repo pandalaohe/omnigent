@@ -15041,7 +15041,7 @@ def create_runner_app(
 
         if body_type == "permission_mode_change":
             harness = _session_harness_name(conversation_id)
-            if harness and (harness == "acp" or harness.startswith("acp:")):
+            if is_acp_permission_harness(harness):
                 mode = body.get("permission_mode") if isinstance(body, dict) else None
                 if not isinstance(mode, str) or not mode:
                     return JSONResponse(
