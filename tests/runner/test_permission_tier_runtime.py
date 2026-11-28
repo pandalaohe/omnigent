@@ -1916,6 +1916,24 @@ async def test_pi_subagent_denial_cannot_open_card_or_acquire_launch_lease(
         assert decision.action.value == "ALLOW"
         assert decision.reason == "relaxed-auto:native-proof"
         assert cards == []
+        assert runtime.authorize(
+            "session-a",
+            call_id=binding.call_id,
+            name=binding.name,
+            arguments_digest=binding.arguments_digest,
+            expected_revision=3,
+        )
+        assert runtime.verify_execute(
+            "session-a",
+            call_id=binding.call_id,
+            revision=3,
+            arguments_digest=binding.arguments_digest,
+            name=binding.name,
+            arguments=arguments,
+            operation_id="native-launch",
+            step="launch",
+        )
+        return
     else:
         assert decision.action.value == "ASK"
         assert decision.rule_id == "native-proof"

@@ -151,6 +151,17 @@ def trusted_permission_control_paths(
     return tuple(dict.fromkeys(str(path) for path in paths))
 
 
+def _log_relaxed_auto(intent: ToolIntent, decision: TierDecision) -> TierDecision:
+    if decision.action == Verdict.ALLOW and decision.reason.startswith("relaxed-auto:"):
+        logger.info(
+            "permission_tier tier=allow reason=%s tool=%s host=%s",
+            decision.reason,
+            intent.name,
+            intent.context.host_id,
+        )
+    return decision
+
+
 def apply_auto_floor(
     tier: PermissionTier,
     intent: ToolIntent,
@@ -159,46 +170,42 @@ def apply_auto_floor(
     floor: Literal["narrow"] | None,
 ) -> TierDecision:
     """Apply the single narrow auto-tier floor after decide_tier returns ALLOW."""
-    if tier != "auto" or floor is None or decision.action != Verdict.ALLOW:
+    if tier != "auto" or decision.action != Verdict.ALLOW:
         return decision
+    if floor is None:
+        return _log_relaxed_auto(intent, decision)
     windows = intent.context.platform == "windows"
-    if (
-        intent.kind == ToolKind.EDIT
-        and intent.target is not None
-        and intent.workspace_path is not None
-    ):
-        outside = [
+    if intent.kind == ToolKind.EDIT and intent.target is not None:
+        known = [
             bound
             for bound in (intent.target, intent.source)
-            if bound is not None
-            and bound.kind != "unknown"
-            and not _under(bound.path, intent.workspace_path.path, windows)
+            if bound is not None and bound.kind != "unknown"
         ]
-        if outside:
+        if known:
             from omnigent.server.child_approvals import _critical_target
 
-            if any(_critical_target(bound.path) for bound in outside):
+            if any(_critical_target(bound.path) for bound in known):
                 return TierDecision(Verdict.ASK, "Writing to a critical path requires approval")
-            reason = "relaxed-auto:outside-workspace-edit"
-            logger.info(
-                "permission_tier tier=allow reason=%s tool=%s host=%s",
-                reason,
-                intent.name,
-                intent.context.host_id,
-            )
-            return TierDecision(Verdict.ALLOW, reason)
+            if intent.workspace_path is not None and any(
+                not _under(bound.path, intent.workspace_path.path, windows) for bound in known
+            ):
+                decision = TierDecision(Verdict.ALLOW, "relaxed-auto:outside-workspace-edit")
     if intent.kind == ToolKind.EXEC:
         if intent.hidden_script:
             return TierDecision(Verdict.ASK, "Command requires user approval")
-        from omnigent.server.child_approvals import auto_floor_asks
+        from omnigent.server.child_approvals import auto_floor_decision
 
-        if intent.command and auto_floor_asks(
-            intent.command,
-            platform=intent.context.platform,
-            opaque=intent.command_opaque,
-        ):
-            return TierDecision(Verdict.ASK, "Command requires user approval")
-    return decision
+        if intent.command:
+            asks, relaxed_floor = auto_floor_decision(
+                intent.command,
+                platform=intent.context.platform,
+                opaque=intent.command_opaque,
+            )
+            if asks:
+                return TierDecision(Verdict.ASK, "Command requires user approval")
+            if relaxed_floor:
+                decision = TierDecision(Verdict.ALLOW, f"relaxed-auto:{relaxed_floor}")
+    return _log_relaxed_auto(intent, decision)
 
 
 def evaluate_host_tool(

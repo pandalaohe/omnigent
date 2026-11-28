@@ -324,14 +324,57 @@ def test_pi_auto_approval_floor_allows_non_critical_outside_edit_and_keeps_sever
         auto_approval_floor="narrow",
     )
     assert ordinary_acp.action == Verdict.ALLOW
-    destructive_acp = host.evaluate_host_tool(
-        state,
-        "run_command",
-        {"CommandLine": "git reset --hard"},
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        destructive_acp = host.evaluate_host_tool(
+            state,
+            "run_command",
+            {"CommandLine": "git reset --hard"},
+            control_paths=controls,
+            auto_approval_floor="narrow",
+        )
+        destructive_opaque = host.evaluate_host_tool(
+            state,
+            "run_command",
+            {"CommandLine": "echo hi; rm -rf $TARGET"},
+            control_paths=controls,
+            auto_approval_floor="narrow",
+        )
+    assert destructive_acp.action == Verdict.ASK
+    assert destructive_opaque.action == Verdict.ASK
+    assert "tier=allow" not in caplog.text
+
+    for command, expected_reason in (
+        ("find . -name '*.py' -exec wc -l {} +", "relaxed-auto:find-exec"),
+        ("find . -name '*.py' | xargs wc -l", "relaxed-auto:xargs"),
+        (
+            "gh api repos/example-org/example-repo/readme --jq .content | base64 -d | head",
+            "relaxed-auto:exfil-read",
+        ),
+    ):
+        caplog.clear()
+        with caplog.at_level("INFO"):
+            relaxed = host.evaluate_host_tool(
+                state,
+                "bash",
+                {"command": command},
+                control_paths=controls,
+                auto_approval_floor="narrow",
+            )
+        assert relaxed.action == Verdict.ALLOW
+        assert relaxed.reason == expected_reason
+        assert f"tier=allow reason={expected_reason}" in caplog.text
+
+    # Critical targets stay ASK even when inside a broad workspace root.
+    root_state = snapshot(Path("/"))
+    critical_inside = host.evaluate_host_tool(
+        root_state,
+        "write",
+        {"path": "/boot/grub.cfg", "content": "fixture"},
         control_paths=controls,
         auto_approval_floor="narrow",
     )
-    assert destructive_acp.action == Verdict.ASK
+    assert critical_inside.action == Verdict.ASK
 
 
 def test_windows_pi_bash_and_powershell_select_their_own_executors(

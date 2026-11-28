@@ -12,7 +12,6 @@ import contextlib
 import hashlib
 import io
 import json
-import logging
 import math
 import ntpath
 import os
@@ -35,8 +34,6 @@ DEFAULT_PERMISSION_TIER: PermissionTier = "auto"
 PI_PERMISSION_TIER_LABEL_KEY = "omnigent.pi.permission_tier"
 AGY_PERMISSION_TIER_LABEL_KEY = "omnigent.antigravity_native.permission_tier"
 PERMISSION_TIERS_CAPABILITY = "permission_tiers_v1"
-
-logger = logging.getLogger(__name__)
 
 
 class ToolKind(StrEnum):
@@ -4310,15 +4307,23 @@ def _explanation(
     return None
 
 
-def _relaxed_auto_allow(intent: ToolIntent, category: str) -> TierDecision:
-    reason = f"relaxed-auto:{category}"
-    logger.info(
-        "permission_tier tier=allow reason=%s tool=%s host=%s",
-        reason,
-        intent.name,
-        intent.context.host_id,
-    )
-    return TierDecision(Verdict.ALLOW, reason)
+def _relaxed_auto_allow(category: str) -> TierDecision:
+    return TierDecision(Verdict.ALLOW, f"relaxed-auto:{category}")
+
+
+def _unknown_edit_target_is_ambiguous_or_critical(path: str, *, windows: bool) -> bool:
+    if not path.strip():
+        return True
+    if windows and (
+        "%" in path
+        or "$" in path
+        or bool(re.match(r"^(?:\\\\[?.]\\|//[?.]/|\\\?\?\\)", path))
+        or bool(re.match(r"^[A-Za-z]:(?![/\\])", path))
+    ):
+        return True
+    from omnigent.server.child_approvals import _critical_target
+
+    return _critical_target(path)
 
 
 def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -> TierDecision:
@@ -4458,7 +4463,7 @@ def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -
             intent.name == "subagent" and intent.native_status is None
         ):
             if tier == "auto":
-                return _relaxed_auto_allow(intent, "native-proof")
+                return _relaxed_auto_allow("native-proof")
             return TierDecision(
                 Verdict.ASK,
                 "Native support proof is missing"
@@ -4478,19 +4483,20 @@ def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -
             p is not None and p.kind == "unknown" for p in (target, intent.source)
         ):
             if tier == "auto":
-                from omnigent.server.child_approvals import _critical_target
-
                 unknown_paths = [
                     p.path
                     for p in (target, intent.source)
                     if p is not None and p.kind == "unknown"
                 ]
-                if not any(_critical_target(path) for path in unknown_paths):
-                    return _relaxed_auto_allow(intent, "unknown-target")
+                if not any(
+                    _unknown_edit_target_is_ambiguous_or_critical(path, windows=windows)
+                    for path in unknown_paths
+                ):
+                    return _relaxed_auto_allow("unknown-target")
             return TierDecision(Verdict.ASK, "Target type or final path cannot be confirmed")
         if intent.status == "unknown" or intent.kind == ToolKind.UNKNOWN:
-            if tier == "auto":
-                return _relaxed_auto_allow(intent, "unknown-tool")
+            if tier == "auto" and intent.detail != "Interactive terminal input cannot be checked":
+                return _relaxed_auto_allow("unknown-tool")
             return TierDecision(
                 Verdict.ASK, intent.detail or "Unknown tool needs one-time approval"
             )
@@ -4498,7 +4504,7 @@ def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -
         if intent.command_opaque or intent.command_uncertain:
             if tier == "auto":
                 return _relaxed_auto_allow(
-                    intent, "opaque-command" if intent.command_opaque else "uncertain-command"
+                    "opaque-command" if intent.command_opaque else "uncertain-command"
                 )
             return TierDecision(Verdict.ASK, intent.detail or "Command requires one-time approval")
         # D3 step 7: ask / accept-edits / auto.

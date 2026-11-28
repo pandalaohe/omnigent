@@ -347,8 +347,14 @@ def test_agy_operations_keep_existing_operational_tiers(name, args):
 def test_uncheckable_agy_tools_keep_fail_closed_tiers_and_explain_why(name, args, reason):
     result = decision("auto", name, args)
     is_native_grant = name in ("ask_permission", "ask_custom_permission")
+    is_terminal_input = name == "send_command_input" or (
+        name == "manage_task" and args.get("Action") == "send_input"
+    )
     if is_native_grant:
         assert result.action == Verdict.DENY
+        assert reason in result.reason
+    elif is_terminal_input:
+        assert result.action == Verdict.ASK
         assert reason in result.reason
     else:
         assert result.action == Verdict.ALLOW
@@ -2510,7 +2516,7 @@ def test_terminal_and_malformed_calls_fail_closed() -> None:
         {"terminal": "t", "session": "s", "keys": "Up Enter"},
         {"terminal": "t", "session": "s", "text": "rm ", "keys": ""},
     ):
-        assert decision("auto", "sys_terminal_send", args).action == Verdict.ALLOW
+        assert decision("auto", "sys_terminal_send", args).action == Verdict.ASK
         assert decision("plan", "sys_terminal_send", args).action == Verdict.DENY
         assert decision("ask", "sys_terminal_send", args).action == Verdict.ASK
         assert decision("accept-edits", "sys_terminal_send", args).action == Verdict.ASK
@@ -4220,3 +4226,21 @@ def test_r2_symlink_lexical_escape_windows_operand_fallback_and_persistent_cwd()
         ).action
         == Verdict.ASK
     )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        r"\\?\C:\Windows\System32\drivers\etc\hosts",
+        r"\\.\PhysicalDrive0",
+        r"%SystemRoot%\win.ini",
+        r"C:Windows\win.ini",
+    ],
+)
+def test_windows_unknown_critical_or_namespace_edit_stays_ask_under_auto(path: str) -> None:
+    def failing_resolver(_raw: str) -> ResolvedPath:
+        raise OSError("cannot resolve")
+
+    host = windows_host(resolver=failing_resolver)
+    result = decision("auto", "write", {"path": path, "content": "x"}, host)
+    assert result.action == Verdict.ASK
