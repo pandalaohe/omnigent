@@ -464,6 +464,7 @@ def register_mcp_routes(
                         skill_bundle_dir=_resolved_spec_workdir(spec_bundle_entry),
                         wake_on_async_result=wake_on_async_result,
                         session_workspace=await _session_explicit_workspace(session_id),
+                        permission_tiers=permission_tiers,
                     )
                 except Exception as exc:
                     _logger.exception(

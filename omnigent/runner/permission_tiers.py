@@ -328,6 +328,11 @@ class PermissionTierRuntime:
         except (OSError, ValueError, TypeError):
             return None
 
+    def ready_tier(self, session_id: str) -> PermissionTier | None:
+        """Return the verified tier only while the session permission state is ready."""
+        state = self.state(session_id)
+        return state.tier if state is not None and state.status == "ready" else None
+
     def path(self, session_id: str) -> Path:
         return self._paths[session_id]
 

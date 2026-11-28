@@ -35,6 +35,7 @@ from omnigent._platform import (
     windows_os_env_shell_path,
 )
 from omnigent.git_commands import run_git
+from omnigent.permission_tiers import PERMISSION_TIERS, PermissionTier
 from omnigent.runner.identity import (
     OMNIGENT_SESSION_ENV_VAR,
     strip_runner_auth_secrets,
@@ -433,12 +434,14 @@ class _HelperProcessClient:
         egress_allow_private_destinations: bool = False,
         copy_on_write_environment: CopyOnWriteEnvironment | None = None,
         relaunch_when_stale: bool = False,
+        permission_tier: PermissionTier | None = None,
     ) -> None:
         self._copy_on_write_environment = copy_on_write_environment
         self._relaunch_when_stale = relaunch_when_stale
         self.cwd = cwd
         self.shell_path = shell_path
         self.sandbox = sandbox
+        self.permission_tier = permission_tier
         self.start_in_scratch = start_in_scratch
         self._egress_rules = egress_rules
         self._egress_allow_private_destinations = egress_allow_private_destinations
@@ -723,6 +726,8 @@ class _HelperProcessClient:
             "shell_path": self.shell_path,
             "sandbox": sandbox.to_jsonable(),
         }
+        if self.permission_tier is not None:
+            config["permission_tier"] = self.permission_tier
         # S4 (security): include the per-helper Proxy-Authorization
         # token IF egress is active. Delivered ONLY via the pipe FD,
         # not via the policy (which serialises to logs/dumps) and not
@@ -1098,6 +1103,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
     _copy_on_write_environment: CopyOnWriteEnvironment | None = None
     _owns_copy_on_write: bool = False
     _relaunch_when_stale: bool = False
+    _permission_tier: PermissionTier | None = None
 
     def isolate_model_credentials(self, access: ClaudeModelAccess) -> None:
         self.sandbox = self._helper.isolate_model_credentials(access)
@@ -1135,6 +1141,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
             egress_allow_private_destinations=self._egress_allow_private_destinations,
             copy_on_write_environment=self._copy_on_write_environment,
             relaunch_when_stale=self._relaunch_when_stale,
+            permission_tier=self._permission_tier,
         )
 
     async def read(
@@ -1280,6 +1287,7 @@ def create_os_environment(
     additional_read_roots: Sequence[Path] = (),
     relaunch_when_stale: bool = False,
     model_access: ClaudeModelAccess | None = None,
+    permission_tier: PermissionTier | None = None,
 ) -> OSEnvironment | None:
     """Instantiate the configured OS environment.
 
@@ -1287,9 +1295,14 @@ def create_os_environment(
         fresh launch would have different mounts or inherited environment
         values. Credential-proxy helpers relaunch for every request to resolve
         their sources again. A relaunch discards the helper's scratch dir.
+    :param permission_tier: Resolved session permission tier when known by the
+        caller. Tier ``"full"`` skips the cwd/grant reach check in the helper
+        while keeping any active OS sandbox boundary intact.
     """
     if spec is None:
         return None
+    if permission_tier is not None and permission_tier not in PERMISSION_TIERS:
+        raise ValueError(f"Unsupported permission_tier: {permission_tier!r}")
     if spec.type != "caller_process":
         raise NotImplementedError(f"os_env type '{spec.type}' is not implemented")
 
@@ -1328,6 +1341,7 @@ def create_os_environment(
         _egress_rules=egress_rules,
         _egress_allow_private_destinations=egress_allow_private,
         _relaunch_when_stale=relaunch_when_stale,
+        _permission_tier=permission_tier,
     )
     if model_access is not None:
         environment.isolate_model_credentials(model_access)
@@ -1353,6 +1367,7 @@ def _handle_helper_request(
     cwd: Path,
     shell_path: str,
     sandbox: SandboxPolicy,
+    permission_tier: PermissionTier | None = None,
 ) -> OpResult:
     op = request.get("op")
     if op == "git":
@@ -1378,7 +1393,9 @@ def _handle_helper_request(
             return {"error": "Invalid Git read request"}
         try:
             git_cwd = _resolve_path(cwd, target)
-            _assert_within_reach(cwd, sandbox, git_cwd, need_write=False)
+            _assert_within_reach(
+                cwd, sandbox, git_cwd, need_write=False, permission_tier=permission_tier
+            )
             _assert_read_allowed(sandbox, git_cwd, cwd)
             options = ["--no-ext-diff", "--no-textconv"] if args[0] == "diff" else []
             argv = [
@@ -1427,7 +1444,9 @@ def _handle_helper_request(
             return {"error": "path must be a non-empty string"}
         path = _resolve_path(cwd, raw_path)
         try:
-            _assert_within_reach(cwd, sandbox, path, need_write=False)
+            _assert_within_reach(
+                cwd, sandbox, path, need_write=False, permission_tier=permission_tier
+            )
             _assert_read_allowed(sandbox, path, cwd)
         except PermissionError as exc:
             return {"error": str(exc)}
@@ -1472,7 +1491,9 @@ def _handle_helper_request(
             return {"error": "path must be a non-empty string"}
         path = _resolve_path(cwd, raw_path)
         try:
-            _assert_within_reach(cwd, sandbox, path, need_write=True)
+            _assert_within_reach(
+                cwd, sandbox, path, need_write=True, permission_tier=permission_tier
+            )
             _assert_write_allowed(sandbox, path)
         except PermissionError as exc:
             return {"error": str(exc)}
@@ -1493,7 +1514,9 @@ def _handle_helper_request(
             return {"error": "path must be a non-empty string"}
         path = _resolve_path(cwd, raw_path)
         try:
-            _assert_within_reach(cwd, sandbox, path, need_write=True)
+            _assert_within_reach(
+                cwd, sandbox, path, need_write=True, permission_tier=permission_tier
+            )
             _assert_read_allowed(sandbox, path, cwd)
             _assert_write_allowed(sandbox, path)
         except PermissionError as exc:
@@ -1512,7 +1535,9 @@ def _handle_helper_request(
             return {"error": "path must be a non-empty string", "code": "invalid_path"}
         if not isinstance(recursive, bool):
             return {"error": "recursive must be a boolean", "code": "invalid_path"}
-        return _delete_impl(cwd, sandbox, raw_path, recursive=recursive)
+        return _delete_impl(
+            cwd, sandbox, raw_path, recursive=recursive, permission_tier=permission_tier
+        )
 
     if op == "shell":
         command = request.get("command")
@@ -1592,6 +1617,7 @@ def _assert_within_reach(
     resolved: Path,
     *,
     need_write: bool,
+    permission_tier: PermissionTier | None = None,
 ) -> None:
     """Confine a file-tool op to *cwd*, extended by declared sandbox grants.
 
@@ -1607,6 +1633,9 @@ def _assert_within_reach(
 
     Precedence and grant semantics:
 
+    - When *permission_tier* is ``"full"``, this reach check is skipped for
+      the session; active OS sandboxes keep their own allow-list checks and
+      backend masks unchanged.
     - A path inside *cwd* is always permitted here (the active-sandbox
       allow-list narrowing in :func:`_assert_read_allowed` /
       :func:`_assert_write_allowed` still runs afterwards, unchanged).
@@ -1642,9 +1671,13 @@ def _assert_within_reach(
     :param need_write: ``True`` for write / edit ops (only write grants admit
         an out-of-cwd path); ``False`` for read ops (read OR write grants
         admit).
+    :param permission_tier: Resolved session permission tier when known; only
+        ``"full"`` bypasses this reach check.
     :raises PermissionError: If *resolved* is outside *cwd* and no grant of
         the required kind covers it.
     """
+    if permission_tier == "full":
+        return
     for root in reachable_roots(cwd, policy):
         # Read grants admit reads only; write grants admit both.
         if need_write and root.access != "write":
@@ -1697,7 +1730,14 @@ _DIR_TRAVERSE_FLAGS = (
 )
 
 
-def _delete_impl(cwd: Path, sandbox: SandboxPolicy, raw_path: str, *, recursive: bool) -> OpResult:
+def _delete_impl(
+    cwd: Path,
+    sandbox: SandboxPolicy,
+    raw_path: str,
+    *,
+    recursive: bool,
+    permission_tier: PermissionTier | None = None,
+) -> OpResult:
     """Remove the entry *raw_path* names, confined like a write and never followed.
 
     The parent is resolved and the entry must be within write reach, exactly as
@@ -1729,7 +1769,7 @@ def _delete_impl(cwd: Path, sandbox: SandboxPolicy, raw_path: str, *, recursive:
     parent = _resolve_path(cwd, parent_raw or ".")
     entry = parent / name
     try:
-        _assert_within_reach(cwd, sandbox, entry, need_write=True)
+        _assert_within_reach(cwd, sandbox, entry, need_write=True, permission_tier=permission_tier)
     except PermissionError:
         # Not str(exc): that names where an outward symlink points.
         return {"error": f"Path {raw_path!r} escapes the environment root", "code": "invalid_path"}
@@ -1746,7 +1786,7 @@ def _delete_impl(cwd: Path, sandbox: SandboxPolicy, raw_path: str, *, recursive:
             "error": f"Write access to {raw_path!r} is blocked by sandbox",
             "code": "permission_denied",
         }
-    anchor = _delete_anchor(cwd, sandbox, parent, entry)
+    anchor = _delete_anchor(cwd, sandbox, parent, entry, permission_tier=permission_tier)
     if anchor is None:
         return {"error": f"Cannot delete the reachable root {raw_path!r}", "code": "invalid_path"}
     try:
@@ -1764,7 +1804,12 @@ def _delete_impl(cwd: Path, sandbox: SandboxPolicy, raw_path: str, *, recursive:
 
 
 def _delete_anchor(
-    cwd: Path, sandbox: SandboxPolicy, parent: Path, entry: Path
+    cwd: Path,
+    sandbox: SandboxPolicy,
+    parent: Path,
+    entry: Path,
+    *,
+    permission_tier: PermissionTier | None = None,
 ) -> tuple[Path, tuple[str, ...]] | None:
     """Pick the trusted directory a delete walks from.
 
@@ -1772,6 +1817,7 @@ def _delete_anchor(
     :param sandbox: Resolved sandbox policy carrying the declared grants.
     :param parent: Resolved parent of the entry.
     :param entry: The entry, parent resolved and leaf not.
+    :param permission_tier: Resolved session permission tier when known.
     :returns: ``(base, parts)``: a write grant to open by path and the
         components from it down to *parent*, or ``None`` when *entry* is a
         grant root whose parent no grant covers.
@@ -1783,6 +1829,8 @@ def _delete_anchor(
             return root.path, parent.relative_to(root.path).parts
         if root.kind == "file" and root.path == entry:
             return parent, ()
+    if permission_tier == "full" and not sandbox.active and parent.anchor:
+        return Path(parent.anchor), parent.parts[1:]
     return None
 
 
@@ -2401,10 +2449,16 @@ def _run_helper(config: JsonValue) -> int:
     cwd_value = config.get("cwd")
     shell_path_value = config.get("shell_path")
     sandbox_value = config.get("sandbox")
+    raw_permission_tier = config.get("permission_tier")
     if not isinstance(cwd_value, str) or not isinstance(shell_path_value, str):
         raise ValueError("Invalid os_env helper config payload")
     if not isinstance(sandbox_value, dict):
         raise ValueError("Invalid os_env helper sandbox payload")
+    permission_tier: PermissionTier | None = None
+    if raw_permission_tier is not None:
+        if not isinstance(raw_permission_tier, str) or raw_permission_tier not in PERMISSION_TIERS:
+            raise ValueError("Invalid os_env helper permission_tier payload")
+        permission_tier = cast(PermissionTier, raw_permission_tier)
 
     # S4 (security): if the parent shipped a Proxy-Authorization
     # token via the config FD, splice it into HTTP_PROXY / HTTPS_PROXY
@@ -2452,6 +2506,7 @@ def _run_helper(config: JsonValue) -> int:
                 cwd=cwd,
                 shell_path=shell_path_value,
                 sandbox=sandbox,
+                permission_tier=permission_tier,
             )
         except Exception as exc:  # noqa: BLE001 — helper loop surfaces any error through the JSON response envelope
             response = {"error": f"os_env helper exception: {exc}"}

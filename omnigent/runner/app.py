@@ -12763,6 +12763,7 @@ def create_runner_app(
                                                         if isinstance(_caller_user_id, str)
                                                         else None
                                                     ),
+                                                    permission_tiers=permission_tiers,
                                                 )
                                             )
                                         )

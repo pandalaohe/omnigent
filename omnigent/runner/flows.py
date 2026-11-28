@@ -37,6 +37,7 @@ from omnigent.tools.builtins.flow import FlowPlan, StopWhen
 
 if TYPE_CHECKING:
     from omnigent.runner.mcp_manager import RunnerMcpManager
+    from omnigent.runner.permission_tiers import PermissionTierRuntime
     from omnigent.runner.resource_registry import SessionResourceRegistry
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
     from omnigent.spec.types import AgentSpec
@@ -98,6 +99,7 @@ class FlowContext:
     local_tool_workdir: Any = None
     filesystem_registry: FilesystemRegistry | None = None
     effective_harness: str | None = None
+    permission_tiers: PermissionTierRuntime | None = None
 
 
 @dataclass
@@ -546,6 +548,7 @@ async def _run_step(run: _FlowRun, index: int, args: dict[str, Any]) -> str:
             mcp_manager=None,
             filesystem_registry=ctx.filesystem_registry,
             effective_harness=ctx.effective_harness,
+            permission_tiers=ctx.permission_tiers,
         )
     finally:
         _step_run.reset(token)

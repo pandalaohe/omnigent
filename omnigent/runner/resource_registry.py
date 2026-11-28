@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     from omnigent.inner.os_env import OSEnvironment
     from omnigent.inner.sandbox import SandboxPolicy
     from omnigent.inner.terminal import TerminalInstance
+    from omnigent.permission_tiers import PermissionTier
     from omnigent.spec.types import AgentSpec
     from omnigent.terminals.registry import TerminalRegistry
 
@@ -311,6 +312,7 @@ class ToolEnvironmentLease:
     spec: OSEnvSpec
     sandbox: SandboxPolicy
     environment: OSEnvironment
+    permission_tier: PermissionTier | None = None
     leased: bool = False
 
     async def release(self, *, reusable: bool) -> None:
@@ -1475,15 +1477,20 @@ class SessionResourceRegistry:
         raise ValueError(f"Environment {environment_id!r} not found for session {session_id!r}")
 
     async def lease_tool_environment(
-        self, session_id: str, spec: OSEnvSpec
+        self,
+        session_id: str,
+        spec: OSEnvSpec,
+        *,
+        permission_tier: PermissionTier | None = None,
     ) -> ToolEnvironmentLease | None:
         """Lease the session's reusable ``sys_os_*`` environment for one call.
 
-        Reuse keeps the helper process warm across calls; a changed spec
-        replaces the environment.
+        Reuse keeps the helper process warm across calls; a changed spec,
+        resolved sandbox, or permission tier replaces the environment.
 
         :param session_id: Session/conversation identifier.
         :param spec: Effective spec for this call, with a concrete cwd.
+        :param permission_tier: Resolved session permission tier when known.
         :returns: The lease, or ``None`` while another call holds it so
             concurrent calls fall back to their own environment.
         """
@@ -1500,12 +1507,14 @@ class SessionResourceRegistry:
                 or lease.spec != spec
                 or lease.environment.cwd != cwd
                 or lease.sandbox != sandbox
+                or lease.permission_tier != permission_tier
             ):
                 environment = create_os_environment(
                     spec,
                     sandbox_policy=sandbox,
                     additional_read_roots=[self._codex_skills_dir_locked(session_id)],
                     relaunch_when_stale=True,
+                    permission_tier=permission_tier,
                 )
                 if environment is None:
                     raise RuntimeError(f"Failed to create OS environment for {session_id!r}")
@@ -1513,7 +1522,12 @@ class SessionResourceRegistry:
                 if lease is not None and not lease.leased:
                     replaced = lease.environment
                 lease = ToolEnvironmentLease(
-                    self, session_id, deepcopy(spec), deepcopy(sandbox), environment
+                    self,
+                    session_id,
+                    deepcopy(spec),
+                    deepcopy(sandbox),
+                    environment,
+                    permission_tier=permission_tier,
                 )
                 self._tool_envs[session_id] = lease
             elif lease.leased:

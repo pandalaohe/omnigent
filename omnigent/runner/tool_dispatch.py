@@ -47,7 +47,9 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 if TYPE_CHECKING:
     from omnigent.inner.datamodel import OSEnvSpec
     from omnigent.inner.os_env import OSEnvironment
+    from omnigent.permission_tiers import PermissionTier
     from omnigent.runner.mcp_manager import RunnerMcpManager
+    from omnigent.runner.permission_tiers import PermissionTierRuntime
     from omnigent.runner.resource_registry import SessionResourceRegistry, ToolEnvironmentLease
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
     from omnigent.spec.types import AgentSpec, SkillSpec
@@ -13197,6 +13199,7 @@ async def execute_tool(
     call_id: str | None = None,
     caller_user_id: str | None = None,
     session_workspace: Path | UnknownSessionWorkspace | None = None,
+    permission_tiers: PermissionTierRuntime | None = None,
 ) -> str:
     """
     Execute a tool and return the output string.
@@ -13290,6 +13293,11 @@ async def execute_tool(
                 return "Error: agent_spec not available for MCP dispatch"
             output = await mcp_manager.call_tool(agent_spec, tool_name, args)
         elif tool_name in _OS_ENV_TOOLS:
+            permission_tier = (
+                permission_tiers.ready_tier(conversation_id)
+                if permission_tiers is not None and conversation_id is not None
+                else None
+            )
             output = await _execute_os_env_tool(
                 tool_name,
                 args,
@@ -13304,6 +13312,7 @@ async def execute_tool(
                     else cast(Path | None, local_tool_workdir)
                 ),
                 effective_harness=effective_harness,
+                permission_tier=permission_tier,
             )
         elif tool_name in _REST_TOOLS:
             output = await _execute_rest_tool(
@@ -13361,6 +13370,7 @@ async def execute_tool(
                 effective_harness=effective_harness,
                 wake_on_async_result=wake_on_async_result,
                 session_workspace=session_workspace,
+                permission_tiers=permission_tiers,
             )
         elif tool_name in _SUBAGENT_TOOLS:
             output = await _execute_subagent_tool(
@@ -13541,6 +13551,7 @@ async def execute_tool(
                 local_tool_workdir=local_tool_workdir,
                 filesystem_registry=filesystem_registry,
                 effective_harness=effective_harness,
+                permission_tiers=permission_tiers,
             )
         elif tool_name in _TASK_LIFECYCLE_TOOLS:
             output = await _execute_task_lifecycle_tool(
@@ -13782,6 +13793,7 @@ async def dispatch_tool_locally(
     skill_bundle_dir: Path | None = None,
     wake_on_async_result: AsyncResultWake | None = None,
     caller_user_id: str | None = None,
+    permission_tiers: PermissionTierRuntime | None = None,
 ) -> str:
     """Execute a tool once and POST its result to the harness.
 
@@ -13843,6 +13855,7 @@ async def dispatch_tool_locally(
         wake_on_async_result=wake_on_async_result,
         call_id=call_id,
         caller_user_id=caller_user_id,
+        permission_tiers=permission_tiers,
     )
 
     # A file-mutating tool just ran — nudge the web to refetch the
@@ -14066,6 +14079,7 @@ async def _execute_os_env_tool(
     resource_registry: SessionResourceRegistry | None = None,
     bundle_dir: Path | None = None,
     effective_harness: str | None = None,
+    permission_tier: PermissionTier | None = None,
 ) -> str:
     """
     Execute sys_os_* through a runner-local OSEnvironment.
@@ -14152,7 +14166,9 @@ async def _execute_os_env_tool(
                 # Scratch calls share their private workspace until retirement.
                 # Other shells stay disposable, leaving cached file helpers intact.
                 tool_lease = await resource_registry.lease_tool_environment(
-                    conversation_id, effective_spec
+                    conversation_id,
+                    effective_spec,
+                    permission_tier=permission_tier,
                 )
             if tool_lease is not None:
                 os_env = tool_lease.environment
@@ -14169,6 +14185,7 @@ async def _execute_os_env_tool(
                         effective_spec,
                         additional_read_roots=additional_read_roots,
                         model_access=model_access,
+                        permission_tier=permission_tier,
                     )
                 )
                 try:
@@ -14959,6 +14976,7 @@ async def _execute_async_inbox_tool(
     effective_harness: str | None = None,
     wake_on_async_result: AsyncResultWake | None = None,
     session_workspace: Path | UnknownSessionWorkspace | None = None,
+    permission_tiers: PermissionTierRuntime | None = None,
 ) -> str:
     """
     Runner-local dispatch for async inbox tools.
@@ -15014,6 +15032,7 @@ async def _execute_async_inbox_tool(
             effective_harness=effective_harness,
             wake_on_async_result=wake_on_async_result,
             session_workspace=session_workspace,
+            permission_tiers=permission_tiers,
         )
 
     if tool_name == SysCancelAsyncTool.name():
@@ -15625,6 +15644,7 @@ def _spawn_async_tool(
     effective_harness: str | None = None,
     wake_on_async_result: AsyncResultWake | None = None,
     session_workspace: Path | UnknownSessionWorkspace | None = None,
+    permission_tiers: PermissionTierRuntime | None = None,
 ) -> str:
     """
     Spawn a tool as a background asyncio.Task.
@@ -15742,6 +15762,7 @@ def _spawn_async_tool(
                 filesystem_registry=filesystem_registry,
                 effective_harness=effective_harness,
                 session_workspace=session_workspace,
+                permission_tiers=permission_tiers,
             )
             execution_task = asyncio.create_task(exec_coro)
             cancellation_task = asyncio.create_task(cancel_event.wait())
