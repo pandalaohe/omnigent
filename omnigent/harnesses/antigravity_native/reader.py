@@ -75,6 +75,7 @@ from typing import Literal
 import httpx
 
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.errors import ErrorCode
 from omnigent.harnesses.antigravity_native.bridge import (
     AntigravityNativeBridgeState,
     agy_conversation_db,
@@ -1484,6 +1485,8 @@ class _ReaderState:
         held as a strong ref so it is not GC'd mid-run; cancelled on teardown.
         Doubles as the start-once guard — a re-sent step re-enters the handler
         every frame while the sub-agents work.
+    :param subagent_title_conflicts: Cascades whose registration was rejected
+        with a title conflict, skipped for the rest of this reader's lifetime.
     """
 
     seen: set[_StepKey]
@@ -1516,6 +1519,7 @@ class _ReaderState:
     surfaced_elicitations: dict[_StepKey, str] = field(default_factory=dict)
     interaction_rescans: set[asyncio.Task[None]] = field(default_factory=set)
     subagent_mirrors: dict[str, asyncio.Task[None]] = field(default_factory=dict)
+    subagent_title_conflicts: set[str] = field(default_factory=set)
     governance_watchers: dict[str, asyncio.Task[None]] = field(default_factory=dict)
     last_context_usage: dict[str, object] | None = None
     usage_thread_kind: Literal["main", "subagent"] = "main"
@@ -1918,6 +1922,11 @@ def _subagent_pairs(step: dict[str, object]) -> list[tuple[dict[str, object], st
     return pairs
 
 
+@dataclass(frozen=True)
+class _SubagentTitleConflict:
+    reason: str
+
+
 async def _register_subagent_child(
     *,
     client: httpx.AsyncClient,
@@ -1925,7 +1934,7 @@ async def _register_subagent_child(
     spec: dict[str, object],
     child_cascade_id: str,
     tool_call_id: str,
-) -> str | None:
+) -> str | _SubagentTitleConflict | None:
     """
     Register one agy sub-agent with the server and return its child session id.
 
@@ -1935,8 +1944,8 @@ async def _register_subagent_child(
     :param child_cascade_id: The child's agy conversation id.
     :param tool_call_id: The INVOKE_SUBAGENT step's mirrored call id, so the
         child links back to the tool card that spawned it.
-    :returns: The minted child conversation id, or ``None`` when the server
-        rejected the registration (logged; the sub-agent is simply not mirrored).
+    :returns: The child session id or a terminal title conflict. Other failed
+        attempts return ``None`` and can be retried on a later frame.
     """
     role = spec.get("role")
     agent_type = spec.get("typeName")
@@ -1953,6 +1962,14 @@ async def _register_subagent_child(
         response = await client.post(
             f"/v1/sessions/{url_component(session_id)}/events", json=payload
         )
+        if response.status_code == httpx.codes.CONFLICT:
+            conflict = response.json()
+            detail = conflict.get("detail") if isinstance(conflict, dict) else None
+            if isinstance(detail, dict) and detail.get("code") == ErrorCode.ALREADY_EXISTS:
+                reason = detail.get("message")
+                if not isinstance(reason, str) or not reason:
+                    reason = "The Antigravity sub-agent title already exists."
+                return _SubagentTitleConflict(reason)
         response.raise_for_status()
         body = response.json()
     except (httpx.HTTPError, ValueError) as exc:
@@ -2411,8 +2428,8 @@ async def _maybe_mirror_subagents(
     the Agents rail stays empty — the sub-agents' work is invisible in the web UI
     even though agy hands us their ids.
 
-    Idempotent: a child already being mirrored is skipped, so a re-read of the
-    step starts nothing new. The step's own status is deliberately NOT consulted:
+    Cascades already mirrored or rejected for a title conflict are skipped on
+    re-read. The step's own status is deliberately NOT consulted:
     ``invoke_subagent`` is fire-and-forget, reaching DONE while the child it
     spawned is still working, so each mirror decides for itself when its child is
     finished.
@@ -2466,23 +2483,35 @@ async def _maybe_mirror_subagents(
                 _logger.warning(
                     "Antigravity child permission observation unavailable", exc_info=True
                 )
-        if child_cascade_id in state.subagent_mirrors:
+        if (
+            child_cascade_id in state.subagent_mirrors
+            or child_cascade_id in state.subagent_title_conflicts
+        ):
             continue
-        child_session_id = await _register_subagent_child(
+        registration = await _register_subagent_child(
             client=client,
             session_id=session_id,
             spec=spec,
             child_cascade_id=child_cascade_id,
             tool_call_id=tool_call_id,
         )
-        if child_session_id is None:
+        if registration is None:
+            continue
+        if isinstance(registration, _SubagentTitleConflict):
+            state.subagent_title_conflicts.add(child_cascade_id)
+            _logger.info(
+                "agy sub-agent mirroring skipped: parent=%s child=%s reason=%s",
+                session_id,
+                child_cascade_id,
+                registration.reason,
+            )
             continue
         task = asyncio.create_task(
             _mirror_subagent_cascade(
                 port=state.port,
                 child_cascade_id=child_cascade_id,
                 client=client,
-                child_session_id=child_session_id,
+                child_session_id=registration,
             )
         )
         state.subagent_mirrors[child_cascade_id] = task
@@ -2490,7 +2519,7 @@ async def _maybe_mirror_subagents(
             "agy sub-agent mirroring started: parent=%s child_cascade=%s child_session=%s role=%r",
             session_id,
             child_cascade_id,
-            child_session_id,
+            registration,
             spec.get("role"),
         )
 

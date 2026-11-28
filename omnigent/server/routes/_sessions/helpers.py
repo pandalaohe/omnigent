@@ -5895,15 +5895,40 @@ async def _create_and_publish_antigravity_child(
             runner_id=parent_conv.runner_id,
             sub_agent_name=agent_type or _ANTIGRAVITY_NATIVE_SUBAGENT_DISPLAY_FALLBACK,
         )
-    except NameAlreadyExistsError:
-        # The (parent, title) unique index fired: a concurrent start, or a
-        # redelivery that arrived before ``set_labels`` ran. Adopt the row and
-        # upsert labels rather than 500ing the sub-agent out of the rail.
-        existing = await asyncio.to_thread(
-            _find_subagent_child_by_title, conversation_store, parent_id, title
+    except NameAlreadyExistsError as exc:
+        # The title embeds the cascade id. Recovery must search archived
+        # children too, since they can still own that title.
+        matches = await asyncio.to_thread(
+            conversation_store.list_conversations,
+            kind="sub_agent",
+            parent_conversation_id=parent_id,
+            title=title,
+            include_archived=True,
+            limit=1,
         )
-        if existing is None:
-            raise
+        if not matches.data:
+            # The colliding row may have disappeared since the create check.
+            raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+        existing = matches.data[0]
+        # The database's collation may equate distinct native cascade IDs.
+        if existing.title != title:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": ErrorCode.ALREADY_EXISTS,
+                    "message": (
+                        "The conflicting Antigravity sub-agent title has no exact cascade match."
+                    ),
+                },
+            ) from exc
+        if existing.archived:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": ErrorCode.ALREADY_EXISTS,
+                    "message": "The Antigravity sub-agent session is archived.",
+                },
+            ) from exc
         await asyncio.to_thread(conversation_store.set_labels, existing.id, labels)
         # An orphaned row's creator died before publishing, so live clients have
         # never heard about this child; a duplicate publish in the race case is a
