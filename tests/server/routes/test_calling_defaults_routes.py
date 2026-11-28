@@ -972,6 +972,74 @@ async def test_acp_host_tier_defaults_on_delegated_create(client, app, stores):
     assert orchestrated.json()["permission_tier"] == "full"
 
 
+@pytest.mark.parametrize("bundled", [True, False], ids=["upload", "registered"])
+async def test_ag_acp_create_persists_saved_full_default_and_explicit_auto(
+    client, app, stores, bundled
+):
+    from omnigent.server.permission_tiers import (
+        ACP_PERMISSION_TIER_LABEL_KEY,
+        PERMISSION_STATE_LABEL_KEY,
+    )
+
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.host_store.update_harness_readiness(HOST_A, {"acp": True, "ag-acp": True})
+    _register_host(app, HOST_A)
+    app.state.host_registry.get(HOST_A).hello.capabilities.append("agy_acp_permissions:ag-acp")
+    _seed_agent(stores, AGENT_ID, "ag-acp", name="ag-acp-agent")
+    stores.prefs.patch_namespace(
+        "local", "calling_defaults", {HOST_A: {"ag-acp": {"permission": "host-tier:full"}}}
+    )
+    conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    parent = conversations.create_conversation(
+        agent_id=AGENT_ID,
+        host_id=HOST_A,
+        workspace="/neutral/project",
+        runner_id="test-runner",
+    )
+
+    async def create(**overrides):
+        metadata = {"parent_session_id": parent.id, **overrides}
+        if bundled:
+            return await client.post(
+                "/v1/sessions",
+                data={"metadata": json.dumps(metadata)},
+                files={"bundle": ("agent.tar.gz", _bundle("ag-acp"), "application/gzip")},
+                headers=PERMISSION_TIERS_HEADERS,
+            )
+        return await client.post(
+            "/v1/sessions",
+            json={"agent_id": AGENT_ID, **metadata},
+            headers=PERMISSION_TIERS_HEADERS,
+        )
+
+    # Omitted tier inherits the saved `host-tier:full` default and persists DB labels.
+    inherited = await create()
+    assert inherited.status_code == 201, inherited.text
+    inherited_id = inherited.json()["session_id"] if bundled else inherited.json()["id"]
+    inherited_snapshot = await client.get(f"/v1/sessions/{inherited_id}")
+    assert inherited_snapshot.status_code == 200, inherited_snapshot.text
+    assert inherited_snapshot.json()["permission_tier"] == "full"
+    assert inherited_snapshot.json()["permission_tier_state"] == "blocked"
+    assert inherited_snapshot.json()["harness_namespace"] == "ag-acp"
+    saved_full = conversations.get_conversation(inherited_id)
+    assert saved_full is not None
+    assert saved_full.labels.get(ACP_PERMISSION_TIER_LABEL_KEY) == "full"
+    assert PERMISSION_STATE_LABEL_KEY in saved_full.labels
+
+    # Explicit `auto` overrides the saved `full` default and persists `auto`.
+    explicit_auto = await create(permission_tier="auto")
+    assert explicit_auto.status_code == 201, explicit_auto.text
+    auto_id = explicit_auto.json()["session_id"] if bundled else explicit_auto.json()["id"]
+    auto_snapshot = await client.get(f"/v1/sessions/{auto_id}")
+    assert auto_snapshot.status_code == 200, auto_snapshot.text
+    assert auto_snapshot.json()["permission_tier"] == "auto"
+    assert auto_snapshot.json()["permission_tier_state"] == "blocked"
+    saved_auto = conversations.get_conversation(auto_id)
+    assert saved_auto is not None
+    assert saved_auto.labels.get(ACP_PERMISSION_TIER_LABEL_KEY) == "auto"
+    assert PERMISSION_STATE_LABEL_KEY in saved_auto.labels
+
+
 @pytest.mark.parametrize("bundled", [False, True], ids=["registered", "upload"])
 @pytest.mark.parametrize(
     "mode,calling_default,expected",

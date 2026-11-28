@@ -3408,6 +3408,7 @@ def _build_session_response(
     from omnigent.server.permission_tiers import (
         PERMISSION_CAPABILITY_LABEL_KEY,
         PERMISSION_CAPABILITY_VALUE,
+        is_acp_permission_harness,
         legacy_permission_tier,
         permission_tier_active,
         read_permission_state,
@@ -3489,7 +3490,7 @@ def _build_session_response(
         harness=harness,
         harness_namespace=(
             session_acp_harness(conv, agent_store, agent_cache)
-            if harness and (harness == "acp" or harness.startswith("acp:"))
+            if is_acp_permission_harness(harness)
             else None
         ),
         permission_tier=permission_tier,
@@ -17712,9 +17713,9 @@ async def _create_session_from_existing_agent_impl(
             acp_options = await cached_acp_permission_options(
                 request, permission_host_id, resolved_harness
             )
-            if resolved_harness and (
-                resolved_harness == "acp" or resolved_harness.startswith("acp:")
-            ):
+            from omnigent.server.permission_tiers import is_acp_permission_harness
+
+            if resolved_harness is not None and is_acp_permission_harness(resolved_harness):
                 require_acp_permission_mode(
                     body.permission_mode, acp_options, resolved_harness, permission_host_id
                 )
@@ -19207,12 +19208,19 @@ def _create_session_from_bundle(
         )
     assert spec.name is not None
 
-    if _spec_harness(spec) != "acp":
+    from omnigent.server.permission_tiers import (
+        ConfirmedPermissionState,
+        creation_permission_tier,
+        is_acp_permission_harness,
+    )
+
+    harness = _spec_harness(spec)
+    if not is_acp_permission_harness(harness):
         metadata = metadata.model_copy(update={"model_override": None})
 
     from omnigent.server.routes.sandbox_inference import configured_snapshot
 
-    if _spec_harness(spec) == "acp" and not configured_snapshot(inference_snapshot):
+    if harness == "acp" and not configured_snapshot(inference_snapshot):
         _validate_acp_spec_models(spec, inference_model)
 
     effort = metadata.reasoning_effort
@@ -19255,15 +19263,9 @@ def _create_session_from_bundle(
         if terminal_launch_args is not None:
             metadata = metadata.model_copy(update={"terminal_launch_args": terminal_launch_args})
 
-    harness = _spec_harness(spec)
     if harness in {"pi", "pi-native", "antigravity-native"} or (
-        harness == "acp" and metadata.permission_tier is not None
+        is_acp_permission_harness(harness) and metadata.permission_tier is not None
     ):
-        from omnigent.server.permission_tiers import (
-            ConfirmedPermissionState,
-            creation_permission_tier,
-        )
-
         labels = dict(metadata.labels or {})
         tier = creation_permission_tier(harness=harness, explicit=metadata.permission_tier)
         labels.update(ConfirmedPermissionState(tier, 1, "blocked").labels(harness))

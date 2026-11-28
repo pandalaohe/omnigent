@@ -12104,6 +12104,9 @@ def create_runner_app(
                 event_body.pop("startup_required", None)
             event_body.pop("host_permission_full", None)
             if acp_harness:
+                if acp_mode := _session_acp_mode.get(conv_id):
+                    event_body["session_mode"] = acp_mode
+                    event_body["session_mode_selection"] = _session_acp_mode_selection.get(conv_id)
                 acp_perm_state = permission_tiers.state(conv_id)
                 event_body["host_permission_full"] = (
                     acp_host_tier
@@ -15057,7 +15060,7 @@ def create_runner_app(
 
         if body_type == "permission_mode_change":
             harness = _session_harness_name(conversation_id)
-            if harness and (harness == "acp" or harness.startswith("acp:")):
+            if is_acp_permission_harness(harness):
                 mode = body.get("permission_mode") if isinstance(body, dict) else None
                 if not isinstance(mode, str) or not mode:
                     return JSONResponse(

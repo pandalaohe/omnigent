@@ -7159,6 +7159,7 @@ def register_core_routes(
             wrapper_for_permission_mode = conv_for_permission_mode.labels.get(
                 _CLAUDE_NATIVE_WRAPPER_LABEL_KEY
             )
+            from omnigent.server.permission_tiers import is_acp_permission_harness
             from omnigent.server.routes._session_create_validation import (
                 cached_acp_permission_options,
                 require_acp_permission_mode,
@@ -7168,9 +7169,7 @@ def register_core_routes(
             permission_harness = await asyncio.to_thread(
                 session_acp_harness, conv_for_permission_mode, agent_store, agent_cache
             )
-            if permission_harness and (
-                permission_harness == "acp" or permission_harness.startswith("acp:")
-            ):
+            if permission_harness is not None and is_acp_permission_harness(permission_harness):
                 permission_host_id = await asyncio.to_thread(
                     effective_host_id, conversation_store, conv_for_permission_mode
                 )
@@ -9330,7 +9329,7 @@ def register_core_routes(
             acp_options = await cached_acp_permission_options(
                 request, permission_host_id, target_harness
             )
-            if target_harness and (target_harness == "acp" or target_harness.startswith("acp:")):
+            if target_harness is not None and is_acp_permission_harness(target_harness):
                 require_acp_permission_mode(
                     body.permission_mode, acp_options, target_harness, permission_host_id
                 )

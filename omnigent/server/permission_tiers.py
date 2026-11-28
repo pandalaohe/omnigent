@@ -71,11 +71,11 @@ def supports_delegated_acp_tier(
     registry: HostRegistry | None, host_id: str | None, harness: str | None, spec: AgentSpec | None
 ) -> bool:
     """Default to managed tiers only for ACP launches with a known tool schema."""
-    from omnigent.acp_cli_harnesses import is_antigravity_acp_command
+    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES, is_antigravity_acp_command
     from omnigent.host.frames import CAP_AGY_ACP_PERMISSIONS_PREFIX
 
     config = spec.executor.config if spec is not None else {}
-    if "acp_agent" in config:
+    if "acp_agent" in config and harness not in ACP_CLI_HARNESSES:
         embedded = config["acp_agent"]
         command = embedded.get("command") if isinstance(embedded, dict) else None
         return isinstance(command, str) and is_antigravity_acp_command(command)
