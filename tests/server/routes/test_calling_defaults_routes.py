@@ -946,7 +946,7 @@ async def test_acp_host_tier_defaults_on_delegated_create(client, app, stores):
     # User bundle upload also picks up the saved `host-tier:full` calling default.
     bundle_default = await client.post(
         "/v1/sessions",
-        data={"metadata": json.dumps({"host_id": HOST_A, "workspace": "/neutral/project"})},
+        data={"metadata": json.dumps({"parent_session_id": parent.id})},
         files={"bundle": ("agent.tar.gz", _bundle("acp:ag"), "application/gzip")},
         headers=PERMISSION_TIERS_HEADERS,
     )
@@ -955,9 +955,10 @@ async def test_acp_host_tier_defaults_on_delegated_create(client, app, stores):
     assert bundle_snapshot.json()["permission_tier"] == "full"
 
     # An untiered orchestrator omitting `permission_tier` honors the user's saved `full` default.
-    _seed_agent(stores, "parent-claude", "claude-native", name="parent-claude-agent")
+    untiered_agent_id = "c1c2c3c4c5c6c7c8c9c0c1c2c3c4c5c6"
+    _seed_agent(stores, untiered_agent_id, "claude-native", name="parent-claude-agent")
     untiered_parent = conversations.create_conversation(
-        agent_id="parent-claude",
+        agent_id=untiered_agent_id,
         host_id=HOST_A,
         workspace="/neutral/project",
         runner_id="test-runner",

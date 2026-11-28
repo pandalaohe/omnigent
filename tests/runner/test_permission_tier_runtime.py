@@ -3041,6 +3041,8 @@ async def test_acp_live_full_to_auto_switch_rejects_active_turn_and_updates_next
     from omnigent.runner import create_runner_app
     from omnigent.server.permission_tiers import (
         ACP_PERMISSION_TIER_LABEL_KEY,
+        PERMISSION_CAPABILITY_LABEL_KEY,
+        PERMISSION_CAPABILITY_VALUE,
         ConfirmedPermissionState,
     )
     from tests.runner.conftest import (
@@ -3150,7 +3152,10 @@ async def test_acp_live_full_to_auto_switch_rejects_active_turn_and_updates_next
             },
         )
         assert prep.status_code == 200, prep.text
-        server.labels = ConfirmedPermissionState("auto", 2, "switching", "tx-1").labels("acp")
+        server.labels = {
+            **ConfirmedPermissionState("auto", 2, "ready").labels("acp"),
+            PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
+        }
         commit = await client.post(
             f"/v1/sessions/{session_id}/events",
             json={
