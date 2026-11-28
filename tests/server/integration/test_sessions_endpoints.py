@@ -19869,10 +19869,10 @@ async def test_external_antigravity_subagent_start_is_idempotent(
     assert len(matching) == 1, f"Expected exactly 1 child row; got {len(matching)}"
 
 
-async def test_external_antigravity_subagent_start_reuses_archived_child(
+async def test_external_antigravity_subagent_start_pauses_for_archived_child(
     client: httpx.AsyncClient,
 ) -> None:
-    """Replay keeps the same child ID through archive and unarchive."""
+    """Only an active child can be returned as a successful registration."""
     agent = await create_test_agent(client)
     parent = await _create_session(
         client,
@@ -19894,8 +19894,10 @@ async def test_external_antigravity_subagent_start_reuses_archived_child(
 
     for _ in range(2):
         replay = await client.post(events_url, json=payload)
-        assert replay.status_code == 202, replay.text
-        assert replay.json()["child_session_id"] == child_id
+        assert replay.status_code == 409, replay.text
+        detail = replay.json()["detail"]
+        assert detail["code"] == ErrorCode.ALREADY_EXISTS
+        assert detail["archived_child_session_id"] == child_id
 
     children_url = f"/v1/sessions/{parent['id']}/child_sessions"
     children = await client.get(children_url, params={"include_archived": "true"})
@@ -19910,6 +19912,55 @@ async def test_external_antigravity_subagent_start_reuses_archived_child(
     replay = await client.post(events_url, json=payload)
     assert replay.status_code == 202, replay.text
     assert replay.json()["child_session_id"] == child_id
+
+
+async def test_external_antigravity_subagent_start_rejects_collation_only_match(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A database's case-insensitive title match is not a cascade identity."""
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client, agent["id"], labels={"omnigent.wrapper": "antigravity-native-ui"}
+    )
+    events_url = f"/v1/sessions/{parent['id']}/events"
+    payload = {
+        "type": "external_antigravity_subagent_start",
+        "data": {"cascade_id": "child-A", "role": "Reviewer"},
+    }
+    first = await client.post(events_url, json=payload)
+    assert first.status_code == 202, first.text
+    child_id = first.json()["child_session_id"]
+
+    create = SqlAlchemyConversationStore.create_conversation
+    list_children = SqlAlchemyConversationStore.list_conversations
+
+    def collation_title(kwargs: dict[str, Any]) -> None:
+        # Simulate the MySQL title equality used by both duplicate detection
+        # and the filtered recovery query while keeping the stored title intact.
+        if kwargs.get("title") == "Reviewer:child-a":
+            kwargs["title"] = "Reviewer:child-A"
+
+    def collated_create(store, *args, **kwargs):
+        collation_title(kwargs)
+        return create(store, *args, **kwargs)
+
+    def collated_list(store, *args, **kwargs):
+        collation_title(kwargs)
+        return list_children(store, *args, **kwargs)
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "create_conversation", collated_create)
+    monkeypatch.setattr(SqlAlchemyConversationStore, "list_conversations", collated_list)
+    payload["data"]["cascade_id"] = "child-a"
+    rejected = await client.post(events_url, json=payload)
+    assert rejected.status_code == 409, rejected.text
+    detail = rejected.json()["detail"]
+    assert detail["code"] == ErrorCode.ALREADY_EXISTS
+    assert "archived_child_session_id" not in detail
+    children = await client.get(f"/v1/sessions/{parent['id']}/child_sessions")
+    assert children.status_code == 200, children.text
+    (child,) = children.json()["data"]
+    assert child["id"] == child_id
+    assert child["labels"]["omnigent.antigravity_native.subagent_cascade_id"] == "child-A"
 
 
 async def test_external_antigravity_subagent_start_requires_cascade_id(

@@ -6164,8 +6164,19 @@ async def test_registration_carries_the_role_type_and_spawning_tool_call(
         await _cancel_mirrors(state)
 
 
+@pytest.mark.parametrize(
+    ("status", "body", "expected_posts"),
+    [
+        (500, {"error": "nope"}, 3),
+        (409, {"error": {"code": "conflict"}}, 3),
+        (409, {"detail": {"code": "already_exists"}}, 1),
+    ],
+)
 async def test_a_rejected_registration_starts_no_mirror(
     monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    body: dict[str, object],
+    expected_posts: int,
 ) -> None:
     """
     A server that will not mint a child leaves nothing polling for it.
@@ -6173,22 +6184,101 @@ async def test_a_rejected_registration_starts_no_mirror(
     Without this the mirror would poll a cascade forever with nowhere to post.
     """
     monkeypatch.setattr(reader, "_mirror_subagent_cascade", _never_returns)
+    posts = 0
 
     def _handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(500, json={"error": "nope"})
+        nonlocal posts
+        posts += 1
+        return httpx.Response(status, json=body)
 
     client = httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(_handler))
     state = reader._ReaderState(seen=set(), interacted=set(), port=4242)
 
     async with client:
-        await reader._maybe_mirror_subagents(
-            _invoke_subagent_step(),
-            client=client,
-            session_id=_SESSION_ID,
-            cascade_id=_CASCADE_ID,
-            state=state,
-        )
+        for _ in range(3):
+            await reader._maybe_mirror_subagents(
+                _invoke_subagent_step(results=[{"conversationId": "child-aaa"}]),
+                client=client,
+                session_id=_SESSION_ID,
+                cascade_id=_CASCADE_ID,
+                state=state,
+            )
+    assert posts == expected_posts
     assert state.subagent_mirrors == {}
+
+
+async def test_archived_subagent_waits_for_unarchive_without_reposting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replayed archive conflict waits without invoking the native mirror."""
+    ticks: asyncio.Queue[None] = asyncio.Queue()
+    checks: asyncio.Queue[bool] = asyncio.Queue()
+    mirrors: asyncio.Queue[str] = asyncio.Queue()
+    registrations: list[str] = []
+    archived = True
+
+    async def sleep(_interval: float) -> None:
+        await ticks.get()
+
+    async def mirror(*, child_session_id: str, **_kwargs) -> None:
+        mirrors.put_nowait(child_session_id)
+        await _never_returns()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            assert request.url.path == "/v1/sessions/archived-child"
+            assert dict(request.url.params) == {
+                "include_items": "false",
+                "include_liveness": "false",
+                "include_live_status": "false",
+                "include_usage": "false",
+            }
+            checks.put_nowait(archived)
+            return httpx.Response(200, json={"archived": archived})
+        child_cascade_id = json.loads(request.content)["data"]["cascade_id"]
+        registrations.append(child_cascade_id)
+        if child_cascade_id == "child-aaa":
+            return httpx.Response(
+                409,
+                json={
+                    "detail": {
+                        "code": "already_exists",
+                        "archived_child_session_id": "archived-child",
+                    }
+                },
+            )
+        return httpx.Response(202, json={"child_session_id": "active-child"})
+
+    monkeypatch.setattr(reader, "_sleep", sleep)
+    monkeypatch.setattr(reader, "_mirror_subagent_cascade", mirror)
+    state = reader._ReaderState(seen=set(), interacted=set(), port=4242)
+    async with httpx.AsyncClient(
+        base_url="http://test", transport=httpx.MockTransport(handler)
+    ) as client:
+        try:
+            for _ in range(3):
+                await reader._maybe_mirror_subagents(
+                    _invoke_subagent_step(),
+                    client=client,
+                    session_id=_SESSION_ID,
+                    cascade_id=_CASCADE_ID,
+                    state=state,
+                )
+            assert registrations == ["child-aaa", "child-bbb"]
+            assert await asyncio.wait_for(mirrors.get(), 2) == "active-child"
+
+            ticks.put_nowait(None)
+            assert await asyncio.wait_for(checks.get(), 2) is True
+            assert mirrors.empty()
+
+            # Restore can happen after the parent step stops sending frames.
+            archived = False
+            ticks.put_nowait(None)
+            assert await asyncio.wait_for(checks.get(), 2) is False
+            assert await asyncio.wait_for(mirrors.get(), 2) == "archived-child"
+            assert registrations == ["child-aaa", "child-bbb"]
+        finally:
+            await _cancel_mirrors(state)
 
 
 async def test_a_settled_invoke_step_does_not_stop_its_children(

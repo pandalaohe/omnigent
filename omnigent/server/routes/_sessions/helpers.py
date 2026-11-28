@@ -5907,9 +5907,21 @@ async def _create_and_publish_antigravity_child(
         if not matches.data:
             raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
         existing = matches.data[0]
+        # The database's collation may equate distinct native cascade IDs.
+        if existing.title != title:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": ErrorCode.ALREADY_EXISTS, "message": str(exc)},
+            ) from exc
         if existing.archived:
-            # A replay can address the existing child without re-announcing it.
-            return existing.id
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": ErrorCode.ALREADY_EXISTS,
+                    "message": "The Antigravity sub-agent session is archived.",
+                    "archived_child_session_id": existing.id,
+                },
+            ) from exc
         await asyncio.to_thread(conversation_store.set_labels, existing.id, labels)
         # An orphaned row's creator died before publishing, so live clients have
         # never heard about this child; a duplicate publish in the race case is a
