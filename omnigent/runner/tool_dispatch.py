@@ -14165,11 +14165,16 @@ async def _execute_os_env_tool(
             ):
                 # Scratch calls share their private workspace until retirement.
                 # Other shells stay disposable, leaving cached file helpers intact.
-                tool_lease = await resource_registry.lease_tool_environment(
-                    conversation_id,
-                    effective_spec,
-                    permission_tier=permission_tier,
-                )
+                if permission_tier is not None:
+                    tool_lease = await resource_registry.lease_tool_environment(
+                        conversation_id,
+                        effective_spec,
+                        permission_tier=permission_tier,
+                    )
+                else:
+                    tool_lease = await resource_registry.lease_tool_environment(
+                        conversation_id, effective_spec
+                    )
             if tool_lease is not None:
                 os_env = tool_lease.environment
                 owns_environment = False
@@ -14179,15 +14184,25 @@ async def _execute_os_env_tool(
                     if resource_registry is not None and conversation_id is not None
                     else []
                 )
-                construction = asyncio.create_task(
-                    asyncio.to_thread(
-                        create_os_environment,
-                        effective_spec,
-                        additional_read_roots=additional_read_roots,
-                        model_access=model_access,
-                        permission_tier=permission_tier,
+                if permission_tier is not None:
+                    construction = asyncio.create_task(
+                        asyncio.to_thread(
+                            create_os_environment,
+                            effective_spec,
+                            additional_read_roots=additional_read_roots,
+                            model_access=model_access,
+                            permission_tier=permission_tier,
+                        )
                     )
-                )
+                else:
+                    construction = asyncio.create_task(
+                        asyncio.to_thread(
+                            create_os_environment,
+                            effective_spec,
+                            additional_read_roots=additional_read_roots,
+                            model_access=model_access,
+                        )
+                    )
                 try:
                     os_env = await asyncio.shield(construction)
                 except BaseException:

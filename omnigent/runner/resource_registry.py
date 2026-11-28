@@ -1509,13 +1509,21 @@ class SessionResourceRegistry:
                 or lease.sandbox != sandbox
                 or lease.permission_tier != permission_tier
             ):
-                environment = create_os_environment(
-                    spec,
-                    sandbox_policy=sandbox,
-                    additional_read_roots=[self._codex_skills_dir_locked(session_id)],
-                    relaunch_when_stale=True,
-                    permission_tier=permission_tier,
-                )
+                if permission_tier is not None:
+                    environment = create_os_environment(
+                        spec,
+                        sandbox_policy=sandbox,
+                        additional_read_roots=[self._codex_skills_dir_locked(session_id)],
+                        relaunch_when_stale=True,
+                        permission_tier=permission_tier,
+                    )
+                else:
+                    environment = create_os_environment(
+                        spec,
+                        sandbox_policy=sandbox,
+                        additional_read_roots=[self._codex_skills_dir_locked(session_id)],
+                        relaunch_when_stale=True,
+                    )
                 if environment is None:
                     raise RuntimeError(f"Failed to create OS environment for {session_id!r}")
                 # A leased environment is closed by its holder on release.
