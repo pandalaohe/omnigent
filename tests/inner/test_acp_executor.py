@@ -2263,6 +2263,145 @@ async def _observe_acp_update(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("path", "tier", "request_override", "expected"),
+    [
+        ("/opt/work/project/tmp/x.txt", "auto", None, "allow"),
+        ("D:/work/omnigent/tmp/x.txt", "auto", None, "allow"),
+        ("D:/work/omnigent/tmp/x.txt", "ask", None, "ask"),
+        ("D:/work/omnigent/tmp/x.txt", "plan", None, "deny"),
+        (r"D:\work\omnigent\tmp\x.txt", "auto", {"Path": "D:/work/omnigent/tmp/x.txt"}, "allow"),
+        (r"D:\work\omnigent\tmp\x.txt", "auto", {"Path": "d:/work/omnigent/tmp/x.txt"}, "allow"),
+        (r"D:\work\omnigent\tmp\x.txt", "auto", {"Path": "D:/work/omnigent/tmp/X.txt"}, "unbound"),
+        (
+            r"D:\work\omnigent\tmp\x.txt",
+            "auto",
+            {"Path": "D:/work/omnigent/tmp/x.txt", "Replacement": "another edit"},
+            "unbound",
+        ),
+        ("D:/work/omnigent/tmp/x.txt", "auto", {"TargetFile": "other.txt"}, "unbound"),
+        ("D:/work/omnigent/tmp/x.txt", "auto", {"Replacement": False}, "unbound"),
+        ("D:/work/omnigent/tmp/x.txt", "auto", {"Path": "other.txt"}, "unbound"),
+    ],
+    ids=[
+        "posix",
+        "windows",
+        "ask",
+        "plan",
+        "windows-separators",
+        "windows-drive-case",
+        "windows-changed-path-case",
+        "windows-changed-replacement",
+        "mixed-target",
+        "bad-type",
+        "changed-target",
+    ],
+)
+async def test_managed_agy_binds_observed_edit_file_permission(
+    path, tier, request_override, expected, monkeypatch
+):
+    from omnigent.permission_tiers import (
+        ResolvedPath,
+        Verdict,
+        adapt_tool_call,
+        decide_tier,
+        load_rules,
+    )
+    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+    from tests.harnesses.test_permission_tiers import posix_host, windows_host
+
+    def resolve(target):
+        return ResolvedPath(target, "directory" if target == workspace else "file")
+
+    is_windows = path.startswith("D:")
+    monkeypatch.setattr(acp_executor_module, "IS_WINDOWS", is_windows)
+    if is_windows:
+        workspace = r"D:\work\omnigent"
+        host = windows_host(cwd=workspace, workspace=workspace, resolver=resolve)
+    else:
+        workspace = "/opt/work/project"
+        host = posix_host(resolver=resolve)
+
+    ex = AcpExecutor(AcpAgentConfig(command="agy.exe acp --stdio", host_permission_tier=True))
+    ex._session_id = "test-session"
+    ex._active_prompt_request_id = 1
+    ex._send = AsyncMock()
+    ex._elicitation_choice_handler = AsyncMock(return_value="Allow once")
+    decisions = []
+
+    async def evaluate(_phase, data):
+        assert data["arguments"]["TargetFile"] == path
+        intent = adapt_tool_call(data["name"], data["arguments"], host)
+        decision = decide_tier(tier, intent, load_rules())
+        decisions.append((intent.kind.value.lower(), decision.action.value.lower()))
+        return PolicyVerdictPayload(
+            action="POLICY_ACTION_DENY"
+            if decision.action == Verdict.DENY
+            else "POLICY_ACTION_UNSPECIFIED",
+            data={"_omnigent_acp_tier": decision.action.value.lower()},
+        )
+
+    ex._policy_evaluator = AsyncMock(side_effect=evaluate)
+    arguments = {"Path": path, "Target": "before", "Replacement": "after"}
+    observed_arguments = (
+        {**arguments, **request_override}
+        if request_override and "Path" not in request_override
+        else arguments
+    )
+    call = {
+        "toolCallId": "edit-1",
+        "name": "edit_file",
+        "kind": "edit",
+        "title": "File x.txt",
+        "args": observed_arguments,
+        "rawInput": observed_arguments,
+        "locations": [{"path": path}],
+    }
+    await _observe_acp_update(
+        ex, "test-session", {**call, "sessionUpdate": "tool_call", "status": "in_progress"}
+    )
+    await _observe_acp_update(
+        ex, "test-session", {**call, "sessionUpdate": "tool_call_update", "status": "pending"}
+    )
+    await ex._respond_to_agent_request(
+        {
+            "id": "edit-permission",
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "test-session",
+                "toolCall": {
+                    **call,
+                    "sessionUpdate": "tool_call",
+                    "status": "pending",
+                    "rawInput": {**arguments, **(request_override or {})},
+                    "content": [
+                        {"type": "diff", "path": path, "oldText": "before", "newText": "after"}
+                    ],
+                },
+                "options": [
+                    {"optionId": "once", "kind": "allow_once", "name": "Allow once"},
+                    {"optionId": "reject", "kind": "reject_once", "name": "Reject"},
+                ],
+            },
+        }
+    )
+
+    if expected == "unbound":
+        ex._policy_evaluator.assert_not_awaited()
+    else:
+        assert decisions == [("edit", expected)]
+    reply = ex._send.await_args.args[0]
+    if expected in {"allow", "ask"}:
+        assert reply["result"] == {"outcome": {"outcome": "selected", "optionId": "once"}}
+    else:
+        assert reply["error"]["code"] == -32000
+    if expected == "ask":
+        ex._elicitation_choice_handler.assert_awaited_once()
+    else:
+        ex._elicitation_choice_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("tier", "include_request_metadata", "long_command"),
     [
         pytest.param("auto", True, False, id="auto"),
@@ -2518,6 +2657,18 @@ async def test_managed_agy_pending_update_negatives_and_non_agy_control(
     assert ex._policy_evaluator.await_count == (1 if scenario == "second-request" else 0)
     ex._elicitation_handler.assert_not_awaited()
     ex._elicitation_choice_handler.assert_not_awaited()
+    rejection_reason = {
+        "mismatched-raw-input": "field_mismatch field=rawInput",
+        "omitted-raw-input": "invalid_request_type field=rawInput",
+        "null-raw-input": "invalid_request_type field=rawInput",
+        "non-object-raw-input": "invalid_request_type field=rawInput",
+        "second-request": "already_answered field=toolCallId",
+    }.get(scenario, "missing_pending_call field=toolCallId")
+    assert [
+        message
+        for message in caplog.messages
+        if message.startswith("acp permission binding rejected:")
+    ] == [f"acp permission binding rejected: reason={rejection_reason}"]
     logs = [
         message
         for message in caplog.messages
