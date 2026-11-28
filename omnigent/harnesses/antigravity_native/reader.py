@@ -137,8 +137,6 @@ _DEFAULT_POLL_INTERVAL_S = 0.25
 # a session can run twenty-odd of them at once (live-verified: 23), and none of
 # them streams — they are committed-only, so a sub-second tick buys nothing.
 _SUBAGENT_POLL_INTERVAL_S = 1.0
-# An archived registration watches only for an Omnigent archive change.
-_SUBAGENT_ARCHIVE_CHECK_INTERVAL_S = 30.0
 
 # Default seconds between Task T-G ``/clear``-rotation checks
 # (``GetAllCascadeTrajectories``). Coarse on purpose: a ``/clear`` is a rare,
@@ -1487,8 +1485,8 @@ class _ReaderState:
         held as a strong ref so it is not GC'd mid-run; cancelled on teardown.
         Doubles as the start-once guard — a re-sent step re-enters the handler
         every frame while the sub-agents work.
-    :param subagent_title_conflicts: Cascades rejected because the conflicting
-        title is owned by a different cascade.
+    :param subagent_title_conflicts: Cascades whose registration was rejected
+        with a title conflict, skipped for the rest of this reader's lifetime.
     """
 
     seen: set[_StepKey]
@@ -1925,11 +1923,8 @@ def _subagent_pairs(step: dict[str, object]) -> list[tuple[dict[str, object], st
 
 
 @dataclass(frozen=True)
-class _SubagentRegistration:
-    """A registered or archived child, or a title owned by a different cascade."""
-
-    session_id: str | None
-    archived: bool = False
+class _SubagentTitleConflict:
+    reason: str
 
 
 async def _register_subagent_child(
@@ -1939,7 +1934,7 @@ async def _register_subagent_child(
     spec: dict[str, object],
     child_cascade_id: str,
     tool_call_id: str,
-) -> _SubagentRegistration | None:
+) -> str | _SubagentTitleConflict | None:
     """
     Register one agy sub-agent with the server and return its child session id.
 
@@ -1949,8 +1944,8 @@ async def _register_subagent_child(
     :param child_cascade_id: The child's agy conversation id.
     :param tool_call_id: The INVOKE_SUBAGENT step's mirrored call id, so the
         child links back to the tool card that spawned it.
-    :returns: The registration or a known title conflict. Other failed attempts
-        return ``None`` and can be retried on a later frame.
+    :returns: The child session id or a terminal title conflict. Other failed
+        attempts return ``None`` and can be retried on a later frame.
     """
     role = spec.get("role")
     agent_type = spec.get("typeName")
@@ -1971,10 +1966,10 @@ async def _register_subagent_child(
             conflict = response.json()
             detail = conflict.get("detail") if isinstance(conflict, dict) else None
             if isinstance(detail, dict) and detail.get("code") == ErrorCode.ALREADY_EXISTS:
-                archived_id = detail.get("archived_child_session_id")
-                if isinstance(archived_id, str) and archived_id:
-                    return _SubagentRegistration(archived_id, archived=True)
-                return _SubagentRegistration(None)
+                reason = detail.get("message")
+                if not isinstance(reason, str) or not reason:
+                    reason = "The Antigravity sub-agent title already exists."
+                return _SubagentTitleConflict(reason)
         response.raise_for_status()
         body = response.json()
     except (httpx.HTTPError, ValueError) as exc:
@@ -1993,7 +1988,7 @@ async def _register_subagent_child(
             child_cascade_id,
         )
         return None
-    return _SubagentRegistration(child_session_id)
+    return child_session_id
 
 
 async def _note_observed_work(
@@ -2201,44 +2196,6 @@ async def _mirror_subagent_cascade(
         # which the reader's teardown drain is the only thing that walks. Each
         # mirror therefore takes its own descendants down with it.
         await _cancel_subagent_mirrors(child_state)
-
-
-async def _mirror_subagent_after_unarchive(
-    *,
-    port: int,
-    child_cascade_id: str,
-    client: httpx.AsyncClient,
-    child_session_id: str,
-) -> None:
-    """Wait for the original child to be restored before reading its cascade."""
-    url = f"/v1/sessions/{url_component(child_session_id)}"
-    while True:
-        await _sleep(_SUBAGENT_ARCHIVE_CHECK_INTERVAL_S)
-        try:
-            response = await client.get(
-                url,
-                params={
-                    "include_items": "false",
-                    "include_liveness": "false",
-                    "include_live_status": "false",
-                    "include_usage": "false",
-                },
-            )
-            if response.status_code in (httpx.codes.NOT_FOUND, httpx.codes.GONE):
-                return
-            response.raise_for_status()
-            snapshot = response.json()
-        except (httpx.HTTPError, ValueError):
-            continue
-        if isinstance(snapshot, dict) and snapshot.get("archived") is False:
-            break
-
-    await _mirror_subagent_cascade(
-        port=port,
-        child_cascade_id=child_cascade_id,
-        client=client,
-        child_session_id=child_session_id,
-    )
 
 
 async def _cancel_subagent_mirrors(state: _ReaderState) -> None:
@@ -2471,8 +2428,8 @@ async def _maybe_mirror_subagents(
     the Agents rail stays empty — the sub-agents' work is invisible in the web UI
     even though agy hands us their ids.
 
-    Idempotent: a child already being mirrored is skipped, so a re-read of the
-    step starts nothing new. The step's own status is deliberately NOT consulted:
+    Cascades already mirrored or rejected for a title conflict are skipped on
+    re-read. The step's own status is deliberately NOT consulted:
     ``invoke_subagent`` is fire-and-forget, reaching DONE while the child it
     spawned is still working, so each mirror decides for itself when its child is
     finished.
@@ -2540,33 +2497,29 @@ async def _maybe_mirror_subagents(
         )
         if registration is None:
             continue
-        child_session_id = registration.session_id
-        if child_session_id is None:
+        if isinstance(registration, _SubagentTitleConflict):
             state.subagent_title_conflicts.add(child_cascade_id)
-            _logger.warning(
-                "agy sub-agent title belongs to another cascade: parent=%s child=%s",
+            _logger.info(
+                "agy sub-agent mirroring skipped: parent=%s child=%s reason=%s",
                 session_id,
                 child_cascade_id,
+                registration.reason,
             )
             continue
-        mirror = (
-            _mirror_subagent_after_unarchive if registration.archived else _mirror_subagent_cascade
-        )
         task = asyncio.create_task(
-            mirror(
+            _mirror_subagent_cascade(
                 port=state.port,
                 child_cascade_id=child_cascade_id,
                 client=client,
-                child_session_id=child_session_id,
+                child_session_id=registration,
             )
         )
         state.subagent_mirrors[child_cascade_id] = task
         _logger.info(
-            "agy sub-agent mirroring %s: parent=%s child_cascade=%s child_session=%s role=%r",
-            "paused" if registration.archived else "started",
+            "agy sub-agent mirroring started: parent=%s child_cascade=%s child_session=%s role=%r",
             session_id,
             child_cascade_id,
-            child_session_id,
+            registration,
             spec.get("role"),
         )
 

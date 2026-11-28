@@ -6164,19 +6164,10 @@ async def test_registration_carries_the_role_type_and_spawning_tool_call(
         await _cancel_mirrors(state)
 
 
-@pytest.mark.parametrize(
-    ("status", "body", "expected_posts"),
-    [
-        (500, {"error": "nope"}, 3),
-        (409, {"error": {"code": "conflict"}}, 3),
-        (409, {"detail": {"code": "already_exists"}}, 1),
-    ],
-)
+@pytest.mark.parametrize("status", [500, 409])
 async def test_a_rejected_registration_starts_no_mirror(
     monkeypatch: pytest.MonkeyPatch,
     status: int,
-    body: dict[str, object],
-    expected_posts: int,
 ) -> None:
     """
     A server that will not mint a child leaves nothing polling for it.
@@ -6189,7 +6180,7 @@ async def test_a_rejected_registration_starts_no_mirror(
     def _handler(request: httpx.Request) -> httpx.Response:
         nonlocal posts
         posts += 1
-        return httpx.Response(status, json=body)
+        return httpx.Response(status, json={"error": {"code": "conflict"}})
 
     client = httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(_handler))
     state = reader._ReaderState(seen=set(), interacted=set(), port=4242)
@@ -6203,82 +6194,67 @@ async def test_a_rejected_registration_starts_no_mirror(
                 cascade_id=_CASCADE_ID,
                 state=state,
             )
-    assert posts == expected_posts
+    assert posts == 3
     assert state.subagent_mirrors == {}
 
 
-async def test_archived_subagent_waits_for_unarchive_without_reposting(
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "The Antigravity sub-agent session is archived.",
+        "The conflicting Antigravity sub-agent title has no exact cascade match.",
+    ],
+)
+async def test_subagent_title_conflict_stops_mirroring_for_reader_lifetime(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    reason: str,
 ) -> None:
-    """A replayed archive conflict waits without invoking the native mirror."""
-    ticks: asyncio.Queue[None] = asyncio.Queue()
-    checks: asyncio.Queue[bool] = asyncio.Queue()
+    """A title conflict is terminal for its cascade and leaves siblings working."""
     mirrors: asyncio.Queue[str] = asyncio.Queue()
     registrations: list[str] = []
-    archived = True
+    conflict = True
 
-    async def sleep(_interval: float) -> None:
-        await ticks.get()
-
-    async def mirror(*, child_session_id: str, **_kwargs) -> None:
-        mirrors.put_nowait(child_session_id)
+    async def mirror(*, child_cascade_id: str, **_kwargs) -> None:
+        mirrors.put_nowait(child_cascade_id)
         await _never_returns()
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "GET":
-            assert request.url.path == "/v1/sessions/archived-child"
-            assert dict(request.url.params) == {
-                "include_items": "false",
-                "include_liveness": "false",
-                "include_live_status": "false",
-                "include_usage": "false",
-            }
-            checks.put_nowait(archived)
-            return httpx.Response(200, json={"archived": archived})
+        assert request.method == "POST"
         child_cascade_id = json.loads(request.content)["data"]["cascade_id"]
         registrations.append(child_cascade_id)
-        if child_cascade_id == "child-aaa":
+        if conflict and child_cascade_id == "child-aaa":
             return httpx.Response(
                 409,
-                json={
-                    "detail": {
-                        "code": "already_exists",
-                        "archived_child_session_id": "archived-child",
-                    }
-                },
+                json={"detail": {"code": "already_exists", "message": reason}},
             )
-        return httpx.Response(202, json={"child_session_id": "active-child"})
+        return httpx.Response(202, json={"child_session_id": f"session-{child_cascade_id}"})
 
-    monkeypatch.setattr(reader, "_sleep", sleep)
     monkeypatch.setattr(reader, "_mirror_subagent_cascade", mirror)
     state = reader._ReaderState(seen=set(), interacted=set(), port=4242)
-    async with httpx.AsyncClient(
-        base_url="http://test", transport=httpx.MockTransport(handler)
-    ) as client:
+    client = httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(handler))
+    async with client:
         try:
-            for _ in range(3):
-                await reader._maybe_mirror_subagents(
-                    _invoke_subagent_step(),
-                    client=client,
-                    session_id=_SESSION_ID,
-                    cascade_id=_CASCADE_ID,
-                    state=state,
-                )
+            with caplog.at_level(logging.INFO, logger=reader.__name__):
+                for _ in range(3):
+                    await reader._maybe_mirror_subagents(
+                        _invoke_subagent_step(),
+                        client=client,
+                        session_id=_SESSION_ID,
+                        cascade_id=_CASCADE_ID,
+                        state=state,
+                    )
+                    conflict = False
             assert registrations == ["child-aaa", "child-bbb"]
-            assert await asyncio.wait_for(mirrors.get(), 2) == "active-child"
-
-            ticks.put_nowait(None)
-            assert await asyncio.wait_for(checks.get(), 2) is True
+            assert set(state.subagent_mirrors) == {"child-bbb"}
+            assert await asyncio.wait_for(mirrors.get(), 2) == "child-bbb"
             assert mirrors.empty()
-
-            # Restore can happen after the parent step stops sending frames.
-            archived = False
-            ticks.put_nowait(None)
-            assert await asyncio.wait_for(checks.get(), 2) is False
-            assert await asyncio.wait_for(mirrors.get(), 2) == "archived-child"
-            assert registrations == ["child-aaa", "child-bbb"]
         finally:
             await _cancel_mirrors(state)
+    conflict_logs = [record for record in caplog.records if "child-aaa" in record.getMessage()]
+    (record,) = conflict_logs
+    assert record.levelno == logging.INFO
+    assert reason in record.getMessage()
 
 
 async def test_a_settled_invoke_step_does_not_stop_its_children(
