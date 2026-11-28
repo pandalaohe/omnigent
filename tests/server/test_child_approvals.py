@@ -4,6 +4,7 @@ import asyncio
 import json
 import shutil
 import threading
+from contextlib import aclosing
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -1166,6 +1167,8 @@ def test_pi_declaration_preserves_human_options_and_bounds_command():
 async def test_runner_owned_select_answer_through_tool(tree, monkeypatch, decision, label):
     request = _pi_request()
     forwarded = []
+    reason = "Read-only or inside the assigned workspace"
+    stream_request = SimpleNamespace(is_disconnected=AsyncMock(return_value=False))
 
     async def receive(req):
         forwarded.append(json.loads(req.content))
@@ -1179,7 +1182,26 @@ async def test_runner_owned_select_answer_through_tool(tree, monkeypatch, decisi
         assert pending_elicitations.count_for(tree.child_id) == 1
         assert pending_elicitations.display_count(tree.child_id, 1) == 0
         assert pending_elicitations.display_count(tree.root_id, 1) == 0
-        result = await _answer(tree, decision)
+        async with (
+            aclosing(helpers._stream_live_events(stream_request, tree.child_id)) as child_events,
+            aclosing(helpers._stream_live_events(stream_request, tree.root_id)) as parent_events,
+        ):
+            for events in (child_events, parent_events):
+                assert (await anext(events)).startswith("event: session.heartbeat\n")
+            result = await _answer(tree, decision, reason=reason)
+            for events in (child_events, parent_events):
+                async with asyncio.timeout(5):
+                    async for frame in events:
+                        if frame.startswith("event: response.elicitation_resolved\n"):
+                            break
+                    else:
+                        pytest.fail("Expected a resolved approval event")
+                resolved = json.loads(frame.splitlines()[1].removeprefix("data: "))
+                assert resolved["elicitation_id"] == "elicit_pi_dialog"
+                assert resolved["action"] == ("accept" if decision == "approve" else "decline")
+                assert resolved["reason"] is None
+                assert resolved["answered_by"]["session_id"] == tree.root_id
+                assert resolved["answered_by"]["reason"] == reason
     assert result == {"status": "answered"}
     assert len(forwarded) == 1
     data = forwarded[0]["data"]

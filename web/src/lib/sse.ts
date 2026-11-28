@@ -1418,18 +1418,18 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     if (typeof elicitationId !== "string" || !elicitationId) return null;
     const action = data.action;
     const hasVerdict = action === "accept" || action === "decline" || action === "cancel";
-    const actor = data.answered_by;
+    const rawActor = data.answered_by;
+    const actor =
+      rawActor && typeof rawActor === "object" && !Array.isArray(rawActor)
+        ? (rawActor as Record<string, unknown>)
+        : undefined;
+    const answerReason = actor?.reason ?? data.reason;
     const answeredBy =
-      hasVerdict &&
-      actor &&
-      typeof actor === "object" &&
-      !Array.isArray(actor) &&
-      typeof (actor as Record<string, unknown>).session_id === "string" &&
-      typeof (actor as Record<string, unknown>).title === "string"
+      hasVerdict && typeof actor?.session_id === "string" && typeof actor.title === "string"
         ? {
-            sessionId: (actor as Record<string, unknown>).session_id as string,
-            title: (actor as Record<string, unknown>).title as string,
-            reason: typeof data.reason === "string" ? data.reason : "",
+            sessionId: actor.session_id,
+            title: actor.title,
+            reason: typeof answerReason === "string" ? answerReason : "",
           }
         : undefined;
     return {

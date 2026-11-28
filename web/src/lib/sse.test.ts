@@ -820,6 +820,30 @@ describe("parseEvent — response.elicitation_request", () => {
 });
 
 describe("parseEvent — response.elicitation_resolved", () => {
+  it("keeps a parent answer's reason separate from an expiry reason", () => {
+    expect(
+      parseEvent("response.elicitation_resolved", {
+        elicitation_id: "offered",
+        action: "decline",
+        reason: null,
+        answered_by: {
+          session_id: "parent",
+          title: "Parent review",
+          reason: "Outside the assigned workspace",
+        },
+      }),
+    ).toEqual({
+      type: "elicitation_resolved",
+      elicitationId: "offered",
+      action: "decline",
+      answeredBy: {
+        sessionId: "parent",
+        title: "Parent review",
+        reason: "Outside the assigned workspace",
+      },
+    });
+  });
+
   it("keeps the verdict the server delivered", () => {
     // A prompt answered on another surface (native terminal popup, second
     // tab, approve page) resolves with a real verdict. Dropping it here is
