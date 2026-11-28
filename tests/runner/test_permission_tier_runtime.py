@@ -180,7 +180,7 @@ def _runtime(
 ) -> PermissionTierRuntime:
     runtime = runtime or PermissionTierRuntime()
     workspace = tmp_path / "workspace"
-    workspace.mkdir()
+    workspace.mkdir(parents=True, exist_ok=True)
     state = HostPermissionState(
         session_id="session-a",
         host_id="host-a",
@@ -1761,7 +1761,9 @@ async def test_scoped_native_http_policy_runs_through_server_and_runner(tmp_path
                         json=event,
                         headers={"Authorization": "Bearer " + parent.credential},
                     )
-                    assert parent_response.json()["result"] == "POLICY_ACTION_UNSPECIFIED"
+                    parent_body = parent_response.json()
+                    assert parent_body["result"] == "POLICY_ACTION_UNSPECIFIED"
+                    parent_binding = parent_body["permission_tier_binding"]
                     assert len(asked_tools) == 0
                     bypass = await client.post(
                         "/permission-tiers/control",
@@ -1813,6 +1815,17 @@ async def test_scoped_native_http_policy_runs_through_server_and_runner(tmp_path
                         "/permission-tiers/control", headers=child_headers, json=finish
                     )
                     assert settled.json().get("finished") is True
+                    parent_settled = await client.post(
+                        "/permission-tiers/control",
+                        headers={"Authorization": "Bearer " + parent.credential},
+                        json={
+                            "type": "permission_tier_finish",
+                            "call_id": parent_binding["call_id"],
+                            "expected_revision": 3,
+                            "pi_origin_receipt": parent_binding["pi_origin_receipt"],
+                        },
+                    )
+                    assert parent_settled.json().get("finished") is True
                     assert runtime.idle("session-a")
             finally:
                 relay.close()

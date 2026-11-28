@@ -863,6 +863,7 @@ class _ShellToken:
     text: str
     unknown_expansion: bool = False
     tilde_expanded: bool = False
+    from_wrapper: bool = False
 
 
 def _scan_delimited(text: str, start: int, close_char: str) -> int:
@@ -1529,7 +1530,9 @@ def _scan_find_for_auto(
                     relative_cwd and bool(inner) and not cur.text.startswith(("-", "/", "~"))
                 )
                 inner.append(
-                    _ShellToken(cur.text, True, cur.tilde_expanded) if mark_unknown else cur
+                    _ShellToken(cur.text, True, cur.tilde_expanded, from_wrapper=True)
+                    if mark_unknown
+                    else cur
                 )
                 index += 1
             if not terminated or not inner or inner[0].unknown_expansion:
@@ -1601,11 +1604,13 @@ def _scan_xargs_for_auto(
         return True
     if replace_placeholder:
         inner = [
-            _ShellToken(t.text, True, t.tilde_expanded) if replace_placeholder in t.text else t
+            _ShellToken(t.text, True, t.tilde_expanded, from_wrapper=True)
+            if replace_placeholder in t.text
+            else t
             for t in raw_inner
         ]
     else:
-        inner = [*raw_inner, _ShellToken("<xargs-arg>", True)]
+        inner = [*raw_inner, _ShellToken("<xargs-arg>", True, from_wrapper=True)]
     if inner[0].unknown_expansion:
         return True
     relaxed.append("xargs")
@@ -1644,10 +1649,10 @@ def _statement_triggers_auto_floor(
         is_encoded, inner = _unwrap_nested_shell_for_auto(lower_name, arg_tokens)
         if is_encoded:
             return True
-        if opaque and (
+        if any(tok.from_wrapper for tok in arg_tokens) and (
             inner is None
             or any(
-                tok.unknown_expansion and (tok.text == inner or "<xargs-arg>" in tok.text)
+                tok.from_wrapper and (tok.text == inner or "<xargs-arg>" in tok.text)
                 for tok in arg_tokens
             )
         ):
@@ -1691,8 +1696,7 @@ def _statement_triggers_auto_floor(
             if key == "git config injection and discards" and (
                 _git_has_unknown_subcommand(arg_tokens)
                 or (
-                    opaque
-                    and any(tok.unknown_expansion for tok in arg_tokens)
+                    any(tok.from_wrapper for tok in arg_tokens)
                     and (_git_subcommand(arg_tokens) in _GIT_SENSITIVE_SUBCOMMANDS)
                 )
             ):

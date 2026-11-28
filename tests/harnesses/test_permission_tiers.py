@@ -1475,7 +1475,7 @@ def test_windows_drive_unc_ads_device_and_system(option_command: str, expected: 
     )
     for path in (r"\\?\C:\work\project\a.py", r"D:a.py"):
         assert (
-            decision("auto", "write", {"path": path, "content": "x"}, host).action == Verdict.ALLOW
+            decision("auto", "write", {"path": path, "content": "x"}, host).action == Verdict.ASK
         )
         assert decision("ask", "write", {"path": path, "content": "x"}, host).action == Verdict.ASK
         assert (
@@ -4240,8 +4240,10 @@ def test_r2_symlink_lexical_escape_windows_operand_fallback_and_persistent_cwd()
     ],
 )
 def test_windows_unknown_critical_or_namespace_edit_stays_ask_under_auto(path: str) -> None:
-    def failing_resolver(_raw: str) -> ResolvedPath:
-        raise OSError("cannot resolve")
+    def failing_resolver(raw: str) -> ResolvedPath:
+        if raw == path:
+            raise OSError("cannot resolve")
+        return ResolvedPath(raw, "directory")
 
     host = windows_host(resolver=failing_resolver)
     result = decision("auto", "write", {"path": path, "content": "x"}, host)
