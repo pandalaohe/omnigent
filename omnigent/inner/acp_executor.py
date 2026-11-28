@@ -196,6 +196,7 @@ _AGY_ACP_COMMAND_FIELDS = {
 }
 _AGY_ACP_WRITE_TARGETS = frozenset({"Path", "TargetFile"})
 _AGY_ACP_WRITE_FIELDS = frozenset({"Content", "Overwrite"})
+_AGY_ACP_EDIT_FILE_FIELDS = frozenset({"Path", "Target", "Replacement"})
 _ACP_KNOWN_TOOL_KINDS = frozenset({"execute", "read", "edit"})
 _ACP_OMNIGENT_OS_KINDS = {
     "sys_os_shell": "execute",
@@ -252,6 +253,7 @@ _AGY_NON_FILE_READ_TOOLS = frozenset(
     {"list_dir", "list_directory", "grep_search", "code_search", "find_by_name"}
 )
 _AGY_TITLE_TOOL_RE = re.compile(r"^(?:Running|Run)\s+([A-Za-z0-9_]+)\??$")
+_AGY_WINDOWS_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[/\\]")
 _AGY_WINDOWS_LEADING_SLASH_RE = re.compile(r"^/([A-Za-z]:[/\\].*)$")
 
 # session/update.update.sessionUpdate discriminator values we map.
@@ -622,6 +624,28 @@ def _same_json_value(left: object, right: object) -> bool:
             _same_json_value(a, b) for a, b in zip(left, right, strict=True)
         )
     return left == right
+
+
+def _same_agy_windows_edit_arguments(request: object, observed: object) -> bool:
+    """Match edit_file inputs that differ only in Windows path spelling."""
+    if not isinstance(request, dict) or not isinstance(observed, dict):
+        return False
+    if request.keys() != _AGY_ACP_EDIT_FILE_FIELDS or observed.keys() != _AGY_ACP_EDIT_FILE_FIELDS:
+        return False
+    request_path, observed_path = request["Path"], observed["Path"]
+    if not (
+        isinstance(request_path, str)
+        and isinstance(observed_path, str)
+        and _AGY_WINDOWS_DRIVE_PATH_RE.match(request_path)
+        and _AGY_WINDOWS_DRIVE_PATH_RE.match(observed_path)
+    ):
+        return False
+    return (
+        request_path[0].upper() == observed_path[0].upper()
+        and request_path[2:].replace("\\", "/") == observed_path[2:].replace("\\", "/")
+        and _same_json_value(request["Target"], observed["Target"])
+        and _same_json_value(request["Replacement"], observed["Replacement"])
+    )
 
 
 def _bound_agy_text(text: str, limit: int) -> str:
@@ -3070,8 +3094,18 @@ class AcpExecutor(Executor):
             return reject("invalid_request_type", "rawInput")
         same_value = _same_json_value if is_agy else operator.eq
         for key in ("kind", "name", "title", "rawInput"):
-            if call.get(key) is not None and not same_value(call[key], observed.get(key)):
-                return reject("field_mismatch", key)
+            if call.get(key) is None or same_value(call[key], observed.get(key)):
+                continue
+            if (
+                key == "rawInput"
+                and IS_WINDOWS
+                and self._managed_agy
+                and observed.get("kind") == "edit"
+                and observed.get("name") == "edit_file"
+                and _same_agy_windows_edit_arguments(call[key], observed.get(key))
+            ):
+                continue
+            return reject("field_mismatch", key)
         arguments = observed.get("rawInput")
         if not isinstance(arguments, dict):
             return reject("invalid_pending_type", "rawInput")
@@ -3080,7 +3114,7 @@ class AcpExecutor(Executor):
             return reject("invalid_pending_type", "kind")
         bridge_tool = None
         if is_agy:
-            agy_tool = self._validate_agy_permission_tool(kind, arguments)
+            agy_tool = self._validate_agy_permission_tool(kind, observed.get("name"), arguments)
             if self._managed_agy and (agy_tool is None or agy_tool[0] == "unknown"):
                 bridge_tool = self._bound_omnigent_tool(observed)
                 if bridge_tool is not None:
@@ -3150,7 +3184,7 @@ class AcpExecutor(Executor):
 
     @staticmethod
     def _validate_agy_permission_tool(
-        kind: object, arguments: _AcpJsonObject
+        kind: object, observed_name: object, arguments: _AcpJsonObject
     ) -> tuple[str, _AcpJsonObject] | None:
         """Reject mixed and malformed known agy shapes before consulting policy."""
         if kind is not None and not isinstance(kind, str):
@@ -3200,6 +3234,13 @@ class AcpExecutor(Executor):
             ):
                 return None
             return "write_to_file", {**arguments, "TargetFile": target}
+        if kind == "edit" and observed_name == "edit_file" and keys == _AGY_ACP_EDIT_FILE_FIELDS:
+            if (
+                not all(isinstance(value, str) for value in arguments.values())
+                or not arguments["Path"]
+            ):
+                return None
+            return "write_to_file", {**arguments, "TargetFile": arguments["Path"]}
         if kind == "edit" and isinstance(arguments.get("TargetFile"), str):
             if keys & _AGY_ACP_SHELL_FIELDS:
                 return None
