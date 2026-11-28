@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -30,6 +31,8 @@ from omnigent.permission_tiers import (
 )
 
 HOST_PERMISSION_STATE_FILE = "permission_state.json"
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -163,13 +166,27 @@ def apply_auto_floor(
         intent.kind == ToolKind.EDIT
         and intent.target is not None
         and intent.workspace_path is not None
-        and any(
-            not _under(bound.path, intent.workspace_path.path, windows)
-            for bound in (intent.target, intent.source)
-            if bound is not None and bound.kind != "unknown"
-        )
     ):
-        return TierDecision(Verdict.ASK, "Writing outside the workspace requires approval")
+        outside = [
+            bound
+            for bound in (intent.target, intent.source)
+            if bound is not None
+            and bound.kind != "unknown"
+            and not _under(bound.path, intent.workspace_path.path, windows)
+        ]
+        if outside:
+            from omnigent.server.child_approvals import _critical_target
+
+            if any(_critical_target(bound.path) for bound in outside):
+                return TierDecision(Verdict.ASK, "Writing to a critical path requires approval")
+            reason = "relaxed-auto:outside-workspace-edit"
+            logger.info(
+                "permission_tier tier=allow reason=%s tool=%s host=%s",
+                reason,
+                intent.name,
+                intent.context.host_id,
+            )
+            return TierDecision(Verdict.ALLOW, reason)
     if intent.kind == ToolKind.EXEC:
         if intent.hidden_script:
             return TierDecision(Verdict.ASK, "Command requires user approval")

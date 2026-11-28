@@ -12,6 +12,7 @@ import contextlib
 import hashlib
 import io
 import json
+import logging
 import math
 import ntpath
 import os
@@ -34,6 +35,8 @@ DEFAULT_PERMISSION_TIER: PermissionTier = "auto"
 PI_PERMISSION_TIER_LABEL_KEY = "omnigent.pi.permission_tier"
 AGY_PERMISSION_TIER_LABEL_KEY = "omnigent.antigravity_native.permission_tier"
 PERMISSION_TIERS_CAPABILITY = "permission_tiers_v1"
+
+logger = logging.getLogger(__name__)
 
 
 class ToolKind(StrEnum):
@@ -3775,8 +3778,29 @@ def _write_operands(
                         break
                     roots.append(value)
                 return roots or ["."]
-            # Other actions (-exec, -fprint) keep every value, so their targets stay visible.
-            return [value for value in conservative[offset + 1 :] if not value.startswith("-")]
+            # Other actions (-exec, -fprint) keep non-pattern values so targets stay visible.
+            pattern_predicates = {
+                "-name",
+                "-iname",
+                "-path",
+                "-ipath",
+                "-wholename",
+                "-iwholename",
+                "-regex",
+                "-iregex",
+            }
+            kept: list[str] = []
+            skip_next = False
+            for raw_arg, value in zip(arguments, conservative[offset + 1 :], strict=False):
+                if skip_next:
+                    skip_next = False
+                    continue
+                if raw_arg in pattern_predicates:
+                    skip_next = True
+                    continue
+                if not value.startswith("-"):
+                    kept.append(value)
+            return kept
         if command == "tee":
             if offset or not posix_shell:
                 return conservative
@@ -4286,6 +4310,17 @@ def _explanation(
     return None
 
 
+def _relaxed_auto_allow(intent: ToolIntent, category: str) -> TierDecision:
+    reason = f"relaxed-auto:{category}"
+    logger.info(
+        "permission_tier tier=allow reason=%s tool=%s host=%s",
+        reason,
+        intent.name,
+        intent.context.host_id,
+    )
+    return TierDecision(Verdict.ALLOW, reason)
+
+
 def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -> TierDecision:
     """Return a pure decision; bad rules or gate faults deny, uncertainty asks or allows per D3."""
     try:
@@ -4416,12 +4451,14 @@ def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -
             return TierDecision(
                 Verdict.DENY, "Plan tier permits only known reads and user questions"
             )
-        # D3 step 5: uncertainty -> ASK (auto / ask / accept-edits).
+        # Step 5: severe-set guards stay ASK; other uncertainty relaxes to ALLOW under auto.
         if opaque_control_mention:
             return TierDecision(Verdict.ASK, opaque_control_mention, "control-path")
         if intent.native_status == NativeSupportStatus.FAILED or (
             intent.name == "subagent" and intent.native_status is None
         ):
+            if tier == "auto":
+                return _relaxed_auto_allow(intent, "native-proof")
             return TierDecision(
                 Verdict.ASK,
                 "Native support proof is missing"
@@ -4435,18 +4472,34 @@ def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -
                 intent.detail or "Write or delete target cannot be bound",
                 "unbound-write",
             )
+        if intent.hidden_script:
+            return TierDecision(Verdict.ASK, intent.detail or "Command requires one-time approval")
         if intent.kind != ToolKind.READ and any(
             p is not None and p.kind == "unknown" for p in (target, intent.source)
         ):
+            if tier == "auto":
+                from omnigent.server.child_approvals import _critical_target
+
+                unknown_paths = [
+                    p.path
+                    for p in (target, intent.source)
+                    if p is not None and p.kind == "unknown"
+                ]
+                if not any(_critical_target(path) for path in unknown_paths):
+                    return _relaxed_auto_allow(intent, "unknown-target")
             return TierDecision(Verdict.ASK, "Target type or final path cannot be confirmed")
         if intent.status == "unknown" or intent.kind == ToolKind.UNKNOWN:
+            if tier == "auto":
+                return _relaxed_auto_allow(intent, "unknown-tool")
             return TierDecision(
                 Verdict.ASK, intent.detail or "Unknown tool needs one-time approval"
             )
-        # D3 step 6: opaque or uncertain command -> auto ALLOW (D5 may ASK); ask/accept-edits ASK.
+        # Step 6: opaque or uncertain command -> auto ALLOW (apply_auto_floor checks severe set).
         if intent.command_opaque or intent.command_uncertain:
             if tier == "auto":
-                return TierDecision(Verdict.ALLOW)
+                return _relaxed_auto_allow(
+                    intent, "opaque-command" if intent.command_opaque else "uncertain-command"
+                )
             return TierDecision(Verdict.ASK, intent.detail or "Command requires one-time approval")
         # D3 step 7: ask / accept-edits / auto.
         if tier == "ask":

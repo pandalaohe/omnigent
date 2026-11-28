@@ -1996,7 +1996,7 @@ async def test_tiered_pi_denials_name_layer_and_unseen_tool_opens_approval_card(
             "omnigent.server.routes._sessions.helpers._get_runner_client", get_runner
         )
 
-        # 1a. Unseen tool in Pi auto tier produces an approval card instead of silent deny.
+        # 1a. Unseen tool in Pi auto tier relaxes to ALLOW without raising a card.
         unseen = _tool_call_request("third_party_tool", {"item": "x"})
         unseen["event"]["data"]["call_id"] = "call-unseen"
         resp_unseen = await client.post(
@@ -2004,16 +2004,25 @@ async def test_tiered_pi_denials_name_layer_and_unseen_tool_opens_approval_card(
         )
         assert resp_unseen.status_code == 200, resp_unseen.text
         assert resp_unseen.json()["result"] == "POLICY_ACTION_ALLOW"
+        assert len(cards) == 0
+
+        # 1b. Severe-set ASK opens an approval card, and declining attributes permission-mode.
+        severe_ok = _tool_call_request("bash", {"command": 'rm -rf "$TARGET"'})
+        severe_ok["event"]["data"]["call_id"] = "call-severe-ok"
+        resp_severe_ok = await client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate", json=severe_ok
+        )
+        assert resp_severe_ok.status_code == 200, resp_severe_ok.text
+        assert resp_severe_ok.json()["result"] == "POLICY_ACTION_ALLOW"
         assert len(cards) == 1
         assert cards[0]["params"].phase == "permission_tier"
-        assert cards[0]["params"].tool_name == "third_party_tool"
+        assert cards[0]["params"].tool_name == "bash"
 
-        # 1b. Declining the approval card denies with permission-mode attribution.
         next_card_action[0] = "decline"
-        unseen_decline = _tool_call_request("third_party_tool", {"item": "y"})
-        unseen_decline["event"]["data"]["call_id"] = "call-unseen-decline"
+        severe_decline = _tool_call_request("bash", {"command": 'rm -rf "$TARGET"'})
+        severe_decline["event"]["data"]["call_id"] = "call-severe-decline"
         resp_decline = await client.post(
-            f"/v1/sessions/{session_id}/policies/evaluate", json=unseen_decline
+            f"/v1/sessions/{session_id}/policies/evaluate", json=severe_decline
         )
         assert resp_decline.status_code == 200, resp_decline.text
         assert resp_decline.json()["result"] == "POLICY_ACTION_DENY"

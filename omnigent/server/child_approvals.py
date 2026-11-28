@@ -835,7 +835,6 @@ _AUTO_FLOOR_CLASSES = (
     "critical path deletion and writes",
     "disk and host tools",
     "git config injection and discards",
-    "find actions",
 )
 _AUTO_PRIVILEGE_WRAPPERS = frozenset(
     {"sudo", "doas", "su", "runuser", "ssh", "chroot", "nsenter", "systemd-run"}
@@ -1242,33 +1241,6 @@ _FIND_VALUE_PREDICATES = frozenset(
 )
 
 
-def _find_has_unknown_action(arg_tokens: list[_ShellToken]) -> bool:
-    in_expr = False
-    index = 0
-    while index < len(arg_tokens):
-        tok = arg_tokens[index]
-        text = tok.text
-        if not in_expr:
-            if text in {"-H", "-L", "-P"} or text.startswith("-O"):
-                index += 1
-                continue
-            if text == "-D":
-                index += 2
-                continue
-            if text.startswith("-") or text in {"!", "("}:
-                in_expr = True
-            else:
-                index += 1
-                continue
-        if text in _FIND_VALUE_PREDICATES:
-            index += 2
-            continue
-        if tok.unknown_expansion:
-            return True
-        index += 1
-    return False
-
-
 _AUTO_FLOOR_ARES_RULE_IDS = (
     "priv-escalation",
     "system-tamper",
@@ -1276,7 +1248,6 @@ _AUTO_FLOOR_ARES_RULE_IDS = (
     "git-destructive",
     "shutdown",
     "chmod-dangerous",
-    "exfil-tools",
     "kernel-module",
 )
 _AUTO_DELETE_VERBS = frozenset({"rm", "remove-item", "ri", "del", "erase", "rd", "rmdir"})
@@ -1441,6 +1412,188 @@ def _auto_delete_has_unbound_target(lower_name: str, arg_tokens: list[_ShellToke
     return False
 
 
+_FIND_EXEC_ACTIONS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+_FIND_WRITE_ACTIONS = frozenset({"-fprint", "-fprint0", "-fprintf", "-fls"})
+_XARGS_VALUE_SHORT_FLAGS = frozenset({"a", "d", "E", "I", "J", "L", "n", "P", "R", "S", "s"})
+_XARGS_VALUE_LONG_FLAGS = frozenset(
+    {
+        "--arg-file",
+        "--delimiter",
+        "--max-args",
+        "--max-procs",
+        "--max-chars",
+        "--process-slot-var",
+    }
+)
+
+
+def _scan_find_for_auto(
+    arg_tokens: list[_ShellToken],
+    pending_stmts: list[tuple[list[_ShellToken], list[_ShellToken], bool, bool]],
+) -> bool:
+    """Ask on find -delete, critical -fprint, unknown actions, or severe -exec commands."""
+    in_expr = False
+    index = 0
+    while index < len(arg_tokens):
+        tok = arg_tokens[index]
+        text = tok.text
+        if not in_expr:
+            if text in {"-H", "-L", "-P"} or text.startswith("-O"):
+                index += 1
+                continue
+            if text == "-D":
+                index += 2
+                continue
+            if text.startswith("-") or text in {"!", "("}:
+                in_expr = True
+            else:
+                index += 1
+                continue
+        if text == "-delete":
+            return True
+        if text in _FIND_WRITE_ACTIONS:
+            if index + 1 >= len(arg_tokens):
+                return True
+            target = arg_tokens[index + 1]
+            if target.unknown_expansion or _redirect_target_is_critical(target):
+                return True
+            index += 3 if text == "-fprintf" else 2
+            continue
+        if text in _FIND_EXEC_ACTIONS:
+            inner: list[_ShellToken] = []
+            index += 1
+            while index < len(arg_tokens) and arg_tokens[index].text not in {";", "+"}:
+                inner.append(arg_tokens[index])
+                index += 1
+            if index < len(arg_tokens):
+                index += 1
+            if not inner or inner[0].unknown_expansion:
+                return True
+            pending_stmts.append((inner, [], False, True))
+            continue
+        if text in _FIND_VALUE_PREDICATES:
+            index += 2
+            continue
+        if tok.unknown_expansion:
+            return True
+        index += 1
+    return False
+
+
+def _scan_xargs_for_auto(
+    arg_tokens: list[_ShellToken],
+    pending_stmts: list[tuple[list[_ShellToken], list[_ShellToken], bool, bool]],
+) -> bool:
+    """Unwrap xargs options and inspect the invoked command with opaque operands."""
+    index = 0
+    while index < len(arg_tokens):
+        tok = arg_tokens[index]
+        text = tok.text
+        if text == "--":
+            index += 1
+            break
+        if not text.startswith("-") or text == "-":
+            break
+        if text.startswith("--"):
+            option, equal, _ = text.partition("=")
+            if option in _XARGS_VALUE_LONG_FLAGS and not equal:
+                index += 2
+                continue
+            index += 1
+            continue
+        consumed_next = False
+        for offset, char in enumerate(text[1:], 1):
+            if char in _XARGS_VALUE_SHORT_FLAGS:
+                if offset == len(text) - 1:
+                    consumed_next = True
+                break
+        index += 2 if consumed_next else 1
+    inner = arg_tokens[index:]
+    if not inner:
+        return False
+    if inner[0].unknown_expansion:
+        return True
+    pending_stmts.append((inner, [], False, True))
+    return False
+
+
+def _statement_triggers_auto_floor(
+    raw_tokens: list[_ShellToken],
+    write_redirects: list[_ShellToken],
+    piped: bool,
+    opaque: bool,
+    embedded: list[str],
+    pending_stmts: list[tuple[list[_ShellToken], list[_ShellToken], bool, bool]],
+) -> bool:
+    if any(_redirect_target_is_critical(tok) for tok in write_redirects):
+        return True
+    tokens = _unwrap_auto_prefixes(raw_tokens, embedded)
+    if not tokens:
+        return False
+    raw_head = tokens[0].text.replace("\\", "/")
+    name = (PurePosixPath(raw_head).name or raw_head).removesuffix(".exe")
+    lower_name = name.casefold()
+    arg_tokens = tokens[1:]
+    args = [tok.text for tok in arg_tokens]
+    if lower_name in _AUTO_PRIVILEGE_WRAPPERS or lower_name == "runas":
+        return True
+    if (
+        piped
+        and lower_name in _AUTO_PIPE_SHELLS
+        and _is_pipe_to_shell_stdin(lower_name, arg_tokens)
+    ):
+        return True
+    if lower_name in _AUTO_PIPE_SHELLS:
+        is_encoded, inner = _unwrap_nested_shell_for_auto(lower_name, arg_tokens)
+        if is_encoded:
+            return True
+        if inner:
+            embedded.append(inner)
+    if lower_name in {"invoke-expression", "iex"} and (
+        piped or any(tok.unknown_expansion or "$" in tok.text for tok in arg_tokens)
+    ):
+        return True
+    if lower_name in {"set-executionpolicy", "invoke-command", "icm", "set-acl"}:
+        return True
+    if lower_name in {"start-process", "saps"} and _start_process_user_only(args):
+        return True
+    if lower_name in _AUTO_REGISTRY_ITEMPROPERTY_CMDLETS and any(
+        _AUTO_REGISTRY_PREFIX.match(arg) for arg in args
+    ):
+        return True
+    if lower_name in _AUTO_DELETE_VERBS and (
+        opaque or _auto_delete_has_unbound_target(lower_name, arg_tokens)
+    ):
+        return True
+    if lower_name == "find" and _scan_find_for_auto(arg_tokens, pending_stmts):
+        return True
+    if lower_name == "xargs" and _scan_xargs_for_auto(arg_tokens, pending_stmts):
+        return True
+    for key in _AUTO_FLOOR_CLASSES:
+        names, prefixes, check = _FLOOR_CLASSES[key]
+        if name not in names and not (prefixes and name.startswith(prefixes)):
+            continue
+        try:
+            matched = (
+                _git_user_only(name, args, piped, allow_dry_run=True)
+                if key == "git config injection and discards"
+                else check(name, args, piped)
+            )
+            if matched:
+                return True
+            if key == "critical path deletion and writes" and _write_has_unknown_target(
+                name, arg_tokens
+            ):
+                return True
+            if key == "git config injection and discards" and _git_has_unknown_subcommand(
+                arg_tokens
+            ):
+                return True
+        except ValueError:
+            return True
+    return False
+
+
 def auto_floor_asks(
     command: str,
     *,
@@ -1453,83 +1606,43 @@ def auto_floor_asks(
         if not isinstance(command, str) or not command.strip():
             return False
         ares_patterns = _auto_floor_ares_patterns()
-        pending = [command]
+        pending_sources: list[tuple[str, bool]] = [(command, opaque)]
+        pending_stmts: list[tuple[list[_ShellToken], list[_ShellToken], bool, bool]] = []
         scanned = 0
-        while pending and scanned < 32:
-            source = pending.pop()
-            scanned += 1
-            if any(pattern.search(source) for pattern in ares_patterns):
-                return True
+        while (pending_sources or pending_stmts) and scanned < 32:
             embedded: list[str] = []
-            for raw_tokens, write_redirects, piped in _scan_lenient_statements(source, embedded):
-                if any(_redirect_target_is_critical(tok) for tok in write_redirects):
+            if pending_sources:
+                source, source_opaque = pending_sources.pop()
+                scanned += 1
+                if any(pattern.search(source) for pattern in ares_patterns):
                     return True
-                tokens = _unwrap_auto_prefixes(raw_tokens, embedded)
-                if not tokens:
-                    continue
-                raw_head = tokens[0].text.replace("\\", "/")
-                name = (PurePosixPath(raw_head).name or raw_head).removesuffix(".exe")
-                lower_name = name.casefold()
-                arg_tokens = tokens[1:]
-                args = [tok.text for tok in arg_tokens]
-                if lower_name in _AUTO_PRIVILEGE_WRAPPERS or lower_name == "runas":
-                    return True
-                if (
-                    piped
-                    and lower_name in _AUTO_PIPE_SHELLS
-                    and _is_pipe_to_shell_stdin(lower_name, arg_tokens)
+                for raw_tokens, write_redirects, piped in _scan_lenient_statements(
+                    source, embedded
                 ):
-                    return True
-                if lower_name in _AUTO_PIPE_SHELLS:
-                    is_encoded, inner = _unwrap_nested_shell_for_auto(lower_name, arg_tokens)
-                    if is_encoded:
+                    if _statement_triggers_auto_floor(
+                        raw_tokens,
+                        write_redirects,
+                        piped,
+                        source_opaque,
+                        embedded,
+                        pending_stmts,
+                    ):
                         return True
-                    if inner:
-                        embedded.append(inner)
-                if lower_name in {"invoke-expression", "iex"} and (
-                    piped or any(tok.unknown_expansion or "$" in tok.text for tok in arg_tokens)
+                pending_sources.extend((inner, source_opaque) for inner in embedded)
+            else:
+                raw_tokens, write_redirects, piped, stmt_opaque = pending_stmts.pop()
+                scanned += 1
+                if _statement_triggers_auto_floor(
+                    raw_tokens,
+                    write_redirects,
+                    piped,
+                    stmt_opaque,
+                    embedded,
+                    pending_stmts,
                 ):
                     return True
-                if lower_name in {"set-executionpolicy", "invoke-command", "icm", "set-acl"}:
-                    return True
-                if lower_name in {"start-process", "saps"} and _start_process_user_only(args):
-                    return True
-                if lower_name in _AUTO_REGISTRY_ITEMPROPERTY_CMDLETS and any(
-                    _AUTO_REGISTRY_PREFIX.match(arg) for arg in args
-                ):
-                    return True
-                if lower_name in _AUTO_DELETE_VERBS and (
-                    opaque or _auto_delete_has_unbound_target(lower_name, arg_tokens)
-                ):
-                    return True
-                for key in _AUTO_FLOOR_CLASSES:
-                    names, prefixes, check = _FLOOR_CLASSES[key]
-                    if name not in names and not (prefixes and name.startswith(prefixes)):
-                        continue
-                    try:
-                        matched = (
-                            _git_user_only(name, args, piped, allow_dry_run=True)
-                            if key == "git config injection and discards"
-                            else check(name, args, piped)
-                        )
-                        if matched:
-                            return True
-                        if (
-                            key == "critical path deletion and writes"
-                            and _write_has_unknown_target(name, arg_tokens)
-                        ):
-                            return True
-                        if (
-                            key == "git config injection and discards"
-                            and _git_has_unknown_subcommand(arg_tokens)
-                        ):
-                            return True
-                        if key == "find actions" and _find_has_unknown_action(arg_tokens):
-                            return True
-                    except ValueError:
-                        return True
-            pending.extend(embedded)
-        return bool(pending)
+                pending_sources.extend((inner, stmt_opaque) for inner in embedded)
+        return bool(pending_sources or pending_stmts)
     except Exception:  # noqa: BLE001 - scan failure counts as no match per D5
         return False
 
@@ -1612,7 +1725,16 @@ def classify_card(params: Mapping[str, Any]) -> Literal["answer", "note_only"] |
         ("agy_permission", "agy_native_permission"),
     }:
         return None
-    return "note_only" if floor(params) == "user_only" else "answer"
+    shell, command = _shell_action(params)
+    if shell and (not isinstance(command, str) or not command.strip()):
+        return "note_only"
+    if floor(params) == "user_only":
+        logger.info(
+            "child_approval card=answer reason=relaxed-floor phase=%s tool=%s",
+            phase,
+            tool,
+        )
+    return "answer"
 
 
 def card_action(params: Mapping[str, Any]) -> tuple[str, bool]:

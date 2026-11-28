@@ -1429,9 +1429,9 @@ async def test_managed_agy_permission_logs_windows_auto_decision(
         ("script", "execute", "run_command", "allow"),
         ("protected-write", "other", "write_to_file", "deny"),
         ("workspace-write", "edit", "write_to_file", "allow"),
-        ("unknown", "other", "unknown", "ask"),
+        ("unknown", "other", "unknown", "allow"),
         ("ambiguous", "other", None, "deny"),
-        ("opencode", "other", "unknown", "ask"),
+        ("opencode", "other", "unknown", "allow"),
     ],
 )
 async def test_managed_agy_binds_windows_permission_by_vendor_arguments(
@@ -1963,14 +1963,20 @@ async def test_managed_agy_permission_rejects_mixed_reads_in_plan(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("arguments", [{"Opaque": True}, {"Path": "note.txt", "Action": "list"}])
 @pytest.mark.parametrize(
-    ("tier", "asks"), [("ask", True), ("accept-edits", True), ("auto", True), ("plan", False)]
+    ("tier", "allowed", "asks"),
+    [
+        ("ask", True, True),
+        ("accept-edits", True, True),
+        ("auto", True, False),
+        ("plan", False, False),
+    ],
 )
 async def test_managed_agy_permission_keeps_unknown_tool_tier_verdicts(
-    tier, asks, arguments, windows_acp_permission_executor
+    tier, allowed, asks, arguments, windows_acp_permission_executor
 ) -> None:
     ex = windows_acp_permission_executor(tier)
     params = _pending_acp_permission(ex, arguments, "other")
-    assert await ex._decide_permission(params) == ((True, "once") if asks else (False, None))
+    assert await ex._decide_permission(params) == ((True, "once") if allowed else (False, None))
     policy_call = ex._policy_evaluator.await_args
     assert policy_call is not None
     assert policy_call.args[1]["name"] == "unknown"
