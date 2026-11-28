@@ -201,6 +201,21 @@ async def test_scoped_rpc_failure_codes_are_safe(attestor_relay, monkeypatch, ca
 
 
 @pytest.mark.asyncio
+async def test_scoped_rpc_authentication_refusal_logs_only_fixed_codes(attestor_relay, caplog):
+    _runtime, _broker, relay, _source, _registry = attestor_relay
+    credential = "private fixture authority"
+    async with httpx.AsyncClient(base_url=relay._advertised_url, trust_env=False) as client:
+        response = await client.post(
+            "/pi/rpc", headers={"Authorization": f"Bearer {credential}"}, content="not JSON"
+        )
+    assert response.status_code == 403
+    assert response.json()["reason"] == "rpc_refused"
+    assert "stage=authentication code=scope_authentication_rejected" in caplog.text
+    assert "scope_authentication_rejected" not in response.text
+    assert credential not in response.text + caplog.text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("ending", ["relay_close", "peer_exit", "backstop"])
 async def test_scoped_rpc_releases_waiter_but_retains_host_operation(
     attestor_relay, monkeypatch, caplog, ending

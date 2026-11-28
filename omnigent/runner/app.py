@@ -10176,7 +10176,16 @@ def create_runner_app(
         # startup paths — all pass a bridge hint and take the branch below.
         peer_for_relay = _session_peer_messaging_enabled.get(session_id, False)
         open_for_relay = _session_open_enabled.get(session_id, False)
-        pi_scoped_relay = permission_tiers.observation_harness(session_id) in ("pi", "pi-native")
+        relay_harness = permission_tiers.observation_harness(session_id)
+        pi_scoped_relay = relay_harness in ("pi", "pi-native")
+        relay_spec = _unwrap_spec_entry(spec_entry)
+        scoped_only_tool_names: frozenset[str] = frozenset()
+        if relay_harness == "pi" and relay_spec is not None and relay_spec.os_env is not None:
+            from omnigent.tools.builtins.os_env import OS_ENV_TOOL_TYPES
+
+            # Pi RPC's turn tool list includes these spec-gated builtins. Keep
+            # them off the shared native/legacy advertisement.
+            scoped_only_tool_names = frozenset(tool.name() for tool in OS_ENV_TOOL_TYPES)
         current = _session_comment_relays.get(session_id)
         if (
             current is not None
@@ -10184,6 +10193,7 @@ def create_runner_app(
             and current.peer_messaging_enabled == peer_for_relay
             and current.session_open_enabled == open_for_relay
             and (current.pi_scope_relay is not None) == pi_scoped_relay
+            and current.relay.scoped_only_tool_names == scoped_only_tool_names
             and current.workflows_enabled == workflows_enabled
             and current.routing_available == routing_stamp()
             and known_bridge_dir is None
@@ -10224,6 +10234,7 @@ def create_runner_app(
             and current.peer_messaging_enabled == peer_for_relay
             and current.session_open_enabled == open_for_relay
             and (current.pi_scope_relay is not None) == pi_scoped_relay
+            and current.relay.scoped_only_tool_names == scoped_only_tool_names
             and not (retry_mcp_discovery and current.mcp_discovery_failed)
         ):
             return
@@ -10233,7 +10244,6 @@ def create_runner_app(
             filter_workflow_tool_schemas,
         )
 
-        relay_spec = _unwrap_spec_entry(spec_entry)
         relay_routing = routing_stamp()
         relay_schemas: list[_JsonObject] = build_native_relay_tool_schemas(
             relay_spec,
@@ -10290,6 +10300,7 @@ def create_runner_app(
                 and current.peer_messaging_enabled == peer_for_relay
                 and current.session_open_enabled == open_for_relay
                 and (current.pi_scope_relay is not None) == pi_scoped_relay
+                and current.relay.scoped_only_tool_names == scoped_only_tool_names
                 and not (retry_mcp_discovery and current.mcp_discovery_failed)
             ):
                 return
@@ -10495,7 +10506,11 @@ def create_runner_app(
                 # Native policy hooks can cache the relay URL/token at startup.
                 relay = current.relay
                 pi_scope_relay = current.pi_scope_relay
-                relay.update_tools(relay_schemas, _relay_tool_executor)
+                relay.update_tools(
+                    relay_schemas,
+                    _relay_tool_executor,
+                    scoped_only_tool_names=scoped_only_tool_names,
+                )
             else:
                 from omnigent.runner.pi_scope_relay import PiScopeRelay
 
@@ -10513,6 +10528,7 @@ def create_runner_app(
                         file_change_observer=_observe_native_file_changes,
                         permission_tier_control=_permission_tier_control,
                         pi_scope_relay=pi_scope_relay,
+                        scoped_only_tool_names=scoped_only_tool_names,
                     )
         except (OSError, RuntimeError):
             _logger.warning(

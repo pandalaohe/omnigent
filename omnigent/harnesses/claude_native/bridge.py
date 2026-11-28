@@ -60,7 +60,7 @@ import unicodedata
 import urllib.parse
 import uuid
 from collections import deque
-from collections.abc import Awaitable, Callable, Collection, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Coroutine, Iterator, Mapping, Sequence
 from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import Future
 from contextvars import ContextVar
@@ -1810,6 +1810,7 @@ class ClaudeNativeToolRelay:
         policy_stop: threading.Event,
         on_close: Callable[[], None] | None = None,
         closed: threading.Event,
+        scoped_only_tool_names: frozenset[str] = frozenset(),
     ) -> None:
         """
         Initialize the relay handle.
@@ -1830,16 +1831,28 @@ class ClaudeNativeToolRelay:
         # writable by the session user, so editing the file must not widen
         # what the relay runs.
         self._advertised_tool_names = _relay_info_tool_names(relay_info)
+        self._scoped_only_tool_names = scoped_only_tool_names
         self._tool_executor = tool_executor
         self._policy_stop = policy_stop
         self._on_close = on_close
         self._closed = closed
 
-    def update_tools(self, tools: list[_JsonObject], tool_executor: ToolExecutor) -> None:
+    @property
+    def scoped_only_tool_names(self) -> frozenset[str]:
+        return self._scoped_only_tool_names
+
+    def update_tools(
+        self,
+        tools: list[_JsonObject],
+        tool_executor: ToolExecutor,
+        *,
+        scoped_only_tool_names: frozenset[str] = frozenset(),
+    ) -> None:
         """Refresh tools on the owning event loop without changing cached relay credentials.
 
         :param tools: Replacement tool schemas.
         :param tool_executor: Callback dispatching against the updated spec.
+        :param scoped_only_tool_names: Additional names callable only by scoped Pi RPC.
         """
         relay_info = {
             **self._relay_info,
@@ -1849,6 +1862,7 @@ class ClaudeNativeToolRelay:
         _publish_tool_relay(self._bridge_dir, relay_info)
         self._relay_info = relay_info
         self._advertised_tool_names = _relay_info_tool_names(relay_info)
+        self._scoped_only_tool_names = scoped_only_tool_names
         self._tool_executor = tool_executor
 
     def close(self) -> None:
@@ -10830,6 +10844,7 @@ def start_tool_relay(
     file_change_observer: Callable[[_JsonObject], Awaitable[None]] | None = None,
     permission_tier_control: Callable[[_JsonObject], Awaitable[_JsonObject]] | None = None,
     pi_scope_relay: PiScopeRelay | None = None,
+    scoped_only_tool_names: frozenset[str] = frozenset(),
 ) -> ClaudeNativeToolRelay:
     """
     Start the shared relay for native-harness Omnigent tool calls.
@@ -10856,6 +10871,7 @@ def start_tool_relay(
         for each ``/hook/observe-tool`` payload; the runner uses it to
         record native file-mutating tool calls in the session's filesystem
         registry.
+    :param scoped_only_tool_names: Additional names callable only by scoped Pi RPC.
     :returns: Started relay handle. Call :meth:`close` when done.
     """
     token = secrets.token_urlsafe(32)
@@ -10878,16 +10894,21 @@ def start_tool_relay(
 
     policy_stop = threading.Event()
 
-    def _current_tool_names() -> set[str]:
+    async def _execute_scoped_rpc(authorization: str | None, payload: object) -> _JsonObject:
+        assert pi_scope_relay is not None
+        tool_names = set(relay.scoped_only_tool_names)
         raw = relay._relay_info.get("tools")
-        if not isinstance(raw, list):
-            return set()
-        return {
-            name
-            for item in raw
-            if isinstance(item, dict)
-            if isinstance(name := item.get("name"), str)
-        }
+        if isinstance(raw, list):
+            tool_names.update(
+                name
+                for item in raw
+                if isinstance(item, dict)
+                if isinstance(name := item.get("name"), str)
+            )
+        # Take the allowlist and its executor together on the runner loop.
+        return await pi_scope_relay.execute_rpc(
+            authorization, payload, relay._tool_executor, tool_names
+        )
 
     handler_cls = _tool_relay_handler_factory(
         token,
@@ -10901,7 +10922,7 @@ def start_tool_relay(
         permission_tier_control=permission_tier_control,
         policy_stop=policy_stop,
         pi_scope_relay=pi_scope_relay,
-        scoped_tool_names=_current_tool_names,
+        scoped_rpc_executor=_execute_scoped_rpc if pi_scope_relay is not None else None,
     )
     httpd, advertised_url = _start_bridge_http_server(handler_cls)
     if pi_scope_relay is not None:
@@ -10931,6 +10952,7 @@ def start_tool_relay(
         policy_stop=policy_stop,
         on_close=pi_scope_relay.bootstrap.close if pi_scope_relay is not None else None,
         closed=closed,
+        scoped_only_tool_names=scoped_only_tool_names,
     )
     thread = threading.Thread(
         target=httpd.serve_forever,
@@ -11278,7 +11300,8 @@ def _tool_relay_handler_factory(
     permission_tier_control: Callable[[_JsonObject], Awaitable[_JsonObject]] | None = None,
     policy_stop: threading.Event,
     pi_scope_relay: PiScopeRelay | None = None,
-    scoped_tool_names: Callable[[], set[str]] | None = None,
+    scoped_rpc_executor: Callable[[str | None, object], Coroutine[object, object, _JsonObject]]
+    | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """
     Create an HTTP handler class for active-turn tool calls.
@@ -11416,13 +11439,24 @@ def _tool_relay_handler_factory(
             self._send_json(response)
 
         def _handle_pi_rpc(self) -> None:
-            from omnigent.runner.pi_scope_relay import PiRpcExecutionError
+            from omnigent.runner.pi_scope_relay import PiRpcExecutionError, PiRpcRefused
 
             authorization = self.headers.get("Authorization")
 
-            def refuse(reason: str, status: HTTPStatus = HTTPStatus.FORBIDDEN) -> None:
+            def refuse(
+                reason: str,
+                stage: str,
+                code: str,
+                status: HTTPStatus = HTTPStatus.FORBIDDEN,
+            ) -> None:
                 # Fixed codes only: exceptions and frames can carry private authority.
-                _logger.warning("Pi RPC failed: path=/pi/rpc status=%d reason=%s", status, reason)
+                _logger.warning(
+                    "Pi RPC failed: path=/pi/rpc status=%d reason=%s stage=%s code=%s",
+                    status,
+                    reason,
+                    stage,
+                    code,
+                )
                 raw = json.dumps(pi_bridge_failure(reason)).encode("utf-8")
                 with contextlib.suppress(OSError):
                     self.send_response(status)
@@ -11433,44 +11467,43 @@ def _tool_relay_handler_factory(
 
             async def authenticate() -> None:
                 if pi_scope_relay is None:
-                    raise ValueError("Pi RPC unavailable")
-                record = pi_scope_relay.authenticate(authorization, "/pi/rpc")
-                if record.status != "ready":
-                    raise ValueError("Pi RPC unavailable")
+                    raise PiRpcRefused("authentication", "relay_unavailable")
+                pi_scope_relay.authenticate_rpc(authorization)
 
             future = asyncio.run_coroutine_threadsafe(authenticate(), loop)
             try:
                 future.result(timeout=5.0)
+            except PiRpcRefused as refusal:
+                refuse("rpc_refused", refusal.stage, refusal.code)
+                return
             except Exception:  # noqa: BLE001 - no untrusted body decoding or fallback
                 future.cancel()
-                refuse("rpc_refused")
+                refuse("rpc_refused", "authentication", "authentication_failed")
                 return
             payload = self._read_json_body()
-            if payload is None or set(payload) != {"payload"} or pi_scope_relay is None:
-                refuse("rpc_refused", HTTPStatus.BAD_REQUEST)
+            if payload is None or set(payload) != {"payload"} or scoped_rpc_executor is None:
+                refuse("rpc_refused", "payload", "invalid_envelope", HTTPStatus.BAD_REQUEST)
                 return
             result = asyncio.run_coroutine_threadsafe(
-                pi_scope_relay.execute_rpc(
-                    authorization,
-                    payload["payload"],
-                    tool_executor,
-                    scoped_tool_names() if scoped_tool_names is not None else set(),
-                ),
+                scoped_rpc_executor(authorization, payload["payload"]),
                 loop,
             )
             try:
                 response = _wait_for_pi_rpc_result(result, loop, self.connection, closed)
             except TimeoutError:
-                refuse("rpc_timeout")
+                refuse("rpc_timeout", "execution", "wait_timeout")
+                return
+            except PiRpcRefused as refusal:
+                refuse("rpc_refused", refusal.stage, refusal.code)
                 return
             except ValueError:
-                refuse("rpc_refused")
+                refuse("rpc_refused", "pre_dispatch", "validation_failed")
                 return
             except PiRpcExecutionError:
-                refuse("rpc_execution_failed")
+                refuse("rpc_execution_failed", "execution", "tool_failed")
                 return
             except Exception:  # noqa: BLE001 - scoped transport errors contain no raw tool exception
-                refuse("rpc_delivery_failed")
+                refuse("rpc_delivery_failed", "delivery", "wait_failed")
                 return
             try:
                 self._send_json(response)

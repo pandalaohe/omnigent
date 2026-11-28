@@ -36,6 +36,15 @@ class PiRpcExecutionError(RuntimeError):
     """The tool was dispatched, but its execution did not deliver a result."""
 
 
+class PiRpcRefused(ValueError):
+    """A pre-dispatch refusal with fixed codes for internal logging."""
+
+    def __init__(self, stage: str, code: str) -> None:
+        super().__init__(code)
+        self.stage = stage
+        self.code = code
+
+
 _mcp_execution: ContextVar[PiMcpExecution | None] = ContextVar("pi_mcp_execution", default=None)
 
 
@@ -149,14 +158,13 @@ class PiScopeRelay:
         tool_names: set[str],
     ) -> dict[str, object]:
         """Shared native/TCP entry; authentication precedes inner JSON decoding."""
-        record = self.authenticate(authorization, "/pi/rpc")
-        if (
-            record.status != "ready"
-            or not isinstance(opaque_payload, str)
-            or len(opaque_payload) > 1024 * 1024
-        ):
-            raise ValueError("Pi RPC payload unavailable")
-        payload = json.loads(opaque_payload)
+        record = self.authenticate_rpc(authorization)
+        if not isinstance(opaque_payload, str) or len(opaque_payload) > 1024 * 1024:
+            raise PiRpcRefused("payload", "invalid_frame")
+        try:
+            payload = json.loads(opaque_payload)
+        except ValueError:
+            raise PiRpcRefused("payload", "invalid_json") from None
         if not isinstance(payload, dict) or set(payload) - {
             "call_id",
             "expected_revision",
@@ -167,17 +175,21 @@ class PiScopeRelay:
             "operation_id",
             "step",
         }:
-            raise ValueError("Pi RPC binding unavailable")
-        self._bound_call(record, payload, settlement=False)
-        receipt = self.runtime.pi_scopes.resolve(self.session_id, payload.get("pi_origin_receipt"))
+            raise PiRpcRefused("payload", "invalid_fields")
+        try:
+            self._bound_call(record, payload, settlement=False)
+            receipt = self.runtime.pi_scopes.resolve(
+                self.session_id, payload.get("pi_origin_receipt")
+            )
+        except ValueError:
+            raise PiRpcRefused("binding", "call_binding_rejected") from None
         name, arguments = payload.get("name"), payload.get("arguments")
-        if (
-            receipt.local_execution
-            or not isinstance(name, str)
-            or name not in tool_names
-            or not isinstance(arguments, dict)
-        ):
-            raise ValueError("Pi RPC tool unavailable")
+        if receipt.local_execution:
+            raise PiRpcRefused("dispatch", "local_tool")
+        if not isinstance(name, str) or not isinstance(arguments, dict):
+            raise PiRpcRefused("payload", "invalid_tool")
+        if name not in tool_names:
+            raise PiRpcRefused("dispatch", "tool_not_enabled")
         if not self.runtime.verify_execute(
             self.session_id,
             call_id=payload.get("call_id"),
@@ -189,7 +201,7 @@ class PiScopeRelay:
             step="rpc",
             origin_receipt=payload.get("pi_origin_receipt"),
         ):
-            raise ValueError("Pi RPC execution unavailable")
+            raise PiRpcRefused("execution", "execution_lease_rejected")
         operation_id = cast(str, payload["operation_id"])
         binding = receipt.binding
         execution = PiMcpExecution(
@@ -219,6 +231,15 @@ class PiScopeRelay:
         finally:
             _mcp_execution.reset(token)
         return {"result": projected}
+
+    def authenticate_rpc(self, authorization: str | None) -> PiScopeRecord:
+        try:
+            record = self.authenticate(authorization, "/pi/rpc")
+        except ValueError:
+            raise PiRpcRefused("authentication", "scope_authentication_rejected") from None
+        if record.status != "ready":
+            raise PiRpcRefused("authentication", "scope_not_ready")
+        return record
 
     def _bound_call(
         self, record: PiScopeRecord, payload: dict[str, object], *, settlement: bool

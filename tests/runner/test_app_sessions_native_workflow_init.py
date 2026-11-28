@@ -146,6 +146,142 @@ async def test_pi_rpc_relay_is_ready_before_permission_bootstrap(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("with_os_env", [True, False])
+async def test_pi_rpc_relay_dispatches_only_spec_enabled_os_tools(
+    tmp_path, monkeypatch, caplog, with_os_env
+):
+    from omnigent.harnesses.pi_native import bridge as pi_bridge
+    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.runner.mcp_execution_registry import MCP_OPERATION_ID_PARAM
+    from omnigent.server.permission_tiers import tier_label_key
+    from tests.runner.test_permission_tier_runtime import _publish_scope
+
+    prepare_installation = pi_bridge.prepare_permission_installation
+
+    def prepare(bridge_dir, *, session_id, harness, extension):
+        source = bridge_dir / "omnigent_pi_fixture" / "omnigent_tools.js"
+        source.parent.mkdir(exist_ok=True)
+        source.write_bytes(extension.read_bytes())
+        return prepare_installation(
+            bridge_dir, session_id=session_id, harness=harness, extension=source
+        )
+
+    monkeypatch.setattr(pi_bridge, "prepare_permission_installation", prepare)
+    spec = AgentSpec(
+        spec_version=1,
+        name="pi-relay-agent",
+        executor=ExecutorSpec(config={"harness": "pi"}),
+        os_env=OSEnvSpec() if with_os_env else None,
+    )
+    app, _ = await _build_app_for_spec(spec)
+    session_id = "5b0c1f7a4d2e4c8fa1b3d6e9c0f2a4b6"
+    tool_calls = {
+        "sys_os_shell": {"command": "echo fixture"},
+        "sys_os_write": {"path": "notes.txt", "content": "old"},
+        "sys_os_edit": {"path": "notes.txt", "oldText": "old", "newText": "new"},
+    }
+    proxy_calls = []
+    original_post = NullServerClient.post
+
+    async def server_post(self, url, **kwargs):
+        if url == f"/v1/sessions/{session_id}/mcp":
+            proxy_calls.append(kwargs["json"]["params"])
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", f"http://server.example{url}"),
+                json={"result": {"content": [{"type": "text", "text": "done"}]}},
+            )
+        return await original_post(self, url, **kwargs)
+
+    monkeypatch.setattr(NullServerClient, "post", server_post)
+    runtime = app.state.permission_tiers
+    async with _runner_client(
+        app,
+        permission_harness="pi",
+        permission_snapshot={"workspace": str(tmp_path), "labels": {tier_label_key("pi"): "auto"}},
+    ) as client:
+        response = await client.post(
+            "/v1/sessions", json={"session_id": session_id, "agent_id": "fixture"}
+        )
+        assert response.status_code == 201, response.text
+        bridge_dir = runtime.path(session_id).parent
+        relay = json.loads((bridge_dir / "tool_relay.json").read_text())
+        assert tool_calls.keys().isdisjoint(item["name"] for item in relay["tools"])
+        admission = runtime.open_pi_child_scope(session_id)
+        origin = runtime.pi_scopes.record(admission.principal).expected["extension_path"]
+        _publish_scope(
+            runtime,
+            admission,
+            [{"name": name, "sourceInfo": {"path": origin}} for name in tool_calls],
+        )
+        revision = runtime.state(session_id).revision
+        async with httpx.AsyncClient(base_url=relay["url"], trust_env=False) as scoped_client:
+            headers = {"Authorization": f"Bearer {admission.credential}"}
+            for name, arguments in tool_calls.items():
+                receipt = runtime.pi_origin_receipt(
+                    session_id,
+                    admission.credential,
+                    call_id=name,
+                    name=name,
+                    arguments=arguments,
+                    local_execution=False,
+                )
+                binding, decision = runtime.inspect(
+                    session_id,
+                    call_id=receipt.binding.call_id,
+                    name=name,
+                    arguments=arguments,
+                    expected_revision=revision,
+                    local_execution=False,
+                    origin_receipt=receipt.token,
+                )
+                assert decision.action.value != "DENY", decision.reason
+                assert runtime.authorize(
+                    session_id,
+                    call_id=binding.call_id,
+                    name=name,
+                    arguments_digest=binding.arguments_digest,
+                    expected_revision=revision,
+                    origin_receipt=receipt.token,
+                )
+                payload = {
+                    "call_id": binding.call_id,
+                    "expected_revision": revision,
+                    "pi_origin_receipt": receipt.token,
+                    "arguments_digest": binding.arguments_digest,
+                    "name": name,
+                    "arguments": arguments,
+                    "operation_id": f"operation-{name}",
+                }
+                response = await scoped_client.post(
+                    "/pi/rpc",
+                    headers=headers,
+                    json={"payload": json.dumps(payload)},
+                )
+                if with_os_env:
+                    assert response.status_code == 200, response.text
+                    assert response.json() == {"result": {"result": "done"}}
+                    assert proxy_calls[-1] == {
+                        "name": name,
+                        "arguments": arguments,
+                        MCP_OPERATION_ID_PARAM: payload["operation_id"],
+                        "_omnigent_permission_call_id": binding.call_id,
+                        "_omnigent_pi_origin_receipt": receipt.token,
+                    }
+                    repeat = await scoped_client.post(
+                        "/pi/rpc", headers=headers, json={"payload": json.dumps(payload)}
+                    )
+                    assert repeat.status_code == 403
+                    assert repeat.json()["reason"] == "rpc_refused"
+                else:
+                    assert response.status_code == 403
+                    assert response.json()["reason"] == "rpc_refused"
+        assert len(proxy_calls) == (len(tool_calls) if with_os_env else 0)
+        expected_code = "execution_lease_rejected" if with_os_env else "tool_not_enabled"
+        assert f"code={expected_code}" in caplog.text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["sdk", "ack", "unknown", "untrusted-ack"])
 async def test_permission_bootstrap_failure_reaches_turn_without_confirmation_wait(
     monkeypatch, failure
