@@ -3080,7 +3080,7 @@ class AcpExecutor(Executor):
             return reject("invalid_pending_type", "kind")
         bridge_tool = None
         if is_agy:
-            agy_tool = self._validate_agy_permission_tool(kind, observed.get("name"), arguments)
+            agy_tool = self._validate_agy_permission_tool(kind, arguments)
             if self._managed_agy and (agy_tool is None or agy_tool[0] == "unknown"):
                 bridge_tool = self._bound_omnigent_tool(observed)
                 if bridge_tool is not None:
@@ -3150,7 +3150,7 @@ class AcpExecutor(Executor):
 
     @staticmethod
     def _validate_agy_permission_tool(
-        kind: object, observed_name: object, arguments: _AcpJsonObject
+        kind: object, arguments: _AcpJsonObject
     ) -> tuple[str, _AcpJsonObject] | None:
         """Reject mixed and malformed known agy shapes before consulting policy."""
         if kind is not None and not isinstance(kind, str):
@@ -3200,17 +3200,6 @@ class AcpExecutor(Executor):
             ):
                 return None
             return "write_to_file", {**arguments, "TargetFile": target}
-        if (
-            kind == "edit"
-            and observed_name == "edit_file"
-            and keys == {"Path", "Target", "Replacement"}
-        ):
-            if (
-                not all(isinstance(value, str) for value in arguments.values())
-                or not arguments["Path"]
-            ):
-                return None
-            return "write_to_file", {**arguments, "TargetFile": arguments["Path"]}
         if kind == "edit" and isinstance(arguments.get("TargetFile"), str):
             if keys & _AGY_ACP_SHELL_FIELDS:
                 return None
