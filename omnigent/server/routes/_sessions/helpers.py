@@ -5057,6 +5057,7 @@ def _publish_elicitation_resolved(
         it. Omitted when unknown, not a recognised reason, or when a
         verdict is present — a verdict and a no-verdict reason are
         mutually exclusive on the wire.
+    :param answered_by: Parent session attribution and rationale for a verdict.
     """
     from omnigent.server.terminal_agent_access import release_terminal_access_request
 
@@ -5069,11 +5070,12 @@ def _publish_elicitation_resolved(
     }
     if action in _VALID_ELICITATION_ACTIONS:
         payload["action"] = action
+        if answered_by is not None:
+            payload["answered_by"] = {
+                key: answered_by[key] for key in ("session_id", "title", "reason")
+            }
     elif reason in _VALID_ELICITATION_RESOLVED_REASONS:
         payload["reason"] = reason
-    if answered_by is not None:
-        payload["answered_by"] = {key: answered_by[key] for key in ("session_id", "title")}
-        payload["reason"] = answered_by["reason"]
     session_stream.publish(session_id, payload)
 
 

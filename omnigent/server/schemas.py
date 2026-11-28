@@ -6407,6 +6407,14 @@ class ArtifactOpenRequestEvent(_SSEEventBase):
     base: Literal["workspace", "host"]
 
 
+class ElicitationAnswerer(BaseModel):
+    """Parent session that answered an approval, with its rationale."""
+
+    session_id: str
+    title: str
+    reason: str
+
+
 class ElicitationResolvedEvent(_SSEEventBase):
     """
     Signal that a previously-published elicitation is no longer
@@ -6431,7 +6439,7 @@ class ElicitationResolvedEvent(_SSEEventBase):
         being cleared, e.g. ``"elicit_abc123"``. Must match the
         id of a prior :class:`ElicitationRequestEvent`.
     :param action: Optional MCP verdict recorded when the
-        resolution carried a human decision (``"accept"`` /
+        resolution carried a decision (``"accept"`` /
         ``"decline"`` / ``"cancel"``). ``None`` for resolutions
         without a verdict — timeout, severed wait, or a runner
         that predates verdict carriage — so consumers can say "no
@@ -6445,12 +6453,15 @@ class ElicitationResolvedEvent(_SSEEventBase):
         stop-turn enabled and the server ended the turn, so the card
         disappears in favour of the persisted timeout notice.
         ``None`` when a verdict is present or the reason is unknown.
+    :param answered_by: Parent session attribution when it supplied the
+        verdict, including its free-text rationale.
     """
 
     type: Literal["response.elicitation_resolved"]
     elicitation_id: str
     action: Literal["accept", "decline", "cancel"] | None = None
     reason: Literal["unanswered", "timed_out"] | None = None
+    answered_by: ElicitationAnswerer | None = None
 
 
 class PolicyDeniedEvent(_SSEEventBase):
